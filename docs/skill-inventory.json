@@ -25,11 +25,13 @@
         "providers": "shared",
         "load_strategy": "always",
         "status": "replace",
-        "reason": "Triage, budgeting, verification, mapping, routing and cost estimation stay in existing code; no prompt copies.",
+        "reason": "Triage, evidence routing (diagnostics/ adapters), budgeting, verification, mapping, routing and cost estimation stay in existing code; no prompt copies.",
         "sources": [
           "bin/ai-team",
           "scripts/bootstrap.py",
           "scripts/manage.py",
+          "diagnostics/core.py",
+          "diagnostics/__init__.py",
           "routing.json",
           "POLICY.md"
         ]
@@ -272,6 +274,16 @@
     },
     {
       "source": "bin/ai-team",
+      "classification": "canonical",
+      "runtime_enabled": true
+    },
+    {
+      "source": "diagnostics/__init__.py",
+      "classification": "canonical",
+      "runtime_enabled": true
+    },
+    {
+      "source": "diagnostics/core.py",
       "classification": "canonical",
       "runtime_enabled": true
     },

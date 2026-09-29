@@ -4,7 +4,7 @@ The runtime uses 15 global reusable capabilities and six thin Codex/Claude entry
 
 | Name | Runtime type | Scope | Providers | Load | Status | Reason |
 |---|---|---|---|---|---|---|
-| Deterministic orchestration controls | script | global | shared | always | replace | Triage, budgeting, verification, mapping, routing and cost estimation stay in existing code; no prompt copies. |
+| Deterministic orchestration controls | script | global | shared | always | replace | Triage, evidence routing (diagnostics/ adapters), budgeting, verification, mapping, routing and cost estimation stay in existing code; no prompt copies. |
 | Orchestration | role | global | shared | lazy | keep | One lead workflow; current policy and routing remain authoritative. |
 | Targeted exploration | role | global | shared | lazy | keep | Read only evidence needed for the next action; no ecosystem discovery. |
 | Implementation | role | global | shared | lazy | keep | Bounded changes from established evidence. |

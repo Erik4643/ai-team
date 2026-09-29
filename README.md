@@ -42,6 +42,8 @@ ai-team --doctor
 ai-team --self-test
 ai-team --version
 ai-team update                 # explicit fetch + fast-forward + validated install
+ai-team "fix Stylelint errors" # a named evidence source is REQUIRED: read and clean before DONE
+ai-team --evidence JETBRAINS_INSPECTION=./inspections "fix WebStorm inspection warnings"
 ```
 
 Update refuses a dirty working tree, detached HEAD or missing upstream. It does not overwrite local changes and never touches the current project. After an update that changed the kit, refresh each project with `ai-team init` (idempotent; project facts are preserved). Diagnostics, tests and installation do not call models. `--self-test --live` is an explicit opt-in to real calls.
@@ -50,12 +52,15 @@ Update refuses a dirty working tree, detached HEAD or missing upstream. It does 
 
 T0 handles triage, mapping, budgeting, verification and cost estimation. T1/T2 roles are selected by capability and expected cost; T3 is reserved for evidence-based escalation. Routing, cooldowns, baseline-aware checks, aggregate diagnostics and risk-based review remain deterministic. Review uses a fresh isolated session and is labeled cross-provider only when providers differ.
 
+**Diagnostic evidence.** A task that names a source — TypeScript, ESLint, Stylelint, tests, build, WebStorm/JetBrains inspections, Qodana, CI, a project custom check, or an unknown tool such as Sonar — makes it REQUIRED: it is read (T0, read-only) and the task is DONE only when it is clean. If it cannot be read (WebStorm keeps its results inside the running IDE), the task is BLOCKED before any check or model call, with the exact way to unblock it: `--evidence SOURCE=PATH` accepts SARIF, a JetBrains XML/JSON export, JUnit, JSON findings or tool/CI output. Broad maintenance uses the project's configured checks and needs none of these. Findings are normalized and classified (real source, generated, third-party, IDE false positive, spelling, configuration noise, low value); only real source findings reach an implementer. A new source is one module in `diagnostics/` that exports `ADAPTERS`; projects declare read-only checks in `.ai/repo-map.json` → `custom_checks`.
+
 Only the selected role and relevant guidance load. [Canonical capabilities](docs/CANONICAL_CAPABILITIES.md) lists the 15 capabilities. [Skill audit summary](docs/SKILL_INVENTORY.md) explains why the historical 4,661 definitions are not the runtime set. Graphify is optional and uses existing project graphs; `AI_TEAM_GRAPHIFY=off` disables it.
 
 | Path | Ownership |
 |---|---|
 | `bin/ai-team`, `scripts/` | global orchestrator, bootstrap, installation, update and health |
 | `routing.json` | model mappings, cost priors, gates, budgets and provider routing |
+| `diagnostics/` | evidence registry and adapters: triage, read-only commands, parsers, finding classes |
 | `POLICY.md`, `PROTOCOL.md` | single global policy and handoff contract |
 | `roles/`, `workflows/`, `skills/graphify/` | canonical lazy reasoning guidance |
 | `capabilities.json` | runtime capability allowlist |

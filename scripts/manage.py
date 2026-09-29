@@ -35,7 +35,7 @@ def engine():
 
 def fingerprint():
     paths=[KIT/'routing.json',KIT/'capabilities.json',KIT/'VERSION',KIT/'install.sh']
-    for folder in ['bin','scripts','roles','workflows','skills','template','tests']:
+    for folder in ['bin','scripts','diagnostics','roles','workflows','skills','template','tests']:
         paths.extend(p for p in (KIT/folder).rglob('*') if p.is_file() and '__pycache__' not in p.parts)
     h=hashlib.sha256()
     for p in sorted(paths):
@@ -148,6 +148,8 @@ def doctor(project):
         for name in m.CFG['providers']:check(name+' CLI',bool(shutil.which(name)),warning=True,hint='install/authenticate separately if needed')
         check('routing',all(str(t) in p['tiers'] for p in m.CFG['providers'].values() for t in (1,2,3)))
         check('canonical capabilities',8<=len(m.CAPABILITIES['capabilities'])<=15)
+        adapters=m.DIAG.adapters()
+        check('diagnostic evidence adapters',bool(adapters) and all(a.id==i for i,a in adapters.items()),', '.join(adapters))
         for c in m.CAPABILITIES['capabilities']:
             check('source '+c['id'],all((KIT/p).is_file() for p in c['sources']))
         for s in m.adapter_specs():
@@ -179,8 +181,12 @@ def doctor(project):
     else:
         for rel in ['.ai/CONTEXT.md','.ai/repo-map.json','.ai/decisions.md','AGENTS.md','CLAUDE.md']:
             check(rel,(project/rel).is_file())
-        try:json.loads((project/'.ai/repo-map.json').read_text())
-        except (OSError,ValueError):check('project map JSON',False)
+        try:rmap=json.loads((project/'.ai/repo-map.json').read_text())
+        except (OSError,ValueError):rmap={};check('project map JSON',False)
+        if isinstance(rmap,dict) and rmap.get('custom_checks'):
+            m=engine();valid,rejected=m.DIAG.custom.project_checks(m.DIAG.Context(project,rmap),m.DIAG.adapters())
+            check('custom checks',not rejected,', '.join(c.id for c in valid) or 'none valid',warning=True,
+                  hint='; '.join(why for _,why in rejected)+' (rejected entries never run)')
         ignored=call(['git','-C',str(project),'check-ignore','-q','.ai/state/probe'],capture=True)
         check('project state ignored',ignored.returncode==0)
     print('Doctor:', 'PASS' if not errors else 'FAIL ('+str(len(errors))+')')

@@ -655,7 +655,7 @@ class AggregateDiagnostics(Base):
         self.assertEqual([c[0] for c in calls], ["implementer"])    # not "nothing to fix"
         self.assertEqual(rc, 0)                                      # all required categories clean afterwards
 
-    def test_8b_unavailable_category_after_repair_is_blocked_not_pass(self):
+    def test_8b_required_unavailable_blocks_before_any_model_call(self):
         d = self.repo({"typecheck": "tsc --noEmit", "lint": "eslint . --fix && prettier --write ."})   # no safe read-only lint form
         def impl(tier):
             (d / "fixed").write_text("y\n")
@@ -670,9 +670,10 @@ class AggregateDiagnostics(Base):
             rc = r.aggregate_repair({x["role"]: x for x in r.p["steps"] if x["provider"]}, "", runner=runner)
         out = buf.getvalue()
         self.assertEqual(rc, 1)
-        self.assertIn("NOT DONE", out)
-        self.assertIn("Verify:      BLOCKED", out)                   # never "NOT DONE" next to "Verify: PASS"
-        self.assertIn("NOT clean: lint", out)
+        self.assertIn("BLOCKED ·", out); self.assertNotIn("DONE ·", out)
+        self.assertIn("Verify:      BLOCKED", out)                   # never "NOT DONE"/"DONE" next to "Verify: PASS"
+        self.assertIn("REQUIRED_EVIDENCE_UNAVAILABLE: LINT", out)
+        self.assertFalse((d / "fixed").exists())                      # no implementer call: a required source can't be read
 
     def test_misconfigured_check_is_not_a_code_error_and_not_clean(self):
         d = self.repo({"typecheck": "true", "prettier": "prettier --check \"{src,store}/**/*.js\""})
@@ -878,13 +879,13 @@ class RequiredOptional(Base):
         self.assertEqual(rc, 0)
         self.assertIn("UNAVAILABLE — `format` modifies files", out); self.assertIn("warning, does not block", out)
         self.assertIn("DONE", out); self.assertNotIn("NOT DONE", out)
-        self.assertIn("Verify:      PASS_WITH_WARNINGS", out); self.assertIn("format unavailable (optional)", out)
+        self.assertIn("Verify:      PASS_WITH_WARNINGS", out); self.assertIn("FORMAT unavailable (optional)", out)
 
     def test_required_unavailable_diagnostic_blocks(self):
         root = self.repo({"lint": "mylinter --fix src", "format": "prettier --check ."})
         rc, out = run_aggregate(root, "fix all existing errors and warnings in this project", lambda c: (True, ""))
         self.assertEqual(rc, 1)
-        self.assertIn("NOT DONE", out); self.assertIn("Verify:      BLOCKED", out); self.assertIn("→ blocks", out)
+        self.assertIn("BLOCKED ·", out); self.assertIn("Verify:      BLOCKED", out); self.assertIn("REQUIRED_EVIDENCE_UNAVAILABLE: LINT", out)
 
     def test_nothing_runnable_is_never_done(self):
         root = self.repo({"format": "mytool --write ."})                                # only an optional gap, nothing ran

@@ -51,7 +51,13 @@ Workers don't auto-load provider instructions (Codex project AGENTS.md off, Clau
 no timestamps or ids in prompts. Fresh sessions per call (no reuse across tasks). Secrets are redacted before anything is written.
 State: last 30 task dirs / 14 days; metrics rotate at 1000 runs and store numbers only.
 
-## 8. Canonical capability loading
+## 8. Evidence (T0, `diagnostics/`)
+A source the task names (tool + findings word, or a fix verb: "Stylelint errors", "WebStorm inspection results", "CI failures"),
+supplied with `--evidence`, or required by a project custom check is REQUIRED; broad maintenance adds the configured checks.
+DONE only when every REQUIRED source was read clean; unreadable → BLOCKED before any model call, never inferred from other checks.
+Only REAL_SOURCE findings go to an implementer (generated, third-party, IDE false positives, spelling, config noise, low value never do).
+
+## 9. Canonical capability loading
 `capabilities.json` lists owned runtime capabilities, not an alternative routing policy. Keep deterministic decisions in
 `bin/ai-team` and `routing.json`. Load only the selected role and at most two matching supplemental workflows; drop supplemental
 guidance first under context pressure. Load optional Graphify guidance only with an installed CLI and a valid local graph;

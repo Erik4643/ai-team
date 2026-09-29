@@ -12,7 +12,8 @@
 Decisions are local (T0): intent → fast path? → complexity (MICRO..CRITICAL) → conditional stages → provider by
 expected cost to success (capability first). Policy: ~/.ai-kit/POLICY.md · data: ~/.ai-kit/routing.json
 """
-import argparse, datetime, hashlib, json, os, re, shlex, shutil, subprocess, sys, time
+import argparse, datetime, hashlib, importlib.util, json, os, re, shutil, subprocess, sys, time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -25,6 +26,30 @@ RANK = {"TRIVIAL": 0, "MICRO": 1, "SMALL": 2, "MEDIUM": 3, "COMPLEX": 4, "CRITIC
 DEMAND = {"TRIVIAL": 0, "MICRO": 1, "SMALL": 1, "MEDIUM": 2, "COMPLEX": 3, "CRITICAL": 3}
 CODE_INTENTS = {"IMPLEMENTATION", "DEBUG", "ARCHITECTURE"}
 MODEL_CALLS = [0]  # real provider invocations in this process (self-test asserts 0)
+
+
+def load_diagnostics(kit):
+    """The diagnostic evidence package ships inside the kit; load it by path under a kit-specific name (no clash with an
+    installed package, and two kits in one process stay separate)."""
+    name = "ai_team_diagnostics_" + hashlib.sha1(str(kit).encode()).hexdigest()[:10]
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, kit / "diagnostics" / "__init__.py", submodule_search_locations=[str(kit / "diagnostics")])
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        try:
+            spec.loader.exec_module(mod)
+        except BaseException:
+            sys.modules.pop(name, None)
+            raise
+    return sys.modules[name]
+
+
+DIAG = load_diagnostics(KIT)
+# Shared evidence primitives stay importable from this module (tests, bootstrap and older callers use them).
+for _name in ("MUTATING", "READ_ONLY_FORMS", "cmd_tokens", "resolve_command", "read_only_args", "read_only_form", "package_scripts",
+              "tracked_css", "OUTPUT_DIR", "generated_dirs", "generated_classifier", "ANSI_RE", "DIAG_RE", "ESLINT_ROW", "FILE_LINE",
+              "NOISE_RE", "BROKEN_CHECK_RE", "norm_msg", "diagnostics"):
+    globals()[_name] = getattr(DIAG.core, _name)
 
 
 def tok(s):
@@ -66,6 +91,7 @@ STYLE_KW = R(r"\b(colou?r|border[- ]?radius|radius|padding|margin|font[- ]?size|
 MICRO_KW = R(r"\b(rename|typo|spelling|colou?r|border[- ]?radius|radius|padding|margin|font[- ]?size|spacing|opacity|z-index|label|wording|copy|comment|unused imports?|bump|placeholder|tooltip|icon size)\b"
              r"|переимен|опечат|цвет|радиус|отступ|шрифт|надпис|формулировк")
 DOCS_KW = R(r"\b(readme|docs?|documentation|changelog|\.md|markdown|wording|typo)\b|документац|ридми")
+FIX_LIKE = R(r"^(fix|make|remove|исправ|почин|убери|удали)$")  # change verbs that only mean "make the findings go away"
 MAINT = R(r"\b(fix|resolve|repair|clean ?up|eliminate|address|get rid of)\b.{0,60}\b(all|every|existing|current|remaining|global|outstanding)\b.{0,80}\b(errors?|warnings?|problems?|issues?|failures?|diagnostics?)\b"
           r"|\bmake\b.{0,50}\b(checks?|diagnostics|lint|typecheck|type-?check|build|ci|tests?)\b.{0,30}\b(pass|passing|green|clean)\b"
           r"|\bmake\b.{0,40}\b(pass|green|clean)\b.{0,20}\b(all )?(checks?|diagnostics|lint|typecheck|ci|tests?)\b"
@@ -157,11 +183,17 @@ def classify(task, root=None, forced=None):
         intent = "UNKNOWN"  # cheap T1 probe decides
     sig["analysis_first"] = intent == "DEBUG" and not change  # diagnose first; implement only if a change is required
     sig["docs"] = bool(DOCS_KW.search(task)) and not re.search(r"\.(tsx?|jsx?|py|go|rs|css|scss)\b", task)
-    sig["maintenance"] = sig["aggregate"] = bool(MAINT.search(task))  # aggregate diagnostics: every relevant check before "clean"
+    sig["maintenance"] = bool(MAINT.search(task))  # aggregate diagnostics: every relevant check before "clean"
+    sig["broad"] = sig["maintenance"] and bool(DIAG.BROAD.search(task))
+    sig["fix_only"] = all(FIX_LIKE.match(m.group(0)) for m in CHANGE.finditer(task))
+    sig["evidence"] = DIAG.requested_ids(task, DIAG.Context(root, repo_map_file(root)) if root is not None else None)  # T0, regex only
     if sig["maintenance"] and intent == "UNKNOWN":
         intent = "IMPLEMENTATION"  # "clean up the codebase": diagnostics first, then a bounded fix
-    elif intent not in CODE_INTENTS:
-        sig["maintenance"] = sig["aggregate"] = False  # questions and plans stay read-only; no repair loop
+    if intent in CODE_INTENTS:  # evidence-driven repair: broad maintenance, or a fix-only task that names its evidence
+        sig["aggregate"] = sig["maintenance"] or (bool(sig["evidence"]) and sig["fix_only"])
+    else:  # questions, reviews and plans stay read-only: named evidence is audited (T0), never repaired
+        sig["maintenance"] = sig["broad"] = sig["aggregate"] = False
+        sig["audit"] = bool(sig["evidence"]) and intent in ("REVIEW", "QUESTION", "UNKNOWN")
     hit = {k: bool(rx.search(task)) for k, rx in KW.items()}
     sig["risk_keyword"] = hit["CRITICAL"]
     sig["high_risk"] = hit["CRITICAL"] or bool(CONCURRENCY_KW.search(task))  # stricter gates, never looser
@@ -175,7 +207,7 @@ def classify(task, root=None, forced=None):
     if intent not in CODE_INTENTS:
         return intent, ("MEDIUM" if intent == "PLAN" and (hit["COMPLEX"] or hit["CRITICAL"]) else "SMALL"), "high", sig
     words = len(task.split())
-    if sig["maintenance"]:
+    if sig["aggregate"]:
         c = "MEDIUM"  # sized after deterministic diagnostics
     elif hit["CRITICAL"]:
         c = "CRITICAL"
@@ -193,6 +225,14 @@ def classify(task, root=None, forced=None):
 
 
 # ── repository index ───────────────────────────────────────────────────────────
+def repo_map_file(root):
+    """The project's own .ai/repo-map.json (commands, custom checks) without detection — cheap enough for T0 triage."""
+    try:
+        return json.loads((Path(root) / ".ai" / "repo-map.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
 def repo_root():
     rc, out = sh(["git", "rev-parse", "--show-toplevel"])
     return Path(out.strip()) if rc == 0 else Path.cwd()
@@ -846,47 +886,6 @@ def select_checks(files, complexity, task, cmds, root=None):
     return out, "+".join(sorted(kinds)) + " changed", json_files
 
 
-ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
-DIAG_RE = re.compile(r"^(?P<file>[\w./@\[\]-]+\.\w{1,5})(?:[(:]\d+(?:[,:]\d+)?\)?)?:?\s*-?\s*(?P<sev>error|warning)\s*(?P<code>[A-Z]{1,6}\d+)?:?\s*(?P<msg>.*)$", re.I)
-ESLINT_ROW = re.compile(r"^\s+\d+:\d+\s+(?P<sev>error|warning|✖|⚠)\s+(?P<msg>.*?)(?:\s{2,}(?P<code>[@\w/-]+))?$")
-FILE_LINE = re.compile(r"^(?:[\w./@\[\]-]+|/[^:]*?)\.\w{1,5}$")  # eslint/stylelint file header (relative or absolute)
-NOISE_RE = re.compile(r"^(found \d+ errors?|error command failed|info visit|done in|\$ |yarn run|npm err|✖ \d+ problems?|\d+ problems?|checking formatting|all matched files use|> )", re.I)
-BROKEN_CHECK_RE = re.compile(r"no files matching the pattern|no inputs were found|no test files found|no tests found|missing script|command not found|"
-                             r"cannot find module|could not find (a )?(config|configuration)|couldn't find a configuration", re.I)
-
-
-def norm_msg(t):
-    t = ANSI_RE.sub("", t)
-    t = re.sub(r"(/private)?/(tmp|var/folders)/[^\s:'\"]+", "<tmp>", t)
-    t = re.sub(r"\b\d{1,2}:\d{2}(:\d{2})?(\.\d+)?\b|\b\d+(\.\d+)?\s?m?s\b", "", t)  # timestamps, durations
-    return re.sub(r"\s+", " ", t).strip().lower()
-
-
-def diagnostics(output):
-    """Normalized diagnostics → Counter{fingerprint: n} and {fingerprint: raw line}. Fingerprint = file|code|message;
-    line/column numbers and ordering are ignored (they shift with unrelated edits)."""
-    from collections import Counter
-    fps, raw, cur = Counter(), {}, None
-    for line in ANSI_RE.sub("", output or "").splitlines():
-        m = DIAG_RE.match(line.strip())
-        if m and not m.group("file").startswith(("node_modules", "_next")):
-            fp = f"{m.group('file')}|{(m.group('code') or '').upper()}|{norm_msg(m.group('msg'))}"
-        elif FILE_LINE.match(line.strip()):
-            cur = line.strip(); continue
-        elif cur and ESLINT_ROW.match(line):
-            e = ESLINT_ROW.match(line)
-            fp = f"{cur}|{e.group('code') or ''}|{norm_msg(e.group('msg'))}"
-        else:
-            continue
-        fps[fp] += 1; raw.setdefault(fp, line.strip()[:220])
-    if not fps:  # unparseable output: compare normalized non-noise lines, digits masked
-        for line in (output or "").splitlines():
-            t = re.sub(r"\d+", "#", norm_msg(line))
-            if t and not NOISE_RE.match(norm_msg(line)):
-                fps[t] += 1; raw.setdefault(t, line.strip()[:220])
-    return fps, raw
-
-
 def compare_checks(base_ok, base_out, after_ok, after_out):
     """→ {status, pre, new, fixed, new_lines}. Statuses: PASS, PASS_WITH_BASELINE_FAILURES, FAIL_NEW_ERRORS, FAIL_REGRESSION."""
     if after_ok:
@@ -901,8 +900,8 @@ def compare_checks(base_ok, base_out, after_ok, after_out):
             "new_lines": [araw[k] for k in new][:15]}
 
 
-STATUS_RANK = {"PASS": 0, "PASS_WITH_WARNINGS": 1, "PASS_WITH_BASELINE_FAILURES": 2,
-               "FAIL": 3, "FAIL_NEW_ERRORS": 4, "FAIL_REGRESSION": 5, "BLOCKED": 6}
+STATUS_RANK = {"PASS": 0, "PASS_WITH_WARNINGS": 1, "PASS_WITH_BASELINE_FAILURES": 2, "PENDING_EVIDENCE": 3,
+               "FAIL": 4, "FAIL_NEW_ERRORS": 5, "FAIL_REGRESSION": 6, "BLOCKED": 7}
 
 
 def verify_status(res):
@@ -920,6 +919,8 @@ def describe_check(r):
         return f"{r['cmd']} ⚠ " + (r.get("note") or "passed with warnings")
     if st == "BLOCKED":
         return f"{r['cmd']} BLOCKED: " + (r.get("note") or "check unavailable or misconfigured")
+    if st == "PENDING_EVIDENCE":
+        return f"{r['cmd']} … {r.get('note') or 'fresh evidence needed to verify'}"
     if st in ("FAIL_NEW_ERRORS", "FAIL_REGRESSION"):
         return f"{r['cmd']} ✗ {st}: {r['new']} new" + (f", {r['pre']} pre-existing" if r.get("pre") else "")
     return f"{r['cmd']} ✗"
@@ -957,130 +958,9 @@ def verify(root, cmds, json_files, tdir, baseline=None):
     return all(r["ok"] for r in res), res
 
 
-DIAG_CATS = ["typecheck", "lint", "style", "test", "format", "build"]
-DIAG_SCRIPTS = {"typecheck": ("typecheck", "type-check", "check-types", "types", "tsc"),
-                "lint": ("lint:check", "lint:ci", "check:lint", "lint", "eslint"),
-                "style": ("lint:css:check", "lint:css", "lint:style", "lint:styles", "lint:scss", "stylelint:check", "stylelint"),
-                "test": ("test:ci", "test:unit", "test"),
-                "format": ("format:check", "prettier:check", "check:format", "check-format", "format-check", "lint:format", "prettier", "format"),
-                "build": ("build",)}
-MUTATING = re.compile(r"(^|\s)(--fix\b|--fix-type\b|--write\b|-w\b|--update-?snapshots?\b|-u\b|--apply\b|--save\b)")
 RUN_STATES = ("run", "required")  # "required" = legacy spelling of "run now"
 CLEAN_STATES = ("CLEAN", "CLEAN_WITH_WARNINGS")
-# Allowlisted read-only forms: the ONLY CLIs whose check commands are ever rewritten. drop = flag (+ n values) removed,
-# swap = flag replaced, keep = flags that already make it read-only, add = appended when no keep/swap flag is present,
-# reject = flags with no read-only equivalent. Any other command with a mutating flag stays UNAVAILABLE (never guessed).
-READ_ONLY_FORMS = {
-    "eslint":    {"drop": {"--fix": 0, "--fix-dry-run": 0, "--fix-type": 1}, "reason": "removed --fix: eslint reports without fixing"},
-    "stylelint": {"drop": {"--fix": 0}, "reason": "removed --fix: stylelint reports without fixing"},
-    "prettier":  {"swap": {"--write": "--check", "-w": "--check"}, "keep": {"--check", "-c", "--list-different", "-l"}, "add": "--check",
-                  "reason": "--write → --check: prettier lists unformatted files and exits 1"},
-    "tsc":       {"keep": {"--noEmit", "--noemit"}, "add": "--noEmit", "reject": {"-w", "--watch", "-b", "--build"},
-                  "reason": "added --noEmit: type-check without emitting files"},
-}
-SHELL_UNSAFE = re.compile(r"[`$\\\n]")  # substitution, variables, escapes: never analysed, never derived
-SCRIPT_RUN = {"npm": ("run", "run-script"), "pnpm": ("run",), "yarn": ("run",), "bun": ("run",)}
-
-
-def cmd_tokens(cmd):
-    """Quote-aware split of ONE simple command. → tokens, or None if it chains, pipes, redirects or substitutes."""
-    if not cmd or SHELL_UNSAFE.search(cmd):
-        return None
-    lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
-    lex.whitespace_split = True
-    try:
-        toks = list(lex)
-    except ValueError:
-        return None
-    return None if not toks or any(set(t) <= set("();<>|&") for t in toks) else toks
-
-
-def resolve_command(command, scripts, depth=0):
-    """Follow `npm/yarn/pnpm/bun run <script>` references and `npx`/`<pm> exec`/`yarn <bin>` wrappers to the one tool that
-    runs. → (tokens | None, text); tokens is None when the command (or a script it calls) is not one simple command."""
-    toks = cmd_tokens(command)
-    if toks is None or depth > 4:
-        return None, command
-    head, rest = toks[0], toks[1:]
-    if head in ("npx", "bunx"):
-        return (rest, command) if rest and not rest[0].startswith("-") else (None, command)
-    if head not in SCRIPT_RUN or not rest:
-        return toks, command
-    if head in ("pnpm", "yarn") and rest[0] == "exec":
-        return (rest[1:] or None), command
-    explicit = rest[0] in SCRIPT_RUN[head]
-    rest = rest[1:] if explicit else rest
-    if not rest:
-        return None, command
-    name, extra = rest[0], rest[1:]
-    if extra[:1] == ["--"]:
-        extra = extra[1:]
-    if name in scripts:
-        return resolve_command(scripts[name] + (" " + shlex.join(extra) if extra else ""), scripts, depth + 1)
-    return (None, command) if head == "npm" or (head == "bun" and not explicit) else (rest, command)  # yarn/pnpm <bin>
-
-
-def read_only_args(tool, args):
-    """Apply READ_ONLY_FORMS[tool]. → (args | None, changed, reason)."""
-    spec, out, skip, changed = READ_ONLY_FORMS[tool], [], 0, False
-    flag = lambda a: a.split("=", 1)[0]  # noqa: E731
-    if any(flag(a) in spec.get("reject", ()) for a in args):
-        return None, False, f"{tool} {'/'.join(sorted(spec['reject']))} has no read-only equivalent"
-    for a in args:
-        if skip:
-            skip -= 1
-            continue
-        if flag(a) in spec.get("drop", {}):
-            changed, skip = True, (spec["drop"][flag(a)] if "=" not in a else 0)
-            continue
-        if flag(a) in spec.get("swap", {}):
-            changed, a = True, spec["swap"][flag(a)]
-        if a in spec.get("keep", ()) and a in out:
-            continue
-        out.append(a)
-    if not changed and spec.get("add") and not any(flag(a) in spec.get("keep", ()) for a in out):
-        out.append(spec["add"]); changed = True
-    if any(MUTATING.search(a) for a in out if a.startswith("-")):
-        return None, False, f"{tool}: a mutating flag remains after the allowlisted rewrite"
-    return out, changed, spec["reason"]
-
-
-def read_only_form(command, scripts=None, execp=""):
-    """Deterministic read-only form of ONE check command. Only READ_ONLY_FORMS tools are rewritten; unknown semantics are
-    never guessed. → {cmd (runnable) | None, derived, reason, confidence: exact (unchanged) | high (allowlisted) | none}"""
-    toks, text = resolve_command(command, scripts or {})
-    if toks is None:
-        if MUTATING.search(text):
-            return {"cmd": None, "derived": False, "confidence": "none",
-                    "reason": "shell operators/substitution with a mutating flag: not derived"}
-        return {"cmd": command, "derived": False, "confidence": "exact", "reason": "no mutating flag; runs as configured"}
-    tool = os.path.basename(toks[0])
-    if tool in READ_ONLY_FORMS:
-        args, changed, why = read_only_args(tool, toks[1:])
-        if args is None:
-            return {"cmd": None, "derived": False, "confidence": "none", "reason": why}
-        if not changed:
-            return {"cmd": command, "derived": False, "confidence": "exact", "reason": f"{tool} is already read-only"}
-        return {"cmd": (execp + " " if execp else "") + shlex.join([toks[0]] + args), "derived": True, "confidence": "high", "reason": why}
-    if any(MUTATING.search(t) for t in toks[1:] if t.startswith("-")):
-        return {"cmd": None, "derived": False, "confidence": "none",
-                "reason": f"`{tool}` has a mutating flag and is not in the read-only allowlist: not guessed"}
-    return {"cmd": command, "derived": False, "confidence": "exact", "reason": "no mutating flag; runs as configured"}
-
-
-def package_scripts(root, rmap):
-    """→ (scripts, run prefix, exec prefix, deps) from package.json, or None without one."""
-    pj = root / "package.json"
-    if not pj.exists():
-        return None
-    try:
-        pkg = json.loads(pj.read_text())
-    except (OSError, ValueError):
-        pkg = {}
-    pkg = pkg if isinstance(pkg, dict) else {}
-    pm = rmap.get("package_manager") or "npm"
-    return (pkg.get("scripts") or {}, {"yarn": "yarn", "pnpm": "pnpm", "bun": "bun run"}.get(pm, "npm run"),
-            {"yarn": "yarn", "pnpm": "pnpm exec", "bun": "bunx"}.get(pm, "npx"), {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})})
+NOISE_STATUSES = ("NOISE_ONLY", "GENERATED_ONLY")
 
 
 def check_commands(root, rmap):
@@ -1098,141 +978,52 @@ def check_commands(root, rmap):
     return cmds
 
 
-def diag_categories(task):
-    """→ (required, optional, deferred). Categories the task names are REQUIRED. A broad task requires typecheck + lint and
-    runs every other configured check as OPTIONAL: an optional check without a safe read-only form warns, never blocks."""
-    named = [c for c, rx in (("typecheck", r"type ?script|\bts\b|\btypes?\b|typecheck|type-check|\btsc\b|типиз"),
-                             ("lint", r"\blint|eslint|линт|warnings?|предупрежд"), ("style", r"stylelint|\bs?css\b|\bstylesheets?\b"),
-                             ("test", r"\btests?\b|тест"), ("build", r"\bbuild\b|compil|сборк"), ("format", r"format|prettier|формат"))
-             if re.search(rx, task, re.I)]
-    if named and not re.search(r"\ball\b.{0,40}\b(errors|problems|issues|checks)\b(?!.{0,30}\b(type|lint|test|build))|\bevery\b|\bproject\b|все", task, re.I):
-        return named, [], []
-    return ["typecheck", "lint"], ["style", "test", "format", "build"], ["build"]
-
-
 def safe_diag_commands(root, rmap):
-    """→ {category: {cmd, source, note, configured_command, derived_read_only_command, derivation_reason, confidence}}.
-    An existing read-only script always wins; otherwise the first script with an allowlisted read-only form; otherwise
-    cmd=None (UNAVAILABLE). A mutating command is never run as a diagnostic."""
-    out, pkg = {}, package_scripts(root, rmap)
-    if pkg:
-        scripts, run, execp, deps = pkg
-        for cat, names in DIAG_SCRIPTS.items():
-            best = None
-            for n in names:
-                if not scripts.get(n):
-                    continue
-                f = read_only_form(f"{run} {n}", scripts, execp)
-                rec = {"cmd": f["cmd"], "source": f"script `{n}`", "configured_command": f"{run} {n}", "configured_script": scripts[n],
-                       "derived_read_only_command": f["cmd"] if f["derived"] else None, "derivation_reason": f["reason"],
-                       "confidence": f["confidence"],
-                       "note": (f"derived from `{n}`: {f['reason']}" if f["derived"] else f"script `{n}`" if f["cmd"]
-                                else f"`{n}` modifies files; {f['reason']}")}
-                if f["confidence"] == "exact":
-                    best = rec
-                    break
-                if best is None or (best["cmd"] is None and rec["cmd"]):
-                    best = rec
-            if best:
-                out[cat] = best
-        if "typecheck" not in out and "typescript" in deps and (root / "tsconfig.json").exists():
-            c = f"{execp} tsc --noEmit"
-            out["typecheck"] = {"cmd": c, "source": "derived (TypeScript project)", "configured_command": None,
-                                "derived_read_only_command": c, "derivation_reason": "typescript + tsconfig.json, no typecheck script",
-                                "confidence": "high", "note": "derived (TypeScript project)"}
-    else:
-        for cat in ("typecheck", "lint", "style", "test", "format", "build"):  # non-node: the repo map's commands
-            c = rmap.get("commands", {}).get(cat)
-            if c:
-                f = read_only_form(c)
-                out[cat] = {"cmd": f["cmd"], "source": "repo-map", "configured_command": c,
-                            "derived_read_only_command": f["cmd"] if f["derived"] else None, "derivation_reason": f["reason"],
-                            "confidence": f["confidence"], "note": "" if f["confidence"] == "exact" else f["reason"]}
+    """→ {category: record} for the script-backed evidence sources, read-only forms only (pre-registry API)."""
+    ctx, out = DIAG.Context(root, rmap), {}
+    for a in DIAG.adapters().values():
+        if hasattr(a, "from_scripts"):
+            rec = a.from_scripts(ctx) or (a.derive(ctx, False) if a.derive else None)
+            if rec:
+                out[a.category] = rec
     return out
 
 
-def tracked_css(root):
-    return bool(sh(["git", "ls-files", "--", "*.css", "*.scss", "*.sass", "*.less"], cwd=root)[1].strip())
+def diag_plan(task, root, rmap, evidence=None):
+    """Evidence plan for a maintenance task (pre-registry API; see diagnostics.plan_rows)."""
+    sig = classify(task, root)[3]
+    return DIAG.plan_rows(task, DIAG.Context(root, rmap, task, evidence), maintenance=True, broad=sig.get("broad", True), supplied=evidence)
 
 
-def diag_plan(task, root, rmap):
-    """→ [{cat, need, state, cmd, note, configured_command, derived_read_only_command, derivation_reason, confidence}].
-    need: required | optional · state: run | deferred | unavailable | not configured."""
-    req, opt, deferred = diag_categories(task)
-    cmds = safe_diag_commands(root, rmap)
-    rows = []
-    for cat in DIAG_CATS:
-        if cat not in req and cat not in opt:
-            continue
-        need, c = ("required" if cat in req else "optional"), cmds.get(cat)
-        rec = {k: (c or {}).get(k) for k in ("configured_command", "derived_read_only_command", "derivation_reason", "confidence")}
-        if not c:
-            if need == "optional" and (cat == "format" or (cat == "style" and not tracked_css(root))):
-                continue  # optional format/style checks join broad runs only when configured (or source CSS exists)
-            rows.append(dict(rec, cat=cat, need=need, cmd=None, state="not configured",
-                             note="no stylelint script; source CSS is not linted" if cat == "style" else ""))
-        elif not c["cmd"]:
-            rows.append(dict(rec, cat=cat, need=need, cmd=None, state="unavailable", note=c["note"]))
-        else:
-            rows.append(dict(rec, cat=cat, need=need, cmd=c["cmd"], state="deferred" if cat in deferred else "run", note=c["note"] or c["source"]))
-    return rows
+def required_gaps(rows):
+    """REQUIRED sources that cannot be read: the task can never be DONE, so it BLOCKS before any check or model call."""
+    return [r for r in rows or [] if r.get("need", "required") == "required" and r["state"] == "unavailable"]
 
 
-# ── generated output (evidence-based; never treated as source) ────────────────
-OUTPUT_DIR = re.compile(r"^(dist|build|out|output|coverage|storybook-static|target|\.next|\.nuxt|\.output|\.svelte-kit|\.turbo|\.vite)([-_.][\w.-]+)?$")
-OUTPUT_KEY = re.compile(r"out-?dir|outputpath|output|dest\b|distdir|builddir|--out\b|\s-o\s", re.I)
-
-
-def generated_dirs(root):
-    """Top-level build/test output dirs. Name pattern AND evidence (git-ignored, or named as an output in package.json /
-    build config) — a tracked source dir that merely looks like `build/` is not generated. → {dir: evidence}"""
-    try:
-        cands = sorted(p.name for p in root.iterdir() if p.is_dir() and not p.is_symlink() and OUTPUT_DIR.match(p.name))
-    except OSError:
-        return {}
-    if not cands:
-        return {}
-    _, ign = sh(["git", "check-ignore", "--"] + [c + "/" for c in cands], cwd=root)
-    ignored = {x.strip().rstrip("/") for x in ign.splitlines()}
-    cfg = []
-    for p in [root / "package.json", root / "angular.json"] + sorted(root.glob("*.config.*")) + sorted(root.glob("tsconfig*.json")):
-        try:
-            if p.is_file() and p.stat().st_size < 200_000:
-                cfg += [(p.name, line) for line in p.read_text(errors="replace").splitlines() if OUTPUT_KEY.search(line)]
-        except OSError:
-            continue
+def parse_evidence(specs):
+    """--evidence [SOURCE=]PATH (repeatable) → {SOURCE or "": [absolute paths]}; paths are relative to the current directory."""
     out = {}
-    for c in cands:
-        # A path literal, not a bare word (`build: {` is a config key): "dist" / './dist/x', `dist-${mode}`, --outDir dist
-        pre = re.match(r"^([a-z]+[-_.])\w", c)  # `dist-${mode}` names dist-dev, dist-master, …
-        lit = re.compile(r"[\"'`](?:\./)?" + re.escape(c) + r"(?=[/\"'`])|(?:--out-?dir|--outDir|--output(?:-path)?|--dest|\s-o)[= ](?:\./)?"
-                         + re.escape(c) + r"(?![\w-])" + (r"|[\"'`](?:\./)?" + re.escape(pre.group(1)) + r"\$\{" if pre else ""))
-        ev = (["git-ignored"] if c in ignored else []) + sorted({f"output in {name}" for name, line in cfg if lit.search(line)})
-        if ev:
-            out[c] = ", ".join(ev)
+    for spec in specs or []:
+        m = re.match(r"^([A-Za-z][\w:.-]*)=(.+)$", spec)
+        src, path = (m.group(1), m.group(2)) if m and not Path(spec).exists() else ("", spec)
+        out.setdefault(src, []).append(str(Path(path).expanduser().resolve()))
     return out
 
 
-def generated_classifier(root, dirs=None):
-    """→ is_generated(path) for diagnostics paths (relative or absolute). True for evidence-based output dirs, vendor code
-    (node_modules), and git-ignored files under an output-named directory at any depth. `.dirs` holds the evidence."""
-    dirs = generated_dirs(root) if dirs is None else dirs
-    bases, memo = {str(root) + os.sep, str(root.resolve()) + os.sep}, {}
-
-    def is_gen(path):
-        p = str(path).strip()
-        for base in bases:
-            if p.startswith(base):
-                p = p[len(base):]
-                break
-        if p not in memo:
-            parts = Path(p).parts
-            memo[p] = bool(parts) and (parts[0] in dirs or "node_modules" in parts or (
-                any(OUTPUT_DIR.match(x) for x in parts[:-1]) and not os.path.isabs(p)
-                and sh(["git", "check-ignore", "-q", "--", p], cwd=root)[0] == 0))
-        return memo[p]
-    is_gen.dirs = dirs
-    return is_gen
+def render_plan(rows):
+    """Evidence plan before anything runs, with the unblock steps for every REQUIRED source that cannot be read."""
+    lines = []
+    for d in rows:
+        what = d.get("cmd") or (", ".join(Path(e).name for e in d["evidence"]) if d.get("evidence") else "")
+        lines.append(f"     {d.get('source') or d['cat'].upper():<20} {d.get('need', 'required').upper():<9} {d['state']:<15} {what}"
+                     + (f"   ({d['note']})" if d.get("note") else ""))
+    gaps = required_gaps(rows)
+    if gaps:
+        lines.append("  ■ BLOCKED before any check or model call — REQUIRED_EVIDENCE_UNAVAILABLE: " + ", ".join(g["source"] for g in gaps))
+        for g in gaps:
+            steps = (g.get("unblock") or "").splitlines()
+            lines += [f"     unblock {g['source']}: {steps[0]}"] + [f"       {s}" for s in steps[1:]] if steps else []
+    return "\n".join(lines)
 
 
 def generated_notes(root, is_gen, task_paths=()):
@@ -1287,106 +1078,146 @@ def gen_restore(root, dirs, before):
     return restored, lost
 
 
-def diag_entries(output):
-    """(file | None, severity) for each structured diagnostic line."""
-    out, cur = [], None
-    for line in ANSI_RE.sub("", output or "").splitlines():
-        m = DIAG_RE.match(line.strip())
-        if m:
-            out.append((m.group("file"), m.group("sev").lower()))
-        elif FILE_LINE.match(line.strip()):
-            cur = line.strip()
-        elif ESLINT_ROW.match(line):
-            out.append((cur, "warning" if ESLINT_ROW.match(line).group("sev").lower() in ("warning", "⚠") else "error"))
-    return out
-
-
-def run_diag(root, row, want_warnings, runner=None, is_gen=None):
-    """Run one read-only diagnostic. → status PASS / FAIL (source errors, or source warnings when the task asks for them) /
-    GENERATED_ONLY (only generated/vendor files flagged: not a source failure) / BROKEN (the check itself is misconfigured)."""
-    t0 = time.time()
-    if runner:
-        ok, out = runner(row["cmd"])
+def run_diag(root, row, want_warnings, runner=None, is_gen=None, scope=(), spelling=False):
+    """Execute or read one evidence row (T0, read-only) → normalized, classified findings and a status (see restatus).
+    Supplied evidence is read, a command runs in its read-only form, a report a command writes is read fresh or the row is
+    BROKEN — a failing or unreadable source never reads as clean."""
+    t0, core = time.time(), DIAG.core
+    src = row.get("source") or row["cat"].upper()
+    adapter = DIAG.adapters().get(row.get("source") or "")
+    ok, out, found, broken = True, "", [], ""
+    if row.get("evidence"):
+        for p in row["evidence"]:
+            try:
+                found += core.load_evidence(p, src)[1]
+            except (OSError, ValueError) as e:
+                broken = f"evidence unreadable: {e}"
     else:
-        try:
-            r = subprocess.run(row["cmd"], shell=True, cwd=root, capture_output=True, text=True, timeout=LIM["verify_timeout_s"])
-            ok, out = r.returncode == 0, r.stdout + r.stderr
-        except subprocess.TimeoutExpired:
-            ok, out = False, "timeout"
-    is_gen = is_gen or (lambda p: False)
-    fps, raw = diagnostics(out)
-    gen_fps = {fp for fp in fps if fp.count("|") == 2 and is_gen(fp.split("|")[0])}
-    src_n, gen_n = sum(n for fp, n in fps.items() if fp not in gen_fps), sum(fps[fp] for fp in gen_fps)
-    entries = diag_entries(out)
-    warns = sum(1 for f, s in entries if s == "warning" and not (f and is_gen(f)))
-    gen_warns = sum(1 for f, s in entries if s == "warning" and f and is_gen(f))
-    errs = (src_n or (0 if gen_n else 1)) if not ok else 0
-    status = "FAIL" if (not ok and errs) or (want_warnings and warns) else "PASS"
-    note = row.get("note", "")
-    structured = bool(entries)
-    if not ok and not structured and BROKEN_CHECK_RE.search(out):
-        status = "BROKEN"  # the check itself is misconfigured: not a code problem, but it also can't prove "clean"
-        note = "check misconfigured: " + BROKEN_CHECK_RE.search(out).group(0)
-    elif status == "PASS" and (gen_n or gen_warns) and (not ok or want_warnings):
-        status = "GENERATED_ONLY"
-        note = f"{max(gen_n, gen_warns)} diagnostic(s) only in generated/vendor output — not source failures"
-    return dict(row, ok=ok, status=status, note=note, errors=errs, warnings=warns, generated=max(gen_n, gen_warns),
-                out=redact(out[-60000:]), s=round(time.time() - t0))
+        report = root / row["output"] if row.get("output") else None
+        if report is not None:
+            report.unlink(missing_ok=True)  # a stale report is never read as fresh evidence
+        outs = []
+        for c in row.get("cmds") or [row["cmd"]]:
+            if runner:
+                c_ok, c_out = runner(c)
+            else:
+                try:
+                    r = subprocess.run(c, shell=True, cwd=root, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                                       timeout=row.get("timeout") or LIM["verify_timeout_s"])
+                    c_ok, c_out = r.returncode == 0, r.stdout + r.stderr
+                except subprocess.TimeoutExpired:
+                    c_ok, c_out = False, "timeout"
+            ok, outs = ok and c_ok, outs + [c_out]
+        out = "\n".join(outs)
+        if report is not None:
+            if report.is_file():
+                try:
+                    found = core.load_evidence(report, src)[1]
+                except (OSError, ValueError) as e:
+                    broken = f"report unreadable: {e}"
+            else:
+                broken = f"no report at {row['output']}: the command did not produce its evidence"
+        elif row.get("parser") not in (None, "text") and out.strip():
+            try:
+                found = core.parse_evidence_text(out, src)[1]
+            except ValueError:
+                found = core.parse_text(out, src, failed=not ok)
+        else:
+            found = adapter.parse(out, None, failed=not ok) if adapter else core.parse_text(out, src, failed=not ok)
+    for f in found:
+        core.classify(f, is_gen, root, scope)
+    return restatus(dict(row, ok=ok and not broken, out=redact(out[-60000:]), s=round(time.time() - t0), findings=found[:5000],
+                         want_warnings=want_warnings or (not ok and not row.get("evidence")), spelling=spelling, broken=broken))
+
+
+def restatus(r):
+    """Status from classified findings: PASS · FAIL (actionable source findings, or a failure nothing explains) ·
+    NOISE_ONLY (only generated / third-party / IDE-only / low-value findings) · BROKEN (misconfigured check, unreadable evidence).
+    Recomputed when an authority reclassifies findings."""
+    found = r.get("findings") or []
+    for f in found:
+        f["actionable"] = DIAG.core.actionable(f, r.get("want_warnings"), r.get("spelling"))
+    act = [f for f in found if f["actionable"]]
+    noise = Counter(f["class"] for f in found if not f["actionable"])
+    status, note = "PASS", r.get("note", "")
+    if r.get("broken"):
+        status, note = "BROKEN", r["broken"]
+    elif not r["ok"] and not any(not f.get("fallback") for f in found) and BROKEN_CHECK_RE.search(r.get("out", "")):
+        status, note = "BROKEN", "check misconfigured: " + BROKEN_CHECK_RE.search(r["out"]).group(0)
+    elif act or (not r["ok"] and not found):
+        status = "FAIL"
+    elif noise:
+        status, n = "NOISE_ONLY", sum(noise.values())
+        note = (f"{n} diagnostic(s) only in generated/vendor output — not source failures" if set(noise) <= {"GENERATED_OUTPUT", "THIRD_PARTY"}
+                else f"{n} non-actionable: " + ", ".join(f"{'source warnings (not requested)' if k == 'REAL_SOURCE_WARNING' else k} {v}"
+                                                        for k, v in noise.most_common()))
+    return dict(r, status=status, note=note, errors=len(act) or int(status == "FAIL"), actionable=len(act),
+                warnings=sum(1 for f in found if f["class"] == "REAL_SOURCE_WARNING"),
+                generated=noise["GENERATED_OUTPUT"] + noise["THIRD_PARTY"], classes=dict(Counter(f["class"] for f in found)))
 
 
 def overall_state(results):
-    """DIRTY: a check found source problems. INCOMPLETE: a REQUIRED check could not run (or nothing could).
-    CLEAN_WITH_WARNINGS: all that ran passed, but an OPTIONAL check was unavailable/misconfigured or only generated output
-    was flagged. CLEAN: every configured check ran and passed."""
+    """DIRTY: a source has actionable findings. INCOMPLETE: a REQUIRED source could not be read (or nothing could).
+    CLEAN_WITH_WARNINGS: all that ran is clean, but an OPTIONAL source was unavailable/misconfigured or only noise was
+    found. CLEAN: every selected source was read and is clean."""
     if any(r.get("status") == "FAIL" for r in results):
         return "DIRTY"
     gaps = [r for r in results if r["state"] == "unavailable" or r.get("status") == "BROKEN"
             or (r["state"] in RUN_STATES and r.get("status") is None)]
-    ran = [r for r in results if r.get("status") in ("PASS", "GENERATED_ONLY")]
+    ran = [r for r in results if r.get("status") in ("PASS",) + NOISE_STATUSES]
     if any(r.get("need", "required") == "required" for r in gaps) or (gaps and not ran):
         return "INCOMPLETE"
-    return "CLEAN_WITH_WARNINGS" if gaps or any(r.get("status") == "GENERATED_ONLY" for r in results) else "CLEAN"
+    return "CLEAN_WITH_WARNINGS" if gaps or any(r.get("status") in NOISE_STATUSES for r in results) else "CLEAN"
 
 
-def diag_vres(results):
-    """Aggregate results → verification rows that agree with overall_state: a required gap is BLOCKED, an optional gap or
-    generated-only finding is a warning, so "NOT DONE" never sits next to "PASS" and "DONE" never next to "BLOCKED"."""
+def group_key(r, f):
+    tmpl = re.sub(r"'[^']*'|\"[^\"]*\"|`[^`]*`|\d+", "X", norm_msg(f.get("message") or ""))[:90]
+    return f"{r.get('source') or r['cat'].upper()} {f.get('code') or ''} {tmpl}".strip()
+
+
+def diag_vres(results, addressed=frozenset()):
+    """Evidence results → verification rows that agree with overall_state: a REQUIRED gap is BLOCKED, an OPTIONAL gap or
+    noise-only source is a warning, static evidence whose findings were all addressed is PENDING_EVIDENCE (it can only be
+    re-verified by fresh evidence) — so "NOT DONE" never sits next to "PASS" and "DONE" never next to "BLOCKED"."""
     out = []
     for r in results:
-        need = r.get("need", "required")
+        need, label = r.get("need", "required"), r.get("source") or r["cat"]
         if r["state"] == "unavailable" or r.get("status") == "BROKEN":
             what = "UNAVAILABLE" if r["state"] == "unavailable" else "misconfigured"
-            out.append({"cmd": r.get("cmd") or r["cat"], "ok": need != "required", "s": r.get("s", 0), "tail": r.get("note", ""),
+            out.append({"cmd": r.get("cmd") or label, "ok": need != "required", "s": r.get("s", 0), "tail": r.get("note", ""),
                         "status": "BLOCKED" if need == "required" else "PASS_WITH_WARNINGS",
-                        "note": f"{r['cat']} {what} ({need}): {r.get('note') or 'no safe read-only command'}"})
-        elif r.get("status") == "GENERATED_ONLY":
-            out.append({"cmd": r["cmd"], "ok": True, "s": r.get("s", 0), "tail": "", "status": "PASS_WITH_WARNINGS", "note": r["note"]})
+                        "note": f"{label} {what} ({need}): {r.get('note') or 'no readable evidence'}"})
+        elif r.get("status") in NOISE_STATUSES:
+            out.append({"cmd": r.get("cmd") or label, "ok": True, "s": r.get("s", 0), "tail": "", "status": "PASS_WITH_WARNINGS", "note": r["note"]})
+        elif r.get("status") == "FAIL" and r.get("static") and {group_key(r, f) for f in r.get("findings") or [] if f.get("actionable")} <= set(addressed):
+            out.append({"cmd": label, "ok": False, "s": 0, "tail": "", "status": "PENDING_EVIDENCE",
+                        "note": f"{r['errors']} finding(s) from static {label} evidence addressed; only fresh {label} evidence can verify them"})
         elif r.get("status"):
-            out.append({"cmd": r["cmd"], "ok": r["status"] == "PASS", "s": r.get("s", 0), "tail": "",
+            out.append({"cmd": r.get("cmd") or label, "ok": r["status"] == "PASS", "s": r.get("s", 0), "tail": "",
                         "status": "PASS" if r["status"] == "PASS" else "FAIL", "pre": r["errors"], "new": 0, "fixed": 0})
     return out
 
 
 def group_diags(results, limit=12, is_gen=None):
-    """Deterministic root-cause groups over SOURCE diagnostics: same category + error code + message template.
-    Generated/vendor files are never handed to an implementer. → [{key, count, files, example}]"""
+    """Deterministic root-cause groups over ACTIONABLE findings (same source + code + message template). Noise classes
+    never reach an implementer, and a few groups per batch keep thousands of IDE warnings out of any prompt.
+    → [{key, count, files, example, static}]"""
     groups = {}
     for r in results:
         if r.get("status") != "FAIL":
             continue
-        fps, raw = diagnostics(r["out"])
-        for fp, n in fps.items():
-            parts = fp.split("|")
-            if len(parts) == 3:
-                f, code, msg = parts
-                if is_gen and is_gen(f):
-                    continue
-                tmpl = re.sub(r"'[^']*'|\"[^\"]*\"|\d+", "X", msg)[:90]
-            else:
-                f, code, tmpl = "(output)", "", fp[:90]
-            g = groups.setdefault(f"{r['cat']}|{code}|{tmpl}", {"key": f"{r['cat'].upper()} {code} {tmpl}".strip(), "count": 0, "files": set(), "example": raw[fp]})
-            g["count"] += n
-            g["files"].add(f)
+        found = r.get("findings")
+        if found is None:  # a pre-registry row that carries raw output only
+            found = [DIAG.core.classify(f, is_gen) for f in DIAG.core.parse_text(r.get("out", ""), r["cat"], failed=not r.get("ok", False))]
+            for f in found:
+                f["actionable"] = f["class"] in ("REAL_SOURCE_ERROR", "REAL_SOURCE_WARNING")
+        for f in found:
+            if f.get("actionable"):
+                key = group_key(r, f)
+                g = groups.setdefault(key, {"key": key, "count": 0, "files": set(), "example": f.get("raw") or f.get("message", ""),
+                                            "static": bool(r.get("static"))})
+                g["count"] += 1
+                g["files"].add(f.get("file") or "(output)")
     return sorted(groups.values(), key=lambda g: (-g["count"], len(g["files"])))[:limit]
 
 
@@ -1394,21 +1225,24 @@ def render_diags(results):
     lines = []
     for r in results:
         need = r.get("need", "required").upper()
-        head = f"  {r['cat'].upper():<10} {need:<9} "
+        head = f"  {r.get('source') or r['cat'].upper():<20} {need:<9} "
+        what = r.get("cmd") or ("evidence " + ", ".join(Path(e).name for e in r["evidence"]) if r.get("evidence") else "")
         derived = f"   (derived from {r['configured_command']}: {r['derivation_reason']})" if r.get("derived_read_only_command") and r.get("configured_command") else ""
         if r["state"] == "not configured":
             lines.append(head + "skipped — not configured" + (f" ({r['note']})" if r.get("note") else ""))
         elif r["state"] == "unavailable":
             lines.append(head + f"UNAVAILABLE — {r['note']}" + (" → blocks" if need == "REQUIRED" else " → warning, does not block"))
         elif r.get("status") is None:
-            lines.append(head + f"deferred until static checks are clean ({r['cmd']})")
+            lines.append(head + (f"deferred until static checks are clean ({what})" if r["state"] == "deferred" else f"planned: {what}"))
         elif r["status"] == "BROKEN":
-            lines.append(head + f"⚠ {r['cmd']} — {r['note']} (fix the script; not counted as code errors)")
-        elif r["status"] == "GENERATED_ONLY":
-            lines.append(head + f"⚠ {r['cmd']} — {r['note']}")
+            lines.append(head + f"⚠ {what} — {r['note']} (fix the script or evidence; not counted as code errors)")
+        elif r["status"] in NOISE_STATUSES:
+            lines.append(head + f"⚠ {what} — {r['note']}")
         else:
-            detail = (f"{r['errors']} error(s)" if not r["ok"] else "") + (f"{' · ' if not r['ok'] else ''}{r['warnings']} warning(s)" if r["warnings"] else "")
-            lines.append(head + f"{'✓' if r['status'] == 'PASS' else '✗'} {r['cmd']}" + (f" — {detail}" if detail else "") + derived)
+            detail = (f"{r['errors']} actionable" if r["status"] == "FAIL" else "") + (f"{' · ' if r['status'] == 'FAIL' else ''}{r['warnings']} warning(s)" if r["warnings"] else "")
+            lines.append(head + f"{'✓' if r['status'] == 'PASS' else '✗'} {what}" + (f" — {detail}" if detail else "") + derived)
+        if r.get("classes") and set(r["classes"]) - {"REAL_SOURCE_ERROR", "REAL_SOURCE_WARNING"}:
+            lines.append(" " * 33 + "classes: " + " · ".join(f"{k} {v}" for k, v in sorted(r["classes"].items(), key=lambda kv: -kv[1])))
     return "\n".join(lines)
 
 
@@ -1580,12 +1414,18 @@ def review_size(root):
 
 
 # ── planning ───────────────────────────────────────────────────────────────────
-def plan(task, budget, forced=None, root=None, apply=False):
+def plan(task, budget, forced=None, root=None, apply=False, evidence=None):
     intent, cx, conf, sig = classify(task, root, forced)
     b = CFG["budgets"][budget]
     base = {"intent": intent, "complexity": cx, "confidence": conf, "signals": sig, "budget": budget, "steps": [], "apply": apply,
             "max_tier": b["max_tier"], "max_parallel": b["max_parallel"], "judge": b["judge"], "review": b["review"],
-            "cross_review": rank(cx) >= rank(b["cross_review_from"])}
+            "cross_review": rank(cx) >= rank(b["cross_review_from"]), "evidence": evidence or None}
+    ctx = DIAG.Context(root, load_map(root), task, evidence) if root is not None and intent not in ("META", "INSPECTION", "TOOL") else None
+    if ctx is not None and intent in ("REVIEW", "QUESTION", "UNKNOWN") and (sig.get("audit") or evidence):
+        # read-only evidence audit: T0, 0 model calls; BLOCKED when a named source cannot be read
+        return dict(base, local=True, evidence_audit=True, diagnostics=DIAG.plan_rows(task, ctx, supplied=evidence))
+    if evidence and intent in CODE_INTENTS and sig.get("fix_only"):
+        sig["aggregate"] = True
     if intent == "REVIEW" and root is not None:
         rt, rcls, rwhy = review_size(root)
         base.update(review_class=rcls, review_reason=rwhy)
@@ -1611,10 +1451,10 @@ def plan(task, budget, forced=None, root=None, apply=False):
         pipe.update(b.get("add", {}).get(cx, {}) if cx != "MICRO" else {})
         for r in b.get("drop", {}).get(cx, []):
             pipe.pop(r, None)
-        if sig["maintenance"]:
-            pipe = {"implementer": 2, "reviewer": 2}  # deterministic diagnostics replace the explorer
-            if root is not None:
-                base["diagnostics"] = diag_plan(task, root, load_map(root))
+        if sig["aggregate"]:
+            pipe = {"implementer": 2, "reviewer": 2}  # deterministic evidence replaces the explorer
+            if ctx is not None:
+                base["diagnostics"] = DIAG.plan_rows(task, ctx, maintenance=sig["maintenance"], broad=sig["broad"], supplied=evidence)
         elif cx == "MEDIUM" and sig["paths"] and not sig["analysis_first"]:
             pipe.pop("explorer", None)
         if sig["analysis_first"]:
@@ -1625,7 +1465,11 @@ def plan(task, budget, forced=None, root=None, apply=False):
             pipe.setdefault("explorer", 1); pipe.setdefault("architect", 2)
         if RESEARCH.search(task):
             pipe["researcher"] = 1
-    rmap = load_map(root) if root else {}
+    if ctx is not None and intent in CODE_INTENTS and not sig.get("aggregate"):
+        gate = [r for r in DIAG.plan_rows(task, ctx, supplied=evidence) if r["need"] == "required"]
+        if gate:  # the task depends on named evidence: it is read (T0) before DONE; unreadable → BLOCKED before any model call
+            base["evidence_gate"] = gate
+    rmap = ctx.rmap if ctx is not None else {}
     impl_provider, g = None, CFG["gates"]["architect"]
     for role in ("answer", "explorer", "researcher", "architect", "implementer", "reviewer"):
         if role not in pipe:
@@ -1676,6 +1520,9 @@ def print_plan(p, root, rmap, task):
           f"Providers: {', '.join(available()) or 'none'}" + "".join(f" ({k} limited until {v[11:16]})" for k, v in cool.items()))
     if p["signals"].get("note"):
         print(f"Note:   {p['signals']['note']}")
+    if p.get("evidence_audit"):
+        print("  T0 evidence audit (read-only; 0 model calls; a REQUIRED source that cannot be read → BLOCKED):\n" + render_plan(p["diagnostics"]))
+        return
     if p.get("local"):
         what = {"META": f"local answer ({p['signals'].get('meta', 'status')})", "INSPECTION": "git status / diff --stat",
                 "REVIEW": p.get("review_reason", "nothing to review"),
@@ -1684,10 +1531,14 @@ def print_plan(p, root, rmap, task):
         return
     llm = [s for s in p["steps"] if s["provider"]]
     if p.get("diagnostics") is not None:
-        print("  T0 aggregate diagnostics (read-only; REQUIRED must run and pass · OPTIONAL unavailable → warning, not a block):")
-        for d in p["diagnostics"]:
-            print(f"     {d['cat'].upper():<10} {d.get('need', 'required').upper():<9} {d['state']:<15} {d['cmd'] or ''}"
-                  + (f"   ({d['note']})" if d.get("note") else ""))
+        print("  T0 evidence plan (read-only; REQUIRED sources must be read and clean before DONE · OPTIONAL unavailable → warning):")
+        print(render_plan(p["diagnostics"]))
+    if p.get("evidence_gate"):
+        print("  T0 evidence gate (REQUIRED sources read before DONE; unreadable → BLOCKED before any model call):")
+        print(render_plan(p["evidence_gate"]))
+    if required_gaps(p.get("diagnostics") or p.get("evidence_gate")):
+        print("Cost:   0 model calls — BLOCKED until the REQUIRED evidence above can be read")
+        return
     for s in p["steps"]:
         if not s["provider"]:
             print(f"  T{s['tier']} {s['role']:<11} SKIPPED — {s['note']}")
@@ -1856,6 +1707,8 @@ def record(root, p, log, ok, review, vres, vreason, tdir, dur, escalations, prun
 
 
 def local(p, root, rmap, task):
+    if p.get("evidence_audit"):
+        return Run(task, p, root, rmap).evidence_audit()
     k = p["signals"].get("meta", "status") if p["intent"] == "META" else p["intent"]
     rc = 0
     if k == "providers":
@@ -1917,7 +1770,7 @@ class Run:
         self.log, self.escalations, self.t0 = [], [], time.time()
         self.last, self.pruned, self.fingerprints = {}, [], {}
         self.cmds = check_commands(root, rmap)  # never a mutating script as a check (e.g. `lint` = eslint --fix)
-        self.diag_cmd, self._gen, self.gen_edits = None, None, []
+        self.diag_cmd, self._ctx, self.gen_edits, self.gate_done, self.strict_cmds = None, None, [], False, set()
         self.before, self.pre, self.base_cache = None, {}, {}
         (self.dir / "plan.json").write_text(redact(json.dumps({**p, "task": task}, indent=1, default=str)))
 
@@ -1979,23 +1832,40 @@ class Run:
         if out.get("decision"):
             self.st["decision"] = str(out["decision"])[:800]
 
+    def ctx(self):
+        """Per-run evidence context (lazy facts shared by adapters; supplied evidence attached)."""
+        if self._ctx is None:
+            self._ctx = DIAG.Context(self.root, self.rmap, self.task, self.p.get("evidence"))
+        return self._ctx
+
     def gen(self):
         """Evidence-based generated-output classifier for this repository (computed once per run)."""
-        if self._gen is None:
-            self._gen = generated_classifier(self.root)
-        return self._gen
+        return self.ctx().is_gen
+
+    def evidence_rows(self):
+        """This task's evidence plan with the run's repo map (T0): required / optional sources and how each is read."""
+        sig = self.p.get("signals") or {}
+        return DIAG.plan_rows(self.task, self.ctx(), maintenance=sig.get("maintenance", True), broad=sig.get("broad", True),
+                              supplied=self.p.get("evidence"))
 
     def run_diagnostics(self, rows, runner=None):
-        """Read-only diagnostics; anything a check writes is restored immediately and reported (never silent)."""
-        want_warn = bool(re.search(r"warning|предупрежд", self.task, re.I))
+        """Read-only evidence; anything a check writes is restored immediately and reported (never silent). A source that
+        ran clean settles the IDE findings it is authoritative for (IDE_FALSE_POSITIVE)."""
+        want_warn = bool(re.search(r"warning|issue|problem|предупрежд|проблем", self.task, re.I))
+        # a source the task names is about all of its real findings, unless the task limits itself to errors
+        errors_only = bool(re.search(r"\berrors?\b|ошибк", self.task, re.I)) and not re.search(
+            r"warning|issue|problem|inspection|finding|result|предупрежд|проблем", self.task, re.I)
+        spelling = bool(re.search(r"spell|typo|grammar|опечат|орфограф", self.task, re.I))
+        is_gen = self.gen()
+        scope = [x for x in (self.p.get("signals") or {}).get("paths", []) if not is_gen(x)]
         results = []
         for row in rows:
-            if row["state"] not in RUN_STATES or not row["cmd"]:
+            if row["state"] not in RUN_STATES or not (row.get("cmd") or row.get("cmds") or row.get("evidence")):
                 results.append(dict(row, status=None))
                 continue
             snap = snapshot(self.root)
             saved = {f: ((self.root / f).read_bytes() if (self.root / f).is_file() else None) for f in (snap or {})}
-            r = run_diag(self.root, row, want_warn, runner, self.gen())
+            r = run_diag(self.root, row, want_warn or bool(row.get("explicit") and not errors_only), runner, is_gen, scope, spelling)
             touched = changed(self.root, snap) if snap is not None else []
             if touched:
                 for f in touched:
@@ -2007,64 +1877,133 @@ class Run:
                         old.write_bytes(prev)
                 r["note"] = f"check modified {len(touched)} file(s) — restored; treat this command as mutating"
                 r["status"], r["ok"] = "BROKEN", False
-                self.say(f"  ! {row['cmd']} modified files during a read-only baseline ({', '.join(touched[:3])}); restored")
+                self.say(f"  ! {row.get('cmd')} modified files during a read-only baseline ({', '.join(touched[:3])}); restored")
             results.append(r)
+        clean = {r.get("source") for r in results if r.get("status") in ("PASS",) + NOISE_STATUSES}
+        for i, r in enumerate(results):
+            dup = {c for src, codes in (r.get("authorities") or {}).items() if src in clean for c in codes}
+            if dup and r.get("findings"):
+                for f in r["findings"]:
+                    if f["class"] in ("REAL_SOURCE_ERROR", "REAL_SOURCE_WARNING") and f.get("code") in dup:
+                        f["class"] = "IDE_FALSE_POSITIVE"
+                results[i] = restatus(r)
         return results
+
+    def save_baseline(self, results):
+        rows = [{k: (v[:50] if k == "findings" else v) for k, v in r.items() if k != "out"} for r in results]
+        (self.dir / "diagnostics-baseline.json").write_text(json.dumps(rows, indent=1, default=str))
 
     def diag_reason(self, results, ok, text):
         gap = lambda r: r["state"] == "unavailable" or r.get("status") == "BROKEN"  # noqa: E731
+        label = lambda r: r.get("source") or r["cat"]  # noqa: E731
         if not ok:
-            text += " (NOT clean: " + ", ".join(r["cat"] for r in results if r.get("status") == "FAIL"
+            text += " (NOT clean: " + ", ".join(label(r) for r in results if r.get("status") == "FAIL"
                                                  or (gap(r) and r.get("need", "required") == "required")) + ")"
-        warn = [f"{r['cat']} unavailable (optional)" for r in results if gap(r) and r.get("need", "required") == "optional"]
-        warn += [f"{r['cat']}: generated output only" for r in results if r.get("status") == "GENERATED_ONLY"]
+        warn = [f"{label(r)} unavailable (optional)" for r in results if gap(r) and r.get("need", "required") == "optional"]
+        warn += [f"{label(r)}: {r['note']}" for r in results if r.get("status") in NOISE_STATUSES]
         return (text + (" · warnings: " + "; ".join(warn) if warn else "")
                 + (f" · {len(self.gen_edits)} generated-file edit(s) reverted" if self.gen_edits else ""))
 
+    def block(self, rows, gaps):
+        """REQUIRED_EVIDENCE_UNAVAILABLE: stop before any check or model call and say exactly what would unblock the task."""
+        self.say("  T0 evidence plan:\n" + render_plan(rows))
+        ids = ", ".join(g["source"] for g in gaps)
+        vres = [{"cmd": g["source"], "ok": False, "s": 0, "tail": g.get("note", ""), "status": "BLOCKED",
+                 "note": f"REQUIRED_EVIDENCE_UNAVAILABLE — {g.get('note') or 'no readable evidence'}"} for g in gaps]
+        hint = "\n".join(f"{g['source']}: {g['unblock']}" for g in gaps if g.get("unblock"))
+        return self.finish(False, [], "skipped", vres, f"REQUIRED_EVIDENCE_UNAVAILABLE: {ids}", header="BLOCKED", hint=hint)
+
+    def evidence_audit(self):
+        """Read-only evidence audit (T0, 0 model calls): read every selected source, classify, group by root cause, report."""
+        rows = self.evidence_rows()
+        gaps = required_gaps(rows)
+        if gaps:
+            return self.block(rows, gaps)
+        results = self.run_diagnostics(rows)
+        state = overall_state(results)
+        self.save_baseline(results)
+        notes = generated_notes(self.root, self.gen(), (self.p.get("signals") or {}).get("paths", []))
+        self.say("  T0 evidence audit (read-only, 0 model calls):\n" + render_diags(results) + "".join("\n" + x for x in notes) + f"\n  Overall: {state}")
+        for g in group_diags(results, is_gen=self.gen()):
+            self.say(f"  group ×{g['count']:<4} {g['key'][:90]}  ({len(g['files'])} file(s))  e.g. {g['example'][:120]}")
+        ok = state in CLEAN_STATES
+        header = "DONE" if ok else "FINDINGS" if state == "DIRTY" else "BLOCKED"
+        return self.finish(ok, [], "skipped", diag_vres(results), self.diag_reason(results, ok, "evidence audit"), header=header,
+                           hint="to fix them, ask for a fix with the same sources/evidence, e.g. ai-team \"fix <source> findings\"" if state == "DIRTY" else "")
+
+    def evidence_gate(self, ok, vres, vreason):
+        """Early-exit rule, at the one place every DONE passes: each REQUIRED evidence source of this task must have been read
+        clean. Evidence-driven paths (repair, audit) already did that; other paths read the sources now (T0).
+        → (ok, vres, vreason, header, hint)"""
+        gate = [r for r in self.p.get("evidence_gate") or [] if r.get("need") == "required"]
+        if not ok or not gate or self.gate_done:
+            return ok, vres, vreason, None, ""
+        self.gate_done = True
+        gaps = required_gaps(gate)
+        if gaps:
+            return (False, vres + [{"cmd": g["source"], "ok": False, "status": "BLOCKED", "note": "REQUIRED_EVIDENCE_UNAVAILABLE — " + g.get("note", "")}
+                                   for g in gaps], vreason + " · REQUIRED_EVIDENCE_UNAVAILABLE", "BLOCKED",
+                    "\n".join(f"{g['source']}: {g['unblock']}" for g in gaps if g.get("unblock")))
+        results = self.run_diagnostics(gate)
+        self.say("  T0 evidence gate (required before DONE):\n" + render_diags(results))
+        state = overall_state(results)
+        static = {group_key(r, f) for r in results if r.get("static") for f in r.get("findings") or [] if f.get("actionable")}
+        extra = diag_vres(results, static)
+        if state in CLEAN_STATES:
+            return True, vres + extra, vreason + " · required evidence clean", None, ""
+        pending = [r["source"] for r in results if r.get("static") and r.get("status") == "FAIL"]
+        return (False, vres + extra, self.diag_reason(results, False, vreason + " · required evidence"), None,
+                ("fresh evidence needed: ai-team --evidence " + pending[0] + "=<new report> \"<task>\"") if pending else "")
+
     def aggregate_repair(self, steps, cons, runner=None):
-        """Broad maintenance: baseline every configured category → group SOURCE diagnostics by root cause → fix groups in
-        bounded batches → re-run while progress is made. Done only when no check fails and no REQUIRED check is missing; an
-        OPTIONAL check without a safe read-only form is a warning. Generated output is never a fix target and never edited."""
-        rows = diag_plan(self.task, self.root, self.rmap)
+        """Evidence-driven repair. Plan the task's sources → BLOCK (0 checks, 0 model calls) if a REQUIRED source cannot be
+        read → read everything (T0) → group ACTIONABLE findings by root cause → fix a few groups per bounded batch → re-read
+        while progress is made. DONE only when no required source has actionable findings; findings from static (supplied)
+        evidence end as PENDING_EVIDENCE until fresh evidence confirms them. Generated output is never a target and never edited."""
+        rows = self.evidence_rows()
+        gaps = required_gaps(rows)
+        if gaps:
+            return self.block(rows, gaps)
         is_gen = self.gen()
         gdirs = sorted(is_gen.dirs)
         self.st["files"] = {f for f in self.st["files"] if not is_gen(f)}  # IDE_ONLY paths named in the task are not targets
         results = self.run_diagnostics(rows, runner)
         state = overall_state(results)
-        (self.dir / "diagnostics-baseline.json").write_text(json.dumps([{k: v for k, v in r.items() if k != "out"} for r in results], indent=1))
+        self.save_baseline(results)
         notes = generated_notes(self.root, is_gen, self.p["signals"].get("paths", []))
-        self.say("  T0 diagnostics baseline:\n" + render_diags(results) + "".join("\n" + x for x in notes) + f"\n  Overall: {state}")
-        active = rows
+        self.say("  T0 evidence baseline:\n" + render_diags(results) + "".join("\n" + x for x in notes) + f"\n  Overall: {state}")
+        active = [dict(r, evidence=None) if r.get("evidence") and r.get("cmd") else r for r in rows]  # supplied baseline, then re-run
         if state in CLEAN_STATES:
             deferred = [r for r in rows if r["state"] == "deferred" and r["cmd"]]
             if deferred:  # static checks clean → run the deferred build once before calling the project clean
-                active = [dict(r, state="run") if r["state"] == "deferred" and r["cmd"] else r for r in rows]
+                active = [dict(r, state="run") if r["state"] == "deferred" and r["cmd"] else r for r in active]
                 extra = self.run_diagnostics([dict(r, state="run") for r in deferred], runner)
                 self.say(render_diags(extra))
                 results = [r for r in results if r["state"] != "deferred"] + extra
                 state = overall_state(results)
             if state in CLEAN_STATES:
-                return self.finish(True, [], "skipped", diag_vres(results), self.diag_reason(results, True, "all required diagnostics clean"))
+                return self.finish(True, [], "skipped", diag_vres(results), self.diag_reason(results, True, "all required evidence clean"))
         if state == "INCOMPLETE":
-            gaps = ", ".join(f"{r['cat']} ({r.get('need', 'required')}{', misconfigured' if r.get('status') == 'BROKEN' else ''})"
+            gaps = ", ".join(f"{r.get('source') or r['cat']} ({r.get('need', 'required')}{', misconfigured' if r.get('status') == 'BROKEN' else ''})"
                              for r in results if r["state"] == "unavailable" or r.get("status") == "BROKEN")
-            self.say(f"  no failures in the checks that could run; NOT reporting clean — not checkable read-only: {gaps}")
+            self.say(f"  no failures in the sources that could be read; NOT reporting clean — not readable: {gaps}")
             vres = diag_vres(results)
-            if all(v["ok"] for v in vres):  # only optional gaps, but nothing at all could run
-                vres.append({"cmd": "aggregate diagnostics", "ok": False, "status": "BLOCKED", "tail": "", "note": "no configured check could run read-only"})
-            return self.finish(False, [], "skipped", vres, f"BLOCKED: {gaps} not checkable read-only")
-        base = {r["cmd"]: r for r in results if r.get("status")}
+            if all(v["ok"] for v in vres):  # only optional gaps, but nothing at all could be read
+                vres.append({"cmd": "evidence", "ok": False, "status": "BLOCKED", "tail": "", "note": "no selected source could be read"})
+            return self.finish(False, [], "skipped", vres, f"BLOCKED: {gaps} not readable", header="BLOCKED")
+        base = {r["cmd"]: r for r in results if r.get("status") and r.get("cmd")}
         self.aggregate_base = {c: (r["ok"], r["out"]) for c, r in base.items()}
         impl = steps.get("implementer")
         if not impl or not impl.get("provider"):
             raise SystemExit("ai-team: no implementer provider installed")
         prov, tier = impl["provider"], impl["tier"]
-        total0 = sum(r["errors"] + (r["warnings"] if r["status"] == "FAIL" and r["ok"] else 0) for r in results if r.get("status"))
-        prev_total, stalls, escalated, batch_no, outs, done_keys = total0, 0, False, 0, [], set()
+        total0 = sum(r["errors"] for r in results if r.get("status") and not r.get("static"))
+        prev_total, stalls, escalated, batch_no, outs, done_keys, addressed = total0, 0, False, 0, [], set(), set()
         had_stall = False
         before = self.before
         while batch_no < 8:
-            groups = [g for g in group_diags(results, is_gen=is_gen) if g["key"] not in done_keys] or group_diags(results, is_gen=is_gen)
+            groups = group_diags(results, is_gen=is_gen)
+            groups = [g for g in groups if g["key"] not in done_keys] or [g for g in groups if not g["static"]]
             if not groups:
                 break
             batch, files = [], set()
@@ -2080,13 +2019,16 @@ class Run:
             summary = "\n".join(f"GROUP {i + 1} [{g['key']}] ×{g['count']} — files: {', '.join(sorted(g['files'])[:6])}"
                                 + (f" (+{len(g['files']) - 6})" if len(g["files"]) > 6 else "") + f"\n  e.g. {g['example']}" for i, g in enumerate(batch))
             st = dict(self.st, files={f for f in files if not f.startswith("(")},
-                      findings=[f"Baseline: {total0} diagnostics; {prev_total} remaining", "Fix these root-cause groups (same cause → one consistent fix):\n" + summary])
+                      findings=[f"Baseline: {total0} actionable finding(s) in re-runnable sources; {prev_total} remaining",
+                                "Fix these root-cause groups (same cause → one consistent fix):\n" + summary])
             action = ("Fix the root cause of each GROUP below with the smallest correct change. Do not suppress diagnostics "
                       "(no ts-ignore / eslint-disable / any) unless there is no real fix. Don't touch unrelated files."
-                      + (f" Never edit generated output ({', '.join(d + '/' for d in gdirs)}); fix the source that produces it." if gdirs else ""))
+                      + (f" Never edit generated output ({', '.join(d + '/' for d in gdirs)}); fix the source that produces it." if gdirs else "")
+                      + (" Some groups come from supplied evidence that cannot be re-checked here: fix each at its reported location."
+                         if any(g["static"] for g in batch) else ""))
             batch_snapshot = snapshot(self.root)
             batch_saved = {f: ((self.root / f).read_bytes() if (self.root / f).is_file() else None) for f in (batch_snapshot or {})}
-            batch_base = {r["cmd"]: (r["ok"], r["out"]) for r in results if r.get("status")}
+            batch_base = {r["cmd"]: (r["ok"], r["out"]) for r in results if r.get("status") and r.get("cmd") and not r.get("static")}
             gsnap = gen_snapshot(self.root, gdirs) if gdirs else {}  # generated files are git-ignored: git status can't see edits
             out = self.agent("implementer", tier, make_handoff(self.task, st, action, cons), provider=prov, write=True,
                              label=f"implementer-g{batch_no}-t{tier}", attempt=batch_no)
@@ -2097,17 +2039,19 @@ class Run:
                     self.gen_edits += restored + lost
                     self.say(f"  ! implementer edited generated output ({', '.join((restored + lost)[:3])}); restored"
                              + (f", {len(lost)} not restorable — rebuild them" if lost else "") + "; only source is fixed")
+            addressed |= {g["key"] for g in batch if g["static"]}
+            done_keys |= {g["key"] for g in batch if g["static"]}
             results = self.run_diagnostics(active, runner)
             new_lines, new_count = [], 0
             for r in results:
-                if r.get("status") not in (None, "GENERATED_ONLY") and r["cmd"] in batch_base and not r["ok"]:
+                if r.get("status") not in (None,) + NOISE_STATUSES and not r.get("static") and r.get("cmd") in batch_base and not r["ok"]:
                     b_ok, b_out = batch_base[r["cmd"]]
                     cmpr = compare_checks(b_ok, b_out, r["ok"], r["out"])
                     new_lines += cmpr["new_lines"] if cmpr["status"] in ("FAIL_NEW_ERRORS", "FAIL_REGRESSION") else []
                     new_count += cmpr["new"]
-            total = sum(r["errors"] + (r["warnings"] if r["status"] == "FAIL" and r["ok"] else 0) for r in results if r.get("status"))
+            total = sum(r["errors"] for r in results if r.get("status") and not r.get("static"))
             state = overall_state(results)
-            self.say(f"  diagnostics after batch {batch_no}: {prev_total} → {total}" + (f" · {len(new_lines)} NEW" if new_lines else "") + f" · {state}")
+            self.say(f"  evidence after batch {batch_no}: {prev_total} → {total}" + (f" · {len(new_lines)} NEW" if new_lines else "") + f" · {state}")
             if new_lines:
                 # Restore this batch only; preserve earlier progress and pre-existing dirty files.
                 for f in changed(self.root, batch_snapshot):
@@ -2124,16 +2068,14 @@ class Run:
                                    f"FAIL_REGRESSION: {prev_total} → {total}; batch restored")
             if state in CLEAN_STATES:
                 break
-            if total < prev_total and not new_lines:
+            if total < prev_total or all(g["static"] for g in batch):  # static groups are sent once; progress = re-runnable sources
                 done_keys |= {g["key"] for g in batch}
-                prev_total, stalls = total, 0
+                prev_total, stalls = min(prev_total, total), 0
                 continue
             stalls += 1
             had_stall = True
             for e in self.log[-1:]:
                 e["ok"] = False
-            if new_lines:
-                self.st["findings"] = ["The last change INTRODUCED these diagnostics — fix them first:"] + new_lines[:10]
             if stalls >= 2:
                 if escalated or tier >= min(3, self.p["max_tier"]):
                     self.escalations.append(f"stop [REPEATED_FAILURE] no diagnostic progress after {stalls} batches")
@@ -2148,16 +2090,20 @@ class Run:
                 results = [r for r in results if r["state"] != "deferred"] + extra
                 state = overall_state(results)
         files = changed(self.root, before)
-        vres, ok = diag_vres(results), state in CLEAN_STATES
+        vres, ok = diag_vres(results, addressed), state in CLEAN_STATES
+        pending = [v["cmd"] for v in vres if v["status"] == "PENDING_EVIDENCE"]
         if not ok and all(v["ok"] for v in vres):  # e.g. a required check stopped running: never "NOT DONE" beside a passing verify
-            vres.append({"cmd": "aggregate diagnostics", "ok": False, "status": "BLOCKED", "tail": "", "note": f"overall {state}"})
+            vres.append({"cmd": "evidence", "ok": False, "status": "BLOCKED", "tail": "", "note": f"overall {state}"})
         review_state = "skipped"
         if files and "reviewer" in steps:
             run_rev, why = review_gate(self.root, files, self.p, outs, vres, [], had_stall)  # initial failures are the task, not a repair
-            if run_rev and ok:
+            if run_rev and (ok or (pending and all(v["ok"] or v["status"] == "PENDING_EVIDENCE" for v in vres))):
                 self.say(f"  → reviewer: {why}")
-                review_state, ok, vres = self.review(steps["reviewer"], files, prov, tier, before, outs, ok, vres)
-        return self.finish(ok, files, review_state, vres, self.diag_reason(results, ok, f"aggregate diagnostics {total0} → {prev_total if not ok else 0}"))
+                review_state, ok_after, vres = self.review(steps["reviewer"], files, prov, tier, before, outs, True, vres)
+                ok = ok and ok_after
+        return self.finish(ok, files, review_state, vres, self.diag_reason(results, ok, f"evidence {total0} → {prev_total if not ok else 0}"),
+                           hint=(f"re-read {', '.join(pending)} and pass the fresh report: ai-team --evidence {pending[0]}=<new report> \"{self.task}\""
+                                 if pending else ""))
 
     def pre_content(self, f):
         if f in self.pre:
@@ -2168,7 +2114,7 @@ class Run:
     def baseline(self, cmd):
         """Pre-task result of one check: briefly put the task's changed files back to their pre-task content (HEAD or the
         user's own dirty version), run the check, restore. Cached per command. Other files are never touched."""
-        if cmd == self.diag_cmd:
+        if cmd == self.diag_cmd or cmd in self.strict_cmds:
             return None  # "fix all errors": the pre-existing errors are the task, so no baseline tolerance
         if cmd in getattr(self, "aggregate_base", {}):
             return self.aggregate_base[cmd]  # broad maintenance: the initial diagnostics are the baseline
@@ -2232,6 +2178,10 @@ class Run:
     def execute(self):
         p, cons = self.p, "Stay within FILES unless the change requires otherwise."
         steps = {s["role"]: s for s in p["steps"] if s["provider"]}
+        gate = p.get("evidence_gate") or []
+        if required_gaps(gate):  # required evidence can never be read → no DONE is possible: stop before any model call
+            return self.block(gate, required_gaps(gate))
+        self.strict_cmds = {r["cmd"] for r in gate if r["state"] in RUN_STATES and r.get("cmd") and not (r.get("cmds") or r.get("output") or r.get("evidence"))}
         before = snapshot(self.root)
         self.before = before
         for f in (before or {}):  # user's own uncommitted work: remember it exactly, never assume ai-team made it
@@ -2391,6 +2341,8 @@ class Run:
             cmds, vreason, jfiles = select_checks(files, self.p["complexity"], self.task, self.cmds, self.root)
             if self.diag_cmd and files and self.diag_cmd not in cmds:
                 cmds = [self.diag_cmd] + cmds  # "fix all errors": the diagnostic itself is the acceptance check
+            if files:  # evidence the task named is an acceptance check too (no baseline tolerance)
+                cmds += [c for c in sorted(self.strict_cmds) if c not in cmds]
             if not cmds and not jfiles:
                 self.say(f"  ✓ verify           skipped — {vreason}, no check applies")
                 ok, vres = True, []
@@ -2463,12 +2415,14 @@ class Run:
             if not ok:
                 return "fix round failed verification", False, vres
 
-    def finish(self, ok, files, review_state, vres, vreason):
+    def finish(self, ok, files, review_state, vres, vreason, header=None, hint=""):
+        ok, vres, vreason, gate_header, gate_hint = self.evidence_gate(ok, list(vres), vreason)
+        header, hint = header or gate_header, hint or gate_hint
         dur = round(time.time() - self.t0)
         tin = sum(x["in"] for x in self.log); tc = sum(x["cached"] for x in self.log); tout = sum(x["out"] for x in self.log)
         usd = sum(x["usd"] or 0 for x in self.log)
         print("\n" + "─" * 60)
-        print(f"{'DONE' if ok else 'NOT DONE'} · {self.id} · {self.p['intent']} · {self.p['complexity']} · {self.p['budget']} · {dur}s")
+        print(f"{header or ('DONE' if ok else 'NOT DONE')} · {self.id} · {self.p['intent']} · {self.p['complexity']} · {self.p['budget']} · {dur}s")
         print(f"Changed:     {', '.join(files) or 'nothing'}")
         print(f"Verify:      {verify_status(vres) + ' · ' + '; '.join(describe_check(r) for r in vres) if vres else 'skipped'} ({vreason})")
         print(f"Review:      {review_state}")
@@ -2478,7 +2432,9 @@ class Run:
         print(f"Model calls: {len(self.log)} · fresh {tin / 1000:.1f}k · cached {tc / 1000:.1f}k · out {tout / 1000:.1f}k"
               + (f" · ${usd:.3f}" if usd else "") + f" · ours ~{sum(x['ctx'] for x in self.log) / 1000:.1f}k")
         print(f"State:       {self.dir.relative_to(self.root)}  (input-*.md = exact prompts; kept for the last {LIM['retain_tasks']} tasks)")
-        if not ok:
+        if hint:
+            print("Next:        " + hint.replace("\n", "\n             "))
+        elif not ok:
             print("Next:        read the last *.json / verification.json there, or rerun with --budget quality")
         record(self.root, self.p, self.log, ok, review_state, vres, vreason, self.dir, dur, self.escalations, self.pruned)
         return 0 if ok else 1
@@ -2490,7 +2446,7 @@ def cmd_map(root):
     new = detect_map(root)
     if p.exists():  # keep hand-written keys
         old = json.loads(p.read_text())
-        for k in ("boundaries", "notes", "docs"):
+        for k in ("boundaries", "notes", "docs", "custom_checks"):
             if k in old:
                 new[k] = old[k]
         for k, v in old.get("commands", {}).items():
@@ -2589,6 +2545,8 @@ CATEGORY = {"Eval": "Routing scenarios", "ZeroToken": "Zero-token paths", "Conte
             "Escalation": "T3 / escalation", "Security": "Security", "CostAware": "Cost-aware selection", "Budgets": "Budget modes",
             "ReviewGate": "Review gate", "Maintenance": "Diagnostics-first",
             "EvidenceGuard": "History sample guard", "ReviewerWording": "Reviewer wording", "ReviewSizing": "Review sizing", "BaselineVerification": "Baseline-aware verify", "AggregateDiagnostics": "Aggregate diagnostics",
+            "EvidenceRouting": "Evidence routing", "EvidenceSources": "Evidence sources", "EvidenceRegistry": "Adapter registry",
+            "CustomChecks": "Custom checks", "Classification": "Finding classes",
             "ReadOnlyDerivation": "Read-only derivation", "GeneratedOutput": "Generated output", "RequiredOptional": "Required vs optional"}
 
 
@@ -2675,12 +2633,20 @@ def main():
     if len(argv) == 1 and argv[0] in flags:
         return flags[argv[0]]() or 0
     if argv[:1] == ["--diagnose"]:
-        task = " ".join(argv[1:]) or "fix all existing errors and warnings in this project"
-        rmap = load_map(root)
-        r = Run(task, {"intent": "IMPLEMENTATION", "complexity": "MEDIUM", "budget": "balanced", "signals": {}, "steps": [], "max_tier": 3}, root, rmap)
+        dp = argparse.ArgumentParser(prog="ai-team --diagnose")
+        dp.add_argument("task", nargs="*"); dp.add_argument("--evidence", action="append", default=[], metavar="[SOURCE=]PATH")
+        da = dp.parse_args(argv[1:])
+        task, evidence = " ".join(da.task) or "fix all existing errors and warnings in this project", parse_evidence(da.evidence)
+        rmap, p = load_map(root), plan(task, "balanced", None, root, evidence=evidence)
+        r = Run(task, p, root, rmap)
+        rows = p.get("diagnostics") or p.get("evidence_gate") or DIAG.plan_rows(task, r.ctx(), maintenance=True, broad=True, supplied=evidence)
+        if required_gaps(rows):
+            print(f"Diagnostics (read-only, 0 model calls) for: {task}\n" + render_plan(rows))
+            shutil.rmtree(r.dir, ignore_errors=True)
+            return 1
         snap = snapshot(root)
         r.before, r.pre = snap, {f: ((root / f).read_bytes() if (root / f).is_file() else None) for f in (snap or {})}
-        res = r.run_diagnostics(diag_plan(task, root, rmap))
+        res = r.run_diagnostics(rows)
         notes = generated_notes(root, r.gen(), PATH_RE.findall(task))
         print(f"Diagnostics (read-only, 0 model calls) for: {task}\n" + render_diags(res) + "".join("\n" + x for x in notes)
               + f"\nOverall: {overall_state(res)}")
@@ -2724,10 +2690,12 @@ def main():
     ap.add_argument("--complexity", choices=LEVELS)
     ap.add_argument("--json", action="store_true", help="with --plan: machine-readable plan")
     ap.add_argument("--apply", action="store_true", help="ARCHITECTURE tasks: implement the decision instead of stopping at it")
+    ap.add_argument("--evidence", action="append", default=[], metavar="[SOURCE=]PATH",
+                    help="diagnostic evidence you already have (SARIF, JetBrains export dir, JUnit, JSON findings, tool/CI log); repeatable")
     a = ap.parse_args(argv)
     task = " ".join(a.task)
-    p = plan(task, a.budget, a.complexity, root, a.apply)
-    rmap = {} if p.get("local") and p["intent"] != "TOOL" and p["signals"].get("meta") != "project" else load_map(root)
+    p = plan(task, a.budget, a.complexity, root, a.apply, parse_evidence(a.evidence))
+    rmap = {} if p.get("local") and p["intent"] != "TOOL" and p["signals"].get("meta") != "project" and not p.get("evidence_audit") else load_map(root)
     if a.plan and a.json:
         print(json.dumps(p, indent=1, ensure_ascii=False)); return 0
     if a.context_plan:

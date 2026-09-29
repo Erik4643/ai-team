@@ -19,7 +19,7 @@ class LifecycleTests(unittest.TestCase):
         self.temp=tempfile.TemporaryDirectory(prefix='portable home ');self.addCleanup(self.temp.cleanup)
         self.home=Path(self.temp.name)/'home';self.home.mkdir()
         self.kit=self.home/'kit with spaces';self.kit.mkdir()
-        for name in ['bin','scripts','roles','workflows','skills','template','tests']:
+        for name in ['bin','scripts','diagnostics','roles','workflows','skills','template','tests']:
             shutil.copytree(KIT/name,self.kit/name,ignore=shutil.ignore_patterns('__pycache__'))
         for name in ['install.sh','VERSION','routing.json','capabilities.json','POLICY.md','PROTOCOL.md']:
             shutil.copy2(KIT/name,self.kit/name)
@@ -73,7 +73,7 @@ class LifecycleTests(unittest.TestCase):
         with patch.object(m.subprocess,'run',side_effect=bad):
             with self.assertRaises(m.ProviderError):m.run_provider('claude',1,'x',True,'implementer',self.home,'t',[])
     def test_shipped_sources_are_portable_and_inventory_is_runtime_only(self):
-        for folder in ['bin','scripts','roles','workflows','skills','template']:
+        for folder in ['bin','scripts','diagnostics','roles','workflows','skills','template']:
             for p in (KIT/folder).rglob('*'):
                 if p.is_file() and '__pycache__' not in p.parts:
                     text=p.read_text()
