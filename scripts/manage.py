@@ -123,7 +123,6 @@ def install(skip_checks=False):
     backup.finish()
     if str(bindir) not in os.environ.get('PATH','').split(os.pathsep):
         print('PATH setup required: add export PATH="$HOME/.local/bin:$PATH" to your shell profile.')
-        os.environ['PATH']=str(bindir)+os.pathsep+os.environ.get('PATH','')
     print('Installed ai-team', (KIT/'VERSION').read_text().strip(), 'for Codex and Claude. No provider CLI/auth installed.')
     if skip_checks:return 0
     rc=call([sys.executable,str(KIT/'bin/ai-team'),'--self-test'],cwd=KIT).returncode
@@ -132,8 +131,9 @@ def install(skip_checks=False):
 
 def doctor(project):
     errors=[]
-    def check(name,ok,detail='',warning=False):
-        print(('OK   ' if ok else 'WARN ' if warning else 'FAIL ')+name+((': '+detail) if detail else ''))
+    def check(name,ok,detail='',warning=False,hint=''):
+        # detail is always informative; hint is remediation and only shown when the check is not OK
+        print(('OK   ' if ok else 'WARN ' if warning else 'FAIL ')+name+''.join(': '+x for x in (detail,'' if ok else hint) if x))
         if not ok and not warning:errors.append(name)
     print('GLOBAL KIT HEALTH (T0; no model calls)')
     check('kit root',KIT.is_dir(),str(KIT))
@@ -142,21 +142,21 @@ def doctor(project):
         p=Path.home()/'.local/bin'/name
         check(name+' link',p.is_symlink() and p.resolve()==(KIT/'bin'/name).resolve())
         check(name+' executable',os.access(KIT/'bin'/name,os.X_OK))
-    check('PATH',str(Path.home()/'.local/bin') in os.environ.get('PATH','').split(os.pathsep),'add $HOME/.local/bin to PATH',warning=True)
+    check('PATH',str(Path.home()/'.local/bin') in os.environ.get('PATH','').split(os.pathsep),warning=True,hint='add $HOME/.local/bin to PATH')
     try:
         m=engine();check('active providers',set(m.CFG['providers'])=={'codex','claude'})
-        for name in m.CFG['providers']:check(name+' CLI',bool(shutil.which(name)),'install/authenticate separately if needed',warning=True)
+        for name in m.CFG['providers']:check(name+' CLI',bool(shutil.which(name)),warning=True,hint='install/authenticate separately if needed')
         check('routing',all(str(t) in p['tiers'] for p in m.CFG['providers'].values() for t in (1,2,3)))
         check('canonical capabilities',8<=len(m.CAPABILITIES['capabilities'])<=15)
         for c in m.CAPABILITIES['capabilities']:
             check('source '+c['id'],all((KIT/p).is_file() for p in c['sources']))
         for s in m.adapter_specs():
             p=Path.home()/s['path']
-            check('adapter '+s['path'],p.is_file() and p.read_text()==s['body'],'custom content is preserved',warning=p.exists())
+            check('adapter '+s['path'],p.is_file() and p.read_text()==s['body'],warning=p.exists(),hint='custom content is preserved')
     except (OSError,ValueError,KeyError) as e:check('configuration',False,type(e).__name__)
     for folder,name in [('.codex','AGENTS.md'),('.claude','CLAUDE.md')]:
         p=Path.home()/folder/name
-        check('global '+name,p.is_file() and BEGIN in p.read_text(),'custom symlinks may require a manual pointer',warning=p.is_symlink())
+        check('global '+name,p.is_file() and BEGIN in p.read_text(),warning=p.is_symlink(),hint='custom symlinks may require a manual pointer')
     git=call(['git','-C',str(KIT),'rev-parse','--show-toplevel'],capture=True)
     if git.returncode==0:
         check('Git root',Path(git.stdout.strip()).resolve()==KIT)
@@ -169,9 +169,9 @@ def doctor(project):
     check('runtime writable',os.access(state,os.W_OK))
     try:
         health=json.loads((state/'self-test.json').read_text())
-        check('self-test health',health.get('ok') is True and health.get('fingerprint')==fingerprint(),'rerun ai-team --self-test if stale')
+        check('self-test health',health.get('ok') is True and health.get('fingerprint')==fingerprint(),hint='rerun ai-team --self-test')
     except (OSError,ValueError):check('self-test health',False,'run ai-team --self-test')
-    check('optional Graphify',bool(shutil.which('graphify')),'targeted search is the fallback',warning=True)
+    check('optional Graphify',bool(shutil.which('graphify')),warning=True,hint='not installed; targeted search is the fallback')
     project=Path(project).resolve()
     print('CURRENT PROJECT HEALTH')
     if project==KIT:print('Global kit: application context is not required.')
@@ -200,10 +200,15 @@ def update():
     upstream=call(['git','-C',str(KIT),'rev-parse','--abbrev-ref','@{upstream}'],capture=True)
     if upstream.returncode:
         print('Update refused: current branch has no upstream.');return 1
+    head=lambda:call(['git','-C',str(KIT),'rev-parse','--short','HEAD'],capture=True).stdout.strip()
+    old=head()
     if call(['git','-C',str(KIT),'fetch','--prune']).returncode:return 1
     if call(['git','-C',str(KIT),'merge','--ff-only','@{upstream}']).returncode:return 1
     # Execute the refreshed installer, not this process's old code.
-    return call([str(KIT/'install.sh')],cwd=KIT).returncode
+    rc=call([str(KIT/'install.sh')],cwd=KIT).returncode
+    if rc==0 and head()!=old:
+        print('Global kit updated '+old+' -> '+head()+'. Refresh each project: cd <project> && ai-team init (idempotent; project facts preserved).')
+    return rc
 
 
 def main():

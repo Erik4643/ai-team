@@ -2,7 +2,7 @@
 
 Run: ai-team --self-test      (or: python3 -m unittest discover -s ~/.ai-kit/tests)
 """
-import importlib.machinery, importlib.util, json, os, subprocess, tempfile, unittest
+import contextlib, importlib.machinery, importlib.util, io, json, os, subprocess, tempfile, unittest
 from pathlib import Path
 
 SRC = Path(os.environ.get("AI_KIT", str(Path(__file__).resolve().parents[1]))) / "bin" / "ai-team"
@@ -94,6 +94,10 @@ EVAL = [  # (id, task, intent, complexity or None, required roles, extra asserti
     (12, "check whether dependency X changed its API in the latest version", "RESEARCH", None, ["researcher"], "readonly"),
     (13, "fix all current TypeScript errors", "DEBUG", "MEDIUM", ["implementer"], "maintenance"),
     (14, "tell me what build command this project uses", "META", "TRIVIAL", [], "local"),
+    (15, "plan how to add pagination to the list page", "PLAN", None, ["explorer"], "plan"),
+    (16, "how should we implement pagination?", "PLAN", None, ["explorer"], "plan"),
+    (17, "clean up the codebase", "IMPLEMENTATION", "MEDIUM", ["implementer"], "maintenance"),
+    (18, "clean up the project?", "QUESTION", None, ["explorer"], "readonly"),
 ]
 
 
@@ -128,6 +132,8 @@ class Eval(Base):
                     self.assertNotIn("implementer", roles(p))
                 if kind == "maintenance":
                     self.assertTrue(p["signals"]["maintenance"]); self.assertNotIn("explorer", roles(p))
+                if kind in ("plan", "readonly"):
+                    self.assertNotIn("implementer", roles(p)); self.assertFalse(p["signals"].get("aggregate"))
 
     def test_conditional_stages_never_in_minimum(self):
         p = plan("find and fix an authentication race condition")
@@ -648,6 +654,25 @@ class AggregateDiagnostics(Base):
         rc = r.execute()
         self.assertEqual([c[0] for c in calls], ["implementer"])    # not "nothing to fix"
         self.assertEqual(rc, 0)                                      # all required categories clean afterwards
+
+    def test_8b_unavailable_category_after_repair_is_blocked_not_pass(self):
+        d = self.repo({"typecheck": "tsc --noEmit", "lint": "eslint . --fix && prettier --write ."})   # no safe read-only lint form
+        def impl(tier):
+            (d / "fixed").write_text("y\n")
+            return {"status": "done", "confidence": 0.9}
+        stub({"implementer": impl})
+        task = "Fix all existing errors and warnings in this project"
+        r = m.Run(task, plan(task, root=d), d, {"package_manager": "npm"})
+        r.before, r.pre = m.snapshot(d), {}
+        runner = lambda c: (True, "") if (d / "fixed").exists() else (False, self.TSC_ERR)  # noqa: E731 — no package manager needed
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = r.aggregate_repair({x["role"]: x for x in r.p["steps"] if x["provider"]}, "", runner=runner)
+        out = buf.getvalue()
+        self.assertEqual(rc, 1)
+        self.assertIn("NOT DONE", out)
+        self.assertIn("Verify:      BLOCKED", out)                   # never "NOT DONE" next to "Verify: PASS"
+        self.assertIn("NOT clean: lint", out)
 
     def test_misconfigured_check_is_not_a_code_error_and_not_clean(self):
         d = self.repo({"typecheck": "true", "prettier": "prettier --check \"{src,store}/**/*.js\""})

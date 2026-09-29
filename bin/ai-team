@@ -57,7 +57,7 @@ DEBUG = R(r"\b(bugs?|errors?|crash\w*|broken|fail\w*|exception|not working|doesn
           r"|ошибк|баг|пада|пропада|не работает|слома|вылет|гонк|утечк|неправильн|неверн|первопричин|дважды|мерца")
 ARCH = R(r"\b(redesign|re-?architect\w*|architecture|restructure)\b|архитектур|перепроектир")
 REVIEW = R(r"\b(review|code review|audit)\b|ревью|проверь (код|изменения|diff|дифф)")
-PLAN_I = R(r"^\s*(plan|спланируй|составь план|how (should|would|do) (i|we) (implement|build|approach)|как (лучше )?(реализовать|сделать|подойти))")
+PLAN_I = R(r"^\s*(plan\b|спланируй|составь план|how (should|would|do) (i|we) (implement|build|approach)|как (лучше )?(реализовать|сделать|подойти))")
 RESEARCH = R(r"\b(latest|upgrade|migrate to|changelog|deprecat\w*|release notes|docs? for|best practices?|research)\b|последн\w* верс|обнови\w* до|документаци")
 QUESTION = R(r"\?\s*$|^\s*(what|how|why|where|which|who|when|does|do|is|are|can|explain|что|как|почему|где|какой|какая|какие|зачем|объясни|расскажи|кто|когда)\b")
 REPO_CUE = re.compile(r"(?i:\b(files?|code|codebase|repo\w*|project|components?|functions?|class(es)?|methods?|endpoints?|routes?|pages?|api|hooks?|modules?|tests?|this|here|configured|config)\b"
@@ -145,10 +145,10 @@ def classify(task, root=None, forced=None):
         intent = "ARCHITECTURE"
     elif REVIEW.search(task) and not re.search(r"\b(fix|and fix|apply)\b|исправ", task, re.I):
         intent = "REVIEW"
+    elif PLAN_I.search(task):  # before change verbs: "plan how to add X" must not edit files
+        intent = "PLAN"
     elif change or (dbg and not question) or (dbg and re.match(r"^\s*(find|найди)\b", task, re.I)):
         intent = "DEBUG" if dbg else "IMPLEMENTATION"
-    elif PLAN_I.search(task):
-        intent = "PLAN"
     elif RESEARCH.search(task):
         intent = "RESEARCH"
     elif question:
@@ -158,6 +158,10 @@ def classify(task, root=None, forced=None):
     sig["analysis_first"] = intent == "DEBUG" and not change  # diagnose first; implement only if a change is required
     sig["docs"] = bool(DOCS_KW.search(task)) and not re.search(r"\.(tsx?|jsx?|py|go|rs|css|scss)\b", task)
     sig["maintenance"] = sig["aggregate"] = bool(MAINT.search(task))  # aggregate diagnostics: every relevant check before "clean"
+    if sig["maintenance"] and intent == "UNKNOWN":
+        intent = "IMPLEMENTATION"  # "clean up the codebase": diagnostics first, then a bounded fix
+    elif intent not in CODE_INTENTS:
+        sig["maintenance"] = sig["aggregate"] = False  # questions and plans stay read-only; no repair loop
     hit = {k: bool(rx.search(task)) for k, rx in KW.items()}
     sig["risk_keyword"] = hit["CRITICAL"]
     sig["high_risk"] = hit["CRITICAL"] or bool(CONCURRENCY_KW.search(task))  # stricter gates, never looser
@@ -1811,9 +1815,12 @@ class Run:
                 results += extra
                 state = overall_state(results)
         files = changed(self.root, before)
-        vres = [{"cmd": r["cmd"], "ok": r["status"] == "PASS", "s": r.get("s", 0), "tail": "",
+        # Unavailable or misconfigured required checks are BLOCKED in the result, so "NOT DONE" never sits next to "PASS".
+        blocked = lambda r: r.get("status") == "BROKEN" or (r["state"] == "unavailable" and not r.get("status"))  # noqa: E731
+        vres = [{"cmd": r["cmd"] or r["cat"], "ok": False, "s": r.get("s", 0), "tail": r.get("note", ""), "status": "BLOCKED"} if blocked(r) else
+                {"cmd": r["cmd"], "ok": r["status"] == "PASS", "s": r.get("s", 0), "tail": "",
                  "status": "PASS" if r["status"] == "PASS" else "FAIL", "pre": r["errors"], "new": 0, "fixed": 0}
-                for r in results if r.get("status")]
+                for r in results if r.get("status") or blocked(r)]
         ok = state == "CLEAN"
         review_state = "skipped"
         if files and "reviewer" in steps:
@@ -1822,7 +1829,7 @@ class Run:
                 self.say(f"  → reviewer: {why}")
                 review_state, ok, vres = self.review(steps["reviewer"], files, prov, tier, before, outs, ok, vres)
         return self.finish(ok, files, review_state, vres, f"aggregate diagnostics {total0} → {prev_total if not ok else 0}"
-                           + ("" if ok else " (NOT clean: " + ", ".join(r["cat"] for r in results if r.get("status") == "FAIL") + ")"))
+                           + ("" if ok else " (NOT clean: " + ", ".join(r["cat"] for r in results if r.get("status") == "FAIL" or blocked(r)) + ")"))
 
     def pre_content(self, f):
         if f in self.pre:
@@ -2258,6 +2265,7 @@ CATEGORY = {"Eval": "Routing scenarios", "ZeroToken": "Zero-token paths", "Conte
 
 def cmd_self_test(live):
     import unittest
+    real_which = shutil.which  # test modules stub CLI lookup process-wide on import; --live must see the real PATH
     suite = unittest.defaultTestLoader.discover(str(KIT / "tests"))
     res = unittest.TestResult()
     stats = {}
@@ -2275,8 +2283,11 @@ def cmd_self_test(live):
                 stats[cat] = (ok + (0 if bad else 1), n + 1)
     calls_before = MODEL_CALLS[0]
     import contextlib, io
-    with contextlib.redirect_stdout(io.StringIO()):  # task output from stubbed runs is noise here
-        walk(suite)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):  # task output from stubbed runs is noise here
+            walk(suite)
+    finally:
+        shutil.which = real_which
     print("AI-Team Self Test")
     for cat, (ok, n) in stats.items():
         print(f"  {cat:<22} {ok}/{n} {'✓' if ok == n else '✗'}")

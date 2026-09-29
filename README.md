@@ -44,7 +44,7 @@ ai-team --version
 ai-team update                 # explicit fetch + fast-forward + validated install
 ```
 
-Update refuses a dirty working tree, detached HEAD or missing upstream. It does not overwrite local changes. Diagnostics, tests and installation do not call models. `--self-test --live` is an explicit opt-in to real calls.
+Update refuses a dirty working tree, detached HEAD or missing upstream. It does not overwrite local changes and never touches the current project. After an update that changed the kit, refresh each project with `ai-team init` (idempotent; project facts are preserved). Diagnostics, tests and installation do not call models. `--self-test --live` is an explicit opt-in to real calls.
 
 ## Runtime design
 

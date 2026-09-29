@@ -35,7 +35,7 @@ class LifecycleTests(unittest.TestCase):
         self.install();before=self.snapshot();self.install();self.assertEqual(before,self.snapshot())
         self.assertTrue((self.home/'.local/bin/ai-team').is_symlink());self.assertTrue((self.home/'.local/bin/ai-init').is_symlink())
         self.assertFalse((self.home/'.gemini').exists())
-        self.assertEqual(self.run_cmd([str(self.home/'.local/bin/ai-team'),'--version']).stdout.strip(),'0.9.0')
+        self.assertEqual(self.run_cmd([str(self.home/'.local/bin/ai-team'),'--version']).stdout.strip(),(self.kit/'VERSION').read_text().strip())
         project=self.home/'project';project.mkdir();self.run_cmd(['git','init','-q',str(project)])
         self.run_cmd([str(self.home/'.local/bin/ai-init')],cwd=project)
         self.assertTrue((project/'.ai/CONTEXT.md').is_file())
