@@ -137,6 +137,13 @@ class EvidenceRouting(Base):
         rc, out, _ = self.run_task(root, "Audit WebStorm inspection results")
         self.assertEqual(rc, 1); self.assertIn("BLOCKED ·", out)                                  # required source unreadable
 
+    def test_blocked_result_needs_no_provider_cli(self):
+        root = self.frontend()
+        r = subprocess.run([sys.executable, str(KIT / "bin/ai-team"), "Fix WebStorm inspection errors"], cwd=root, capture_output=True, text=True,
+                           env={**os.environ, "AI_KIT": str(KIT), "PATH": "/usr/bin:/bin", "AI_TEAM_PROVIDERS": "none"})
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("BLOCKED ·", r.stdout); self.assertNotIn("no active AI provider", r.stdout + r.stderr)
+
     def test_zero_provider_calls_for_planning_discovery_and_audits(self):
         root = self.frontend()
         calls = m.MODEL_CALLS[0]

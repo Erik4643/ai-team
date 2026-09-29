@@ -2706,7 +2706,7 @@ def main():
     print()
     if p.get("local"):
         return local(p, root, rmap, task)
-    if not available():
+    if not available() and not required_gaps(p.get("diagnostics") or p.get("evidence_gate")):  # BLOCKED needs no model
         sys.exit("ai-team: no active AI provider CLI found (codex or claude). Install one and rerun `ai-team doctor`.")
     return Run(task, p, root, rmap).execute()
 
