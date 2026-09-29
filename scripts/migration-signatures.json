@@ -1,0 +1,7 @@
+{
+  "purpose": "Exact legacy reusable Graphify definition hashes from the completed audit; no project facts. Matches are backed up before removal from project discovery.",
+  "sha256": [
+    "3898b1042721cad27d6f87ca44f638415a7f763203aefd86b90f9358ffea3a43",
+    "3e4d30df5a936965acaa25117230a6f3ff44353c137e63030e85e3bc3a391fb7"
+  ]
+}

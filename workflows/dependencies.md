@@ -1,0 +1,2 @@
+# Dependency investigation
+Trace the affected import/caller to the manifest, resolved lockfile version and runtime boundary. Inspect only relevant lockfile entries; use existing package-manager inspection commands without installing or upgrading. Separate direct, transitive and peer constraints. Research exact-version official documentation only where local evidence is insufficient. Report compatibility impact and the smallest supported change with a targeted check.

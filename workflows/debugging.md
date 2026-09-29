@@ -1,0 +1,2 @@
+# Debugging and test repair
+Reproduce expected versus actual behavior; isolate one root-cause hypothesis with the smallest experiment. Use prior failure evidence before proposing another fix. For failed tests, distinguish product regression, stale expectation, flaky environment and baseline failure; preserve the intended contract instead of weakening assertions. Change one cause, then run the targeted reproduction/check. Stop stacking fixes after a regression. Never dump environment values or credentials.

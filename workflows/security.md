@@ -1,0 +1,2 @@
+# Security review
+Trace changed trust boundaries, authorization checks and untrusted input to sensitive operations. Check realistic injection, access-control, secret exposure and unsafe defaults in the relevant diff and callers. Report an evidenced failure path and severity, not a checklist of speculative findings. Do not collect credentials, install scanners or run invasive probes. Use the existing review schema and risk gate.

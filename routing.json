@@ -1,0 +1,267 @@
+{
+  "_doc": "Routing data for ai-team. Edit model names here only; roles and pipelines never name models.",
+  "providers": {
+    "codex": {
+      "bin": "codex",
+      "tiers": {
+        "1": {
+          "model": "gpt-6-astra",
+          "effort": "low"
+        },
+        "2": {
+          "model": "gpt-5.6-sol",
+          "effort": "medium"
+        },
+        "3": {
+          "model": "gpt-6-astra",
+          "effort": "high"
+        }
+      }
+    },
+    "claude": {
+      "bin": "claude",
+      "tiers": {
+        "1": {
+          "model": "haiku",
+          "effort": "low",
+          "max_usd": 0.5
+        },
+        "2": {
+          "model": "sonnet",
+          "effort": "medium",
+          "max_usd": 2
+        },
+        "3": {
+          "model": "opus",
+          "effort": "high",
+          "max_usd": 5
+        }
+      }
+    }
+  },
+  "_cost_doc": "Comparative units, not money: fresh*w.fresh + cached*w.cached + output*w.output + seconds*w.seconds, divided by expected success (p for read-only roles, p\u00b2 for repo-mutating roles). Seeds are measured; history blends in with priors (cost prior = 5 samples, success prior = 8 samples) so a few runs never dominate.",
+  "baseline_seed": {
+    "codex": 12400,
+    "claude": 2400,
+    "claude_answer": 1100
+  },
+  "cached_seed": {
+    "codex": 25000,
+    "claude": 30000
+  },
+  "cost_weights": {
+    "fresh": 1.0,
+    "cached": 0.1,
+    "output": 4.0,
+    "seconds": 30
+  },
+  "expected_output": {
+    "answer": 150,
+    "explorer": 600,
+    "researcher": 800,
+    "architect": 1200,
+    "implementer": 900,
+    "reviewer": 700,
+    "judge": 800
+  },
+  "effort_mult": {
+    "low": 1.0,
+    "medium": 1.3,
+    "high": 2.0
+  },
+  "_strength_doc": "Relative capability (0-1). Roles map to one dimension; the cost model multiplies it into expected success.",
+  "strength": {
+    "codex": {
+      "analysis": 0.85,
+      "explore": 0.8,
+      "edit": 1.0,
+      "docs": 0.9,
+      "architecture": 0.85,
+      "review": 0.85,
+      "debug": 0.9,
+      "research": 0.7
+    },
+    "claude": {
+      "analysis": 1.0,
+      "explore": 0.95,
+      "edit": 0.7,
+      "docs": 1.0,
+      "architecture": 1.0,
+      "review": 1.0,
+      "debug": 0.95,
+      "research": 0.85
+    }
+  },
+  "tier_success": {
+    "1": 0.85,
+    "2": 0.93,
+    "3": 0.97
+  },
+  "_demand_doc": "Prior success drops 0.08 per level the task demand exceeds the tier (SMALL=1, MEDIUM=2, COMPLEX/CRITICAL=3).",
+  "role_providers": {
+    "answer": [
+      "claude",
+      "codex"
+    ],
+    "explorer": [
+      "claude",
+      "codex"
+    ],
+    "researcher": [
+      "claude",
+      "codex"
+    ],
+    "architect": [
+      "claude",
+      "codex"
+    ],
+    "implementer": [
+      "codex",
+      "claude"
+    ],
+    "reviewer": [
+      "claude",
+      "codex"
+    ],
+    "judge": [
+      "claude",
+      "codex"
+    ]
+  },
+  "pipelines": {
+    "MICRO": {
+      "implementer": 1
+    },
+    "SMALL": {
+      "implementer": 1
+    },
+    "MEDIUM": {
+      "explorer": 1,
+      "implementer": 2,
+      "reviewer": 2
+    },
+    "COMPLEX": {
+      "explorer": 1,
+      "architect": 2,
+      "implementer": 2,
+      "reviewer": 2
+    },
+    "CRITICAL": {
+      "explorer": 1,
+      "architect": 2,
+      "implementer": 2,
+      "reviewer": 2
+    }
+  },
+  "escalation_cap": {
+    "MICRO": 2,
+    "SMALL": 2,
+    "MEDIUM": 3,
+    "COMPLEX": 3,
+    "CRITICAL": 3
+  },
+  "budgets": {
+    "economy": {
+      "max_tier": 2,
+      "tier_delta": {
+        "COMPLEX.reviewer": -1
+      },
+      "drop": {
+        "MEDIUM": [
+          "reviewer"
+        ]
+      },
+      "review": "critical-only",
+      "judge": false,
+      "max_parallel": 1,
+      "cross_review_from": "CRITICAL"
+    },
+    "balanced": {
+      "max_tier": 3,
+      "tier_delta": {},
+      "review": "justified",
+      "judge": true,
+      "max_parallel": 2,
+      "cross_review_from": "COMPLEX"
+    },
+    "quality": {
+      "max_tier": 3,
+      "tier_delta": {},
+      "add": {
+        "SMALL": {
+          "reviewer": 2
+        }
+      },
+      "review": "always",
+      "judge": true,
+      "max_parallel": 3,
+      "cross_review_from": "MEDIUM"
+    }
+  },
+  "context_budget": {
+    "TRIVIAL": 0,
+    "MICRO": 1500,
+    "SMALL": 2000,
+    "MEDIUM": 8000,
+    "COMPLEX": 16000,
+    "CRITICAL": 16000
+  },
+  "codex_disable_features": [
+    "plugins",
+    "apps",
+    "browser_use",
+    "browser_use_external",
+    "computer_use",
+    "in_app_browser",
+    "image_generation",
+    "goals",
+    "tool_suggest",
+    "multi_agent"
+  ],
+  "codex_enable_features": [
+    "skip_host_skill_discovery"
+  ],
+  "limits": {
+    "max_attempts_per_tier": 2,
+    "max_review_rounds": 1,
+    "handoff_chars": 4000,
+    "diff_chars": 24000,
+    "verify_timeout_s": 900,
+    "max_attempts_t3": 1,
+    "retain_tasks": 30,
+    "retain_days": 14,
+    "metrics_max_lines": 1000,
+    "diagnostic_errors": 40
+  },
+  "_role_providers_doc": "Tie-break order only; the cost model picks the provider.",
+  "capability_margin": {
+    "edit": 0.1,
+    "default": 0.25
+  },
+  "gates": {
+    "architect": {
+      "min_confidence": 0.8,
+      "min_confidence_high_risk": 0.9,
+      "max_files": 3,
+      "max_subsystems": 1,
+      "t3_below_confidence": 0.6,
+      "high_risk_areas": "auth, authorization, security, payments, migrations, destructive ops, concurrency"
+    },
+    "review": {
+      "max_lines": 60,
+      "min_implementer_confidence": 0.7
+    }
+  },
+  "_gates_doc": "Stage pruning thresholds. High-risk = auth/security/payment/data keywords in the task (stricter even without repo evidence). CRITICAL always keeps architect and review.",
+  "duration_seed": {
+    "codex": 20,
+    "claude": 12
+  },
+  "priors": {
+    "cost_samples": 5,
+    "success_samples": 8,
+    "intent_group_min": 5
+  },
+  "_pipelines_doc": "Plan-time tiers never include T3; T3 is reached only by evidence-based escalation with a reason code.",
+  "_context_budget_doc": "Orchestrator-supplied tokens per call (provider-native baseline excluded). Over budget \u2192 trimmed before sending."
+}

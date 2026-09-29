@@ -1,0 +1,2 @@
+# Performance investigation
+Define the workload and measurable symptom. Capture a comparable baseline, then use existing profiling or timing evidence to isolate the hot path, query, allocation or contention. Test one hypothesis, preserve behavior and compare the same workload after the change. Report measurement conditions and uncertainty; do not infer an improvement from code appearance alone. Keep stack-specific commands in the project map.

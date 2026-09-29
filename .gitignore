@@ -1,0 +1,24 @@
+# Runtime and private migration data
+/state/
+/runtime/
+/logs/
+/backups/
+/backup-*/
+/archives/
+/.ai/
+/.idea/
+/test-home*/
+__pycache__/
+*.py[cod]
+*.log
+*.tmp
+.DS_Store
+.env*
+!.env.example
+# Provider auth and sessions never belong in this repository
+/.codex/
+/.claude/
+/.gemini/
+**/auth.json
+**/credentials.json
+**/session*.json

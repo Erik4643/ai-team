@@ -1,0 +1,2405 @@
+#!/usr/bin/env python3
+"""ai-team — give one task; the cheapest valid execution path does it.
+
+  ai-team "<task>" [--budget economy|balanced|quality] [--complexity CLASS] [--apply]
+  ai-team --plan "<task>"           routing: what / why / how much / what is conditional   (0 tokens)
+  ai-team --context-plan "<task>"   what each call WOULD receive, by source                 (0 tokens)
+  ai-team --status | --providers | --models | --last | --cost | --routing | --help        (0 tokens)
+  ai-team --self-test [--live]      routing/context/security regression suite (--live: 2 cheap real calls)
+  ai-team map | doctor [--probe] | stats | install
+  ai-team role <role> [--tier N] [--provider P] [--write] "<handoff>|@file"
+
+Decisions are local (T0): intent → fast path? → complexity (MICRO..CRITICAL) → conditional stages → provider by
+expected cost to success (capability first). Policy: ~/.ai-kit/POLICY.md · data: ~/.ai-kit/routing.json
+"""
+import argparse, datetime, hashlib, json, os, re, shutil, subprocess, sys, time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+KIT = Path(os.environ.get("AI_KIT", str(Path(__file__).resolve().parents[1]))).expanduser().resolve()
+CFG = json.loads((KIT / "routing.json").read_text())
+CAPABILITIES = json.loads((KIT / "capabilities.json").read_text())
+LIM = CFG["limits"]
+LEVELS = ["MICRO", "SMALL", "MEDIUM", "COMPLEX", "CRITICAL"]
+RANK = {"TRIVIAL": 0, "MICRO": 1, "SMALL": 2, "MEDIUM": 3, "COMPLEX": 4, "CRITICAL": 5}
+DEMAND = {"TRIVIAL": 0, "MICRO": 1, "SMALL": 1, "MEDIUM": 2, "COMPLEX": 3, "CRITICAL": 3}
+CODE_INTENTS = {"IMPLEMENTATION", "DEBUG", "ARCHITECTURE"}
+MODEL_CALLS = [0]  # real provider invocations in this process (self-test asserts 0)
+
+
+def tok(s):
+    return len(s or "") // 4  # rough estimate; provider counters are the real numbers
+
+
+def rank(cx):
+    return RANK.get(cx, 2)
+
+
+# ── T0 intent + complexity ─────────────────────────────────────────────────────
+def R(p):
+    return re.compile(p, re.I)
+
+
+META = R(r"^\s*(hi|hello|hey|ping|test(ing)?|status|help|version|привет|тест|статус|помощь|версия)\s*[?!.]*\s*$"
+         r"|(ты|вы)\s+(вообще\s+)?работа|работаешь|are you (working|alive|there|ok)|(протестир\w*|тестир\w*|test|check|провер\w*)\s+(тебя|себя|you|ai-team)"
+         r"|\b(show|list|покажи|выведи)\s+(the\s+)?(status|providers?|models?|routing|plan|cost|last|статус|провайдер\w*|модел\w*|маршрут\w*|план|стоимост\w*|последн\w*)"
+         r"|какая модель|какие модели|which models?\b|what models?\b|что ты (будешь|сможешь|можешь) делать|what (will|can) you do|сколько (стоил|токен)|how much did")
+PROJECT_FACT = R(r"^(?!.*\b(fix|add|change|implement|remove|update|исправ|добав|измени|удали)).*"
+                 r"((what|which|tell me|show|какая|какой|какие|покажи|скажи)\b.*\b(build|test|lint|typecheck|type-check|dev|start|format)\b.*\b(command|script|команд\w*|скрипт\w*)"
+                 r"|\b(package manager|пакетн\w* менеджер|what stack|which stack|какой стек|project commands|команды проекта)\b)")
+META_KIND = [("providers", R(r"provider|провайдер")), ("models", R(r"model|модел")), ("cost", R(r"cost|стоим|токен|how much")),
+             ("last", R(r"\blast\b|последн")), ("routing", R(r"plan|план|routing|маршрут|что ты (будешь|сможешь|можешь)|what (will|can) you"))]
+INSPECT = R(r"^\s*(show|list|покажи|выведи)?\s*(me\s+)?(the\s+)?(git status|git diff|what changed|changes|diff|изменения|что изменилось|статус git)\s*[?.!]*\s*$")
+TOOL_ONLY = R(r"^\s*(please\s+)?(run|execute|запусти|прогони|выполни)?\s*(the\s+)?(lint|linter|format|formatter|typecheck|type-check|tests?|build|линт|тесты|сборку)\s*$")
+CHANGE = R(r"\b(add|change|implement|create|make|fix|rename|remove|delete|update|refactor|replace|move|migrate|upgrade|bump|set|convert|support|write|integrate|redesign|rewrite|extract|split|merge|translate|adjust|increase|decrease|style)\b"
+           r"|добав|измени|поменя|сделай|реализ|созда|исправ|почин|переимен|удали|убери|обнови|рефактор|замени|перенес|перепиш|напиши|подключ|интегр|настрой|верни|сократ|увелич|уменьш|переведи|вынеси|раздели")
+DEBUG = R(r"\b(bugs?|errors?|crash\w*|broken|fail\w*|exception|not working|doesn'?t work|issue|race|leak\w*|regression|wrong|incorrect|unexpected\w*|intermittent\w*|root cause|twice|double[sd]?|flicker\w*|re-?renders?|renders)\b"
+          r"|ошибк|баг|пада|пропада|не работает|слома|вылет|гонк|утечк|неправильн|неверн|первопричин|дважды|мерца")
+ARCH = R(r"\b(redesign|re-?architect\w*|architecture|restructure)\b|архитектур|перепроектир")
+REVIEW = R(r"\b(review|code review|audit)\b|ревью|проверь (код|изменения|diff|дифф)")
+PLAN_I = R(r"^\s*(plan|спланируй|составь план|how (should|would|do) (i|we) (implement|build|approach)|как (лучше )?(реализовать|сделать|подойти))")
+RESEARCH = R(r"\b(latest|upgrade|migrate to|changelog|deprecat\w*|release notes|docs? for|best practices?|research)\b|последн\w* верс|обнови\w* до|документаци")
+QUESTION = R(r"\?\s*$|^\s*(what|how|why|where|which|who|when|does|do|is|are|can|explain|что|как|почему|где|какой|какая|какие|зачем|объясни|расскажи|кто|когда)\b")
+REPO_CUE = re.compile(r"(?i:\b(files?|code|codebase|repo\w*|project|components?|functions?|class(es)?|methods?|endpoints?|routes?|pages?|api|hooks?|modules?|tests?|this|here|configured|config)\b"
+                      r"|файл|код|проект|компонент|функци|класс|страниц|роут|хук|модул)|\b[a-z]+[A-Z]\w+|\b\w+_\w+\b|\w/\w")
+STYLE_KW = R(r"\b(colou?r|border[- ]?radius|radius|padding|margin|font[- ]?size|spacing|opacity|z-index|label|wording|copy|typo|spelling|placeholder|tooltip|icon size)\b|цвет|радиус|отступ|шрифт|надпис|опечат")
+MICRO_KW = R(r"\b(rename|typo|spelling|colou?r|border[- ]?radius|radius|padding|margin|font[- ]?size|spacing|opacity|z-index|label|wording|copy|comment|unused imports?|bump|placeholder|tooltip|icon size)\b"
+             r"|переимен|опечат|цвет|радиус|отступ|шрифт|надпис|формулировк")
+DOCS_KW = R(r"\b(readme|docs?|documentation|changelog|\.md|markdown|wording|typo)\b|документац|ридми")
+MAINT = R(r"\b(fix|resolve|repair|clean ?up|eliminate|address|get rid of)\b.{0,60}\b(all|every|existing|current|remaining|global|outstanding)\b.{0,80}\b(errors?|warnings?|problems?|issues?|failures?|diagnostics?)\b"
+          r"|\bmake\b.{0,50}\b(checks?|diagnostics|lint|typecheck|type-?check|build|ci|tests?)\b.{0,30}\b(pass|passing|green|clean)\b"
+          r"|\bmake\b.{0,40}\b(pass|green|clean)\b.{0,20}\b(all )?(checks?|diagnostics|lint|typecheck|ci|tests?)\b"
+          r"|\bclean (up )?(the )?(project|codebase|repo)\b|\bdiagnostics clean\b|\bstatic[- ]analysis (issues|errors|problems)\b"
+          r"|исправ\w* (все|всё).{0,60}(ошибк|предупрежд|проблем)|почини\w* (все|всё)")
+KW = {
+    "CRITICAL": R(r"\b(auth(?!or)\w*|log ?in|sign[- ]?in|oauth|jwt|access token|refresh token|password\w*|payment\w*|billing|checkout|stripe|security|vulnerab\w*|xss|csrf|injection|encrypt\w*|permission\w*|secrets?|credentials?|migrat\w*|database schema|db schema|data loss|delete (user )?data|drop table|deploy\w*|terraform|kubernetes|k8s)\b"
+                  r"|авториз|аутентиф|логин|парол|платеж|платёж|оплат|безопасн|уязвим|шифров|миграц|удален\w* данн|деплой"),
+    "COMPLEX":  R(r"\b(race|concurren\w*|deadlock|intermittent\w*|randomly|flaky|leak\w*|performance|architect\w*|redesign|refactor\w*|cross[- ]module|multiple (modules|services|packages|platforms)|both platforms|root cause|investigat\w*)\b"
+                  r"|гонк|конкурентн|случайн|иногда|периодичес|утечк|производительн|архитектур|рефактор|разобрат|исследу|первопричин"),
+    "MEDIUM":   R(r"\b(feature|implement\w*|integrat\w*|endpoint|page|form|screen|flow|pagination|wizard|dashboard|upgrade|dependenc\w*)\b"
+                  r"|реализ|интегр|страниц|форм[ауы]?\b|экран|пагинац|дашборд"),
+}
+CONCURRENCY_KW = R(r"\b(race|concurren\w*|deadlock|async|thread\w*|lock\w*|mutex)\b|гонк|конкурентн")
+CRIT_DOMAINS = [  # CRITICAL keywords count only if the repo has that kind of code (one git grep); others always count
+    (R(r"auth(?!or)|log ?in|sign[- ]?in|oauth|jwt|token|session|password|credential|авториз|аутентиф|логин|парол"),
+     r"authenticat|authoriz|\bauth\b|\bauth[A-Z_./-]|signin|sign_in|signIn|login|logout|session|jwt|oauth|bcrypt|argon2|passwordHash|hashPassword"),
+    (R(r"payment|billing|checkout|stripe|платеж|платёж|оплат"),
+     r"stripe|checkout|billing|paymentIntent|payment_intent|payment(Method|Service|Api|Provider)|payment_(method|service|provider)"),
+    (R(r"migrat|schema|data loss|delete (user )?data|drop table|миграц|удален\w* данн"),
+     r"migration|schema\.prisma|knex|sequelize|typeorm|alembic|flyway|liquibase|drizzle"),
+]
+ALWAYS_CRITICAL = R(r"\b(security|vulnerab\w*|xss|csrf|injection|encrypt\w*|permission\w*|secrets?|deploy\w*|terraform|kubernetes|k8s)\b|безопасн|уязвим|шифров|деплой")
+PATH_RE = re.compile(r"(?<![\w/])(?:[\w.@-]+/)+[\w.-]+\.\w{1,6}\b|\b[\w-]+\.(?:tsx?|jsx?|mjs|py|go|rs|java|kt|cs|swift|rb|php|vue|svelte|css|scss|json|ya?ml|toml|md)\b")
+SECRET_RE = re.compile(r"(-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----|sk-(ant-)?[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}"
+                       r"|AIza[0-9A-Za-z_-]{30,}|gh[pousr]_[A-Za-z0-9]{30,}|xox[baprs]-[A-Za-z0-9-]{10,}|eyJ[\w-]{10,}\.[\w-]{10,}\.[\w-]{10,}"
+                       r"|(?i:bearer\s+)[A-Za-z0-9._~+/-]{20,}=*|(?i:(?:password|passwd|secret|api[_-]?(?:key|token)|auth[_-]?token|access[_-]?token|client[_-]?secret)\s*[:=]\s*)\S+)")
+
+
+def redact(s):
+    return SECRET_RE.sub("[REDACTED]", s or "")
+
+
+def sh(cmd, cwd=None, timeout=60):
+    try:
+        r = subprocess.run(cmd, cwd=cwd, shell=isinstance(cmd, str), capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout + (r.stderr if isinstance(cmd, str) else "")
+    except Exception as e:  # noqa: BLE001 — any failure here means "not available"
+        return 1, str(e)
+
+
+GENERATED = {"_next", "node_modules", ".next", "dist", "build", "out", "coverage", ".git", "vendor", "target", "bin", "obj",
+             ".yarn", ".turbo", ".cache", "graphify-out", "__pycache__", ".venv", "venv", ".gradle", "Pods", "DerivedData"}
+
+
+def repo_has(root, pattern):
+    excl = [f":(exclude){d}" for d in sorted(GENERATED)] + [":(exclude)*.md", ":(exclude)*.lock", ":(exclude)*lock.json", ":(exclude)*.yaml",
+                                                             ":(exclude)messages", ":(exclude)locales", ":(exclude).ai", ":(exclude)*.min.js"]
+    rc, out = sh(["git", "grep", "-l", "-I", "-E", pattern, "--", "."] + excl, cwd=root)
+    return rc == 0 and bool(out.strip())
+
+
+def critical_with_evidence(task, root):
+    if ALWAYS_CRITICAL.search(task) or root is None:
+        return True, ""
+    for task_rx, code_rx in CRIT_DOMAINS:
+        if task_rx.search(task) and repo_has(root, code_rx):
+            return True, ""
+    return False, "risk keyword, but no matching code in this repo → not CRITICAL (stricter gates still apply)"
+
+
+def classify(task, root=None, forced=None):
+    """→ (intent, complexity, confidence, signals). Regex + at most one git grep; no tokens."""
+    paths = sorted(set(PATH_RE.findall(task)))
+    sig = {"paths": paths, "keywords": []}
+    if META.search(task):
+        return "META", "TRIVIAL", "high", dict(sig, meta=next((k for k, rx in META_KIND if rx.search(task)), "status"))
+    if PROJECT_FACT.search(task):
+        return "META", "TRIVIAL", "high", dict(sig, meta="project")
+    if INSPECT.match(task):
+        return "INSPECTION", "TRIVIAL", "high", sig
+    if TOOL_ONLY.match(task):
+        return "TOOL", "TRIVIAL", "high", sig
+    change, dbg, arch = bool(CHANGE.search(task)), bool(DEBUG.search(task)), bool(ARCH.search(task))
+    question = bool(QUESTION.search(task))
+    if arch and (change or not question):
+        intent = "ARCHITECTURE"
+    elif REVIEW.search(task) and not re.search(r"\b(fix|and fix|apply)\b|исправ", task, re.I):
+        intent = "REVIEW"
+    elif change or (dbg and not question) or (dbg and re.match(r"^\s*(find|найди)\b", task, re.I)):
+        intent = "DEBUG" if dbg else "IMPLEMENTATION"
+    elif PLAN_I.search(task):
+        intent = "PLAN"
+    elif RESEARCH.search(task):
+        intent = "RESEARCH"
+    elif question:
+        intent = "QUESTION"
+    else:
+        intent = "UNKNOWN"  # cheap T1 probe decides
+    sig["analysis_first"] = intent == "DEBUG" and not change  # diagnose first; implement only if a change is required
+    sig["docs"] = bool(DOCS_KW.search(task)) and not re.search(r"\.(tsx?|jsx?|py|go|rs|css|scss)\b", task)
+    sig["maintenance"] = sig["aggregate"] = bool(MAINT.search(task))  # aggregate diagnostics: every relevant check before "clean"
+    hit = {k: bool(rx.search(task)) for k, rx in KW.items()}
+    sig["risk_keyword"] = hit["CRITICAL"]
+    sig["high_risk"] = hit["CRITICAL"] or bool(CONCURRENCY_KW.search(task))  # stricter gates, never looser
+    if hit["CRITICAL"]:
+        hit["CRITICAL"], note = critical_with_evidence(task, root)
+        if note:
+            sig["note"] = note
+    sig["keywords"] = [k for k, v in hit.items() if v]
+    if forced:
+        return (intent if intent in CODE_INTENTS else "IMPLEMENTATION"), forced.upper(), "forced", sig
+    if intent not in CODE_INTENTS:
+        return intent, ("MEDIUM" if intent == "PLAN" and (hit["COMPLEX"] or hit["CRITICAL"]) else "SMALL"), "high", sig
+    words = len(task.split())
+    if sig["maintenance"]:
+        c = "MEDIUM"  # sized after deterministic diagnostics
+    elif hit["CRITICAL"]:
+        c = "CRITICAL"
+    elif hit["COMPLEX"] or intent == "ARCHITECTURE":
+        c = "COMPLEX"
+    elif hit["MEDIUM"] or len(paths) >= 4 or words > 60:
+        c = "MEDIUM"
+    elif intent == "IMPLEMENTATION" and (MICRO_KW.search(task) or sig["docs"]) and words <= 25 and len(paths) <= 2 \
+            and (not sig["risk_keyword"] or STYLE_KW.search(task)):  # a cosmetic edit near a risky word is still cosmetic
+        c = "MICRO"
+    else:
+        c = "SMALL"
+    conf = "high" if sig["keywords"] or c == "MICRO" else "low → start at T1, escalate on evidence"
+    return intent, c, conf, sig
+
+
+# ── repository index ───────────────────────────────────────────────────────────
+def repo_root():
+    rc, out = sh(["git", "rev-parse", "--show-toplevel"])
+    return Path(out.strip()) if rc == 0 else Path.cwd()
+
+
+def detect_map(root):
+    """Index of durable facts from manifests only (T0). Never reads .env files."""
+    m = {"generated_by": "ai-team map", "stacks": [], "package_manager": None, "workspaces": None,
+         "dirs": [], "generated_dirs": [], "entry_points": [], "commands": {}}
+    f = lambda p: (root / p).exists()  # noqa: E731
+    top = sorted(p.name for p in root.iterdir() if p.is_dir() and not p.name.startswith("."))
+    m["dirs"] = [d for d in top if d not in GENERATED]
+    m["generated_dirs"] = [d for d in top if d in GENERATED] + [d for d in (".next", ".turbo") if f(d)]
+    cmds = {}
+    if f("package.json"):
+        try:
+            pkg = json.loads((root / "package.json").read_text())
+        except (OSError, ValueError):
+            pkg = {}
+        if not isinstance(pkg, dict):
+            pkg = {}
+        m["stacks"].extend(["javascript", "node"])
+        pm = ("pnpm" if f("pnpm-lock.yaml") else "yarn" if f("yarn.lock") else "bun" if f("bun.lockb") or f("bun.lock") else "npm")
+        m["package_manager"] = pm
+        run = pm if pm in ("yarn", "pnpm", "bun") else "npm run"
+        deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+        for name in ("next", "react-native", "expo", "react", "vue", "nuxt", "svelte", "@angular/core", "express", "@nestjs/core", "electron", "typescript"):
+            if name in deps:
+                m["stacks"].append(name)
+        m["workspaces"] = pkg.get("workspaces") or (["pnpm-workspace.yaml"] if f("pnpm-workspace.yaml") else None)
+        scripts = pkg.get("scripts", {})
+        pick = {"typecheck": ("typecheck", "type-check", "tsc", "check-types"), "lint": ("lint",), "test": ("test", "test:unit"),
+                "build": ("build",), "format": ("format", "prettier:fix", "fmt"), "dev": ("dev", "start")}
+        for key, names in pick.items():
+            for n in names:
+                if n in scripts:
+                    cmds[key] = f"{run} {n}"
+                    break
+        if "typecheck" not in cmds and "typescript" in deps and f("tsconfig.json"):
+            cmds["typecheck"] = f"{'npx' if pm == 'npm' else pm} tsc --noEmit"
+    if f("pyproject.toml") or f("requirements.txt") or f("setup.py"):
+        m["stacks"].append("python")
+        py = (root / "pyproject.toml").read_text() if f("pyproject.toml") else ""
+        m["package_manager"] = m["package_manager"] or ("uv" if f("uv.lock") else "poetry" if f("poetry.lock") else "pip")
+        if "pytest" in py or f("pytest.ini") or f("tests"):
+            cmds.setdefault("test", "pytest -q")
+        if "ruff" in py:
+            cmds.setdefault("lint", "ruff check .")
+        if "mypy" in py:
+            cmds.setdefault("typecheck", "mypy .")
+    if f("go.mod"):
+        m["stacks"].append("go"); m["package_manager"] = m["package_manager"] or "go"
+        cmds.setdefault("typecheck", "go build ./..."); cmds.setdefault("lint", "go vet ./..."); cmds.setdefault("test", "go test ./...")
+    if f("Cargo.toml"):
+        m["stacks"].append("rust"); m["package_manager"] = m["package_manager"] or "cargo"
+        cmds.setdefault("typecheck", "cargo check"); cmds.setdefault("lint", "cargo clippy"); cmds.setdefault("test", "cargo test")
+    if list(root.glob("*.sln")) or list(root.glob("*.slnx")) or list(root.glob("*.csproj")):
+        m["stacks"].append("dotnet"); cmds.setdefault("build", "dotnet build"); cmds.setdefault("test", "dotnet test")
+    if f("pom.xml"):
+        m["stacks"].append("java-maven"); cmds.setdefault("build", "mvn -q compile"); cmds.setdefault("test", "mvn -q test")
+    if f("build.gradle") or f("build.gradle.kts"):
+        m["stacks"].append("gradle")
+        if f("build.gradle.kts"):
+            m["stacks"].append("kotlin")
+        else:
+            m["stacks"].append("java")
+        gradle = "./gradlew" if f("gradlew") else "gradle"
+        cmds.setdefault("build", f"{gradle} build -x test"); cmds.setdefault("test", f"{gradle} test")
+    if f("tsconfig.json") and "typescript" not in m["stacks"]:
+        m["stacks"].append("typescript")
+    if f("Package.swift") or list(root.glob("*.xcodeproj")):
+        m["stacks"].append("swift")
+        if f("Package.swift"):
+            cmds.setdefault("build", "swift build"); cmds.setdefault("test", "swift test")
+    if f("Gemfile"):
+        m["stacks"].append("ruby"); m["package_manager"] = m["package_manager"] or "bundler"
+        if f("spec"):
+            cmds.setdefault("test", "bundle exec rspec")
+    if f("composer.json"):
+        m["stacks"].append("php"); m["package_manager"] = m["package_manager"] or "composer"
+        if f("phpunit.xml") or f("phpunit.xml.dist"):
+            cmds.setdefault("test", "vendor/bin/phpunit")
+    if f("Dockerfile") or f("compose.yaml") or f("docker-compose.yml") or f("docker-compose.yaml"):
+        m["stacks"].append("docker")
+    if list(root.glob("*.tf")):
+        m["stacks"].append("terraform")
+    if f("kustomization.yaml") or f("Chart.yaml"):
+        m["stacks"].append("kubernetes")
+    if not m["workspaces"]:
+        workspaces = []
+        for group in ("packages", "apps", "services", "crates"):
+            parent = root / group
+            if parent.is_dir() and not parent.is_symlink():
+                for sub in sorted(parent.iterdir())[:40]:
+                    if sub.is_dir() and not sub.is_symlink() and any((sub / manifest).is_file() for manifest in
+                            ("package.json", "pyproject.toml", "go.mod", "Cargo.toml", "pom.xml", "build.gradle.kts")):
+                        workspaces.append(str(sub.relative_to(root)))
+        m["workspaces"] = workspaces[:20] or None
+    m["stacks"] = list(dict.fromkeys(m["stacks"])) or ["unknown"]
+    m["dirs"] = m["dirs"][:20]
+    m["optional_capabilities"] = {"graphify": {"graph_present": f("graphify-out/graph.json")}}
+    m["boundaries"] = []
+    if f("Makefile"):
+        targets = re.findall(r"^([a-zA-Z][\w-]*):", (root / "Makefile").read_text(), re.M)
+        for key in ("test", "lint", "build", "typecheck"):
+            if key in targets:
+                cmds.setdefault(key, f"make {key}")
+    m["commands"] = cmds
+    for p in ("app", "pages", "src/app", "src/main.ts", "src/index.ts", "src/main.tsx", "index.js", "main.go", "cmd",
+              "manage.py", "main.py", "app.py", "src/main.rs", "Program.cs", "App.tsx", "index.ts"):
+        if f(p):
+            m["entry_points"].append(p)
+    return m
+
+
+def load_map(root):
+    p = root / ".ai" / "repo-map.json"
+    return json.loads(p.read_text()) if p.exists() else detect_map(root)
+
+
+def context_sections(root):
+    for p in (root / ".ai" / "CONTEXT.md", root / "AGENTS.md"):
+        if p.exists():
+            t = p.read_text()
+            parts = re.split(r"(?m)^## ", t)
+            return {x.split("\n", 1)[0].strip().lower(): "## " + x.strip() for x in parts[1:]}
+    return {}
+
+
+def project_context(root, role, complexity):
+    """Level-4 disclosure: Rules always; facts only where the role needs orientation; tool guidance only for explorers."""
+    sec = context_sections(root)
+    want = ["rules"]
+    if role in ("explorer", "architect") or (role == "implementer" and rank(complexity) >= RANK["MEDIUM"]):
+        want.insert(0, "project facts")
+    if role in ("explorer", "architect") and graph_ready(root):
+        want.append("graphify")
+    return "\n\n".join(sec[k] for k in want if k in sec)
+
+
+def graph_ready(root):
+    """Local, bounded validation only. Never install, build, update or query a graph."""
+    if os.environ.get("AI_TEAM_GRAPHIFY", "").lower() in {"off", "0", "false"} or not shutil.which("graphify"):
+        return False
+    p = root / "graphify-out" / "graph.json"
+    try:
+        if p.stat().st_size > 32 * 1024 * 1024:
+            return False
+        graph = json.loads(p.read_text())
+        if not isinstance(graph, dict) or not isinstance(graph.get("nodes"), list) or not graph["nodes"]:
+            return False
+        nodes = graph["nodes"]
+        if not all(isinstance(n, dict) and isinstance(n.get("id"), (str, int)) for n in nodes):
+            return False
+        ids = {n["id"] for n in nodes}
+        edges = graph.get("links", graph.get("edges"))
+        return (len(ids) == len(nodes) and isinstance(edges, list)
+                and all(isinstance(e, dict) and isinstance(e.get("source"), (str, int))
+                        and isinstance(e.get("target"), (str, int))
+                        and e["source"] in ids and e["target"] in ids for e in edges))
+    except (OSError, ValueError):
+        return False
+
+
+def capability_guidance(role, task, root):
+    """Read only selected canonical guidance; catalogs and vendor folders are never searched."""
+    parts = []
+    for c in CAPABILITIES["capabilities"]:
+        if role not in c.get("roles", []) or not c.get("task_pattern"):
+            continue
+        if re.search(c["task_pattern"], task, re.I):
+            parts.append(("workflow:" + c["id"], (KIT / c["sources"][0]).read_text()))
+        if len(parts) >= CAPABILITIES["max_conditional_workflows"]:
+            break
+    if role in ("explorer", "architect") and graph_ready(root):
+        parts.append(("optional:graphify", (KIT / "skills/graphify/SKILL.md").read_text().split("---", 2)[-1].strip()))
+    return parts
+
+
+def role_instructions(role, task, root):
+    if role not in {"orchestrator", "explorer", "implementer", "architect", "reviewer", "researcher", "judge"}:
+        raise ValueError("unknown canonical role: " + role)
+    return "\n\n".join([(KIT / "roles" / (role + ".md")).read_text()]
+                       + [body for _, body in capability_guidance(role, task, root)])
+
+
+def relevant_docs(task, rmap):
+    """Doc paths (never contents) whose `when` pattern matches the task — the agent opens them only if needed."""
+    return [d["path"] for d in rmap.get("docs", []) if d.get("when") and re.search(d["when"], task, re.I)]
+
+
+# ── providers ──────────────────────────────────────────────────────────────────
+DISABLED = set(x for x in os.environ.get("AI_TEAM_DISABLE", "").split(",") if x)
+BROKEN = set()
+COOLDOWN_FILE = KIT / "state" / "cooldown.json"
+LIMIT_RE = re.compile(r"usage limit|rate limit|quota|too many requests|\b429\b|credit balance", re.I)
+_AVAIL = {}
+
+
+def cooldowns():
+    try:
+        data = json.loads(COOLDOWN_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+    now = datetime.datetime.now().isoformat(timespec="seconds")
+    return {k: v for k, v in data.items() if v > now}
+
+
+def set_cooldown(provider, minutes=60):
+    data = cooldowns()
+    data[provider] = (datetime.datetime.now() + datetime.timedelta(minutes=minutes)).isoformat(timespec="seconds")
+    COOLDOWN_FILE.parent.mkdir(exist_ok=True)
+    COOLDOWN_FILE.write_text(json.dumps(data))
+    _AVAIL.clear()
+
+
+def available():
+    """Installed, not disabled, not broken this run, not cooling down. Cached for 30 s within a process."""
+    key = (os.environ.get("AI_TEAM_PROVIDERS", ""), tuple(sorted(BROKEN)), int(time.time() // 30))
+    if key not in _AVAIL:
+        only = [x for x in key[0].split(",") if x]
+        cool = cooldowns()
+        _AVAIL.clear()
+        _AVAIL[key] = [n for n, p in CFG["providers"].items()
+                       if (not only or n in only) and n not in DISABLED and n not in BROKEN and n not in cool and shutil.which(p["bin"])]
+    return list(_AVAIL[key])
+
+
+def pick_provider(role, avoid=None):
+    """Runtime fallback only (a provider failed). Normal selection is choose()."""
+    prefs = [p for p in CFG["role_providers"][role] if p in available()]
+    if avoid and any(p != avoid for p in prefs):
+        prefs = [p for p in prefs if p != avoid]
+    return prefs[0] if prefs else None
+
+
+_CODEX_FLAGS = None
+
+
+def codex_lean_flags():
+    """Disable optional Codex tool surfaces present in this version (−1.2k tokens/call). Feature list cached 24 h per binary."""
+    global _CODEX_FLAGS
+    if _CODEX_FLAGS is None:
+        binp = Path(shutil.which("codex") or "codex").resolve()
+        cache = KIT / "state" / "codex-features.json"
+        stamp = f"{binp}:{binp.stat().st_mtime if binp.exists() else 0}"
+        known = None
+        try:
+            c = json.loads(cache.read_text())
+            if c.get("stamp") == stamp and time.time() - c.get("t", 0) < 86400:
+                known = set(c["features"])
+        except (OSError, ValueError, KeyError):
+            pass
+        if known is None:
+            _, feats = sh(["codex", "features", "list"])
+            known = {line.split()[0] for line in feats.splitlines() if line.strip()}
+            cache.parent.mkdir(exist_ok=True)
+            cache.write_text(json.dumps({"stamp": stamp, "t": time.time(), "features": sorted(known)}))
+        flags = []
+        for f in CFG.get("codex_disable_features", []):
+            if f in known:
+                flags += ["--disable", f]
+        for f in CFG.get("codex_enable_features", []):
+            if f in known:
+                flags += ["--enable", f]
+        cfg = Path.home() / ".codex" / "config.toml"
+        if cfg.exists():
+            for name in re.findall(r"^\[mcp_servers\.([A-Za-z0-9_-]+)\]\s*$", cfg.read_text(), re.M):
+                flags += ["-c", f"mcp_servers.{name}.enabled=false"]
+        flags += ["-c", "project_doc_max_bytes=0"]  # ai-team sends the targeted project context itself
+        _CODEX_FLAGS = flags
+    return _CODEX_FLAGS
+
+
+class ProviderError(Exception):
+    pass
+
+
+def ro_bash(extra=()):
+    return [f"Bash({c}:*)" for c in ["git diff", "git status", "git log", "git show", "git grep", "rg", "ls", "graphify query", "graphify path", "graphify explain"] + list(extra)]
+
+
+ENV_DENY = ["Read(./.env)", "Read(./.env.*)", "Read(**/.env)", "Read(**/.env.*)"]
+ANSWER_SYSTEM = "You are ai-team's quick assistant. Answer briefly and precisely. No tools are available."
+
+
+def run_provider(provider, tier, prompt, write, role, tdir, label, allow_cmds, cwd=None):
+    """cwd = repo root: agents must work in the repository even when ai-team is started from a subdirectory."""
+    MODEL_CALLS[0] += 1
+    spec = CFG["providers"][provider]["tiers"][str(tier)]
+    model, effort = spec["model"], spec.get("effort")
+    log = tdir / f"{label}.{provider}.log"
+    if provider == "codex":
+        out = tdir / f"{label}.codex.out"
+        cmd = (["codex", "exec", "-m", model] + (["-c", f"model_reasoning_effort={effort}"] if effort else [])
+               + ["-s", "workspace-write" if write else "read-only", "--skip-git-repo-check", "--ephemeral", "--json"]
+               + (["-C", str(cwd)] if cwd else [])
+               + codex_lean_flags() + ["-o", str(out), "-"])
+        r = subprocess.run(cmd, input=prompt, text=True, capture_output=True, timeout=3600, cwd=cwd)
+        raw = r.stdout + r.stderr
+        log.write_text(redact(raw[-20000:]))
+        text = out.read_text() if out.exists() else ""
+        u = re.findall(r'"usage":(\{[^}]*\})', raw)
+        usage = json.loads(u[-1]) if u else {}
+        if r.returncode != 0 or not text.strip():
+            raise ProviderError(raw[-600:])
+        cached = usage.get("cached_input_tokens", 0)  # codex counts cached tokens inside input_tokens
+        return text, {"in": usage.get("input_tokens", 0) - cached, "cached": cached, "out": usage.get("output_tokens", 0), "usd": None}, model
+    if provider == "claude":
+        # --setting-sources "": no CLAUDE.md / memory / hooks / plugins — ai-team already sends the targeted context (−2.2k measured).
+        base = ["claude", "-p", "--model", model, "--output-format", "json", "--strict-mcp-config", "--disable-slash-commands",
+                "--setting-sources", "", "--max-budget-usd", str(spec.get("max_usd", 2))]
+        if effort and tier > 1:
+            base += ["--effort", effort]
+        if role == "answer":  # no tools + tiny system prompt: measured ~1.1k input
+            cmd = base + ["--tools", "", "--system-prompt", ANSWER_SYSTEM]
+        else:
+            tools, allowed = ["Read", "Grep", "Glob", "Bash"], ["Read", "Grep", "Glob"] + ro_bash()
+            if write:
+                tools += ["Edit", "Write"]; allowed += ["Edit", "Write"] + [f"Bash({c}:*)" for c in allow_cmds]
+            if role == "researcher":
+                tools += ["WebSearch", "WebFetch"]; allowed += ["WebSearch", "WebFetch"]
+            cmd = base + ["--permission-mode", "acceptEdits" if write else "dontAsk", "--tools", *tools, "--allowedTools", *allowed,
+                          "--disallowedTools", *ENV_DENY]
+        r = subprocess.run(cmd, input=prompt, text=True, capture_output=True, timeout=3600, cwd=cwd)
+        log.write_text(redact(r.stdout[-20000:] + "\n--stderr--\n" + r.stderr[-4000:]))
+        try:
+            j = json.loads(r.stdout)
+        except ValueError:
+            raise ProviderError((r.stderr or r.stdout)[-600:])
+        if r.returncode != 0 or j.get("is_error") or not str(j.get("result", "")).strip():
+            raise ProviderError(str(j.get("result") or j.get("subtype"))[:600])
+        u = j.get("usage", {})
+        return j.get("result", ""), {"in": u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0),
+                                     "cached": u.get("cache_read_input_tokens", 0), "out": u.get("output_tokens", 0),
+                                     "usd": j.get("total_cost_usd")}, model
+    if provider == "gemini":  # headless gemini-cli flags; verified only when gemini is installed
+        cmd = ["gemini", "-m", model, "--output-format", "json"] + (["--approval-mode", "auto_edit"] if write else []) + ["-p", prompt]
+        r = subprocess.run(cmd, text=True, capture_output=True, timeout=3600, cwd=cwd)
+        log.write_text(redact(r.stdout[-20000:] + "\n--stderr--\n" + r.stderr[-4000:]))
+        try:
+            j = json.loads(r.stdout); text = j.get("response", "")
+        except ValueError:
+            text = r.stdout
+        if r.returncode != 0 or not text.strip():
+            raise ProviderError((r.stderr or r.stdout)[-600:])
+        return text, {"in": 0, "cached": 0, "out": 0, "usd": None}, model
+    raise ProviderError(f"unknown provider {provider}")
+
+
+def parse_output(text, role):
+    if role == "answer":
+        return {"role": role, "status": "done", "findings": [text.strip()]}
+    s = text.strip()
+    for cand in reversed(re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", s, re.S)):
+        try:
+            return json.loads(cand)
+        except ValueError:
+            pass
+    end = s.rfind("}")
+    for i, ch in enumerate(s):
+        if ch == "{" and end > i:
+            try:
+                return json.loads(s[i:end + 1])
+            except ValueError:
+                continue
+    if "NO_CHANGE_REQUIRED" in s:
+        return {"role": role, "status": "no_change", "findings": [s[:800]]}
+    return {"role": role, "status": "blocked", "confidence": 0.0, "findings": [s[:1500]],
+            "open_questions": ["Provider returned no valid structured result; completion is unverified."], "_unstructured": True}
+
+
+# ── cost-aware provider selection (T0 arithmetic over config + local history) ──
+_HIST = None
+
+
+def metrics():
+    p = KIT / "state" / "metrics.jsonl"
+    return [json.loads(x) for x in p.read_text().splitlines() if x.strip()] if p.exists() else []
+
+
+def history():
+    """Per-call metadata from the last 200 runs. No prompts, outputs or source."""
+    global _HIST
+    if _HIST is None:
+        _HIST = []
+        for m in metrics()[-200:]:
+            for st in m.get("steps", []):
+                ok = st.get("ok")
+                if ok is None:
+                    ok = st.get("status") in ("done", "no_change", "needs_change")
+                _HIST.append(dict(st, ok=bool(ok), intent=m.get("intent"), complexity=m.get("complexity")))
+    return _HIST
+
+
+def units(fresh, cached, out, secs=0):
+    w = CFG["cost_weights"]
+    return fresh * w["fresh"] + cached * w["cached"] + out * w["output"] + secs * w.get("seconds", 0)
+
+
+def observed_baseline(provider, answer=False):
+    """Measured seed blended with the 25th percentile of (fresh input − our context) over the last 50 calls. → (tokens, samples)."""
+    key = f"{provider}_answer" if answer and f"{provider}_answer" in CFG["baseline_seed"] else provider
+    seed = CFG["baseline_seed"].get(key, 5000)
+    recent = [st for st in history() if st["provider"] == provider and (st["role"] == "answer") == key.endswith("_answer") and st.get("in")][-50:]
+    xs = sorted(max(0, st["in"] - st.get("ctx", 0)) for st in recent)
+    if not xs:
+        return seed, 0
+    n, k = len(xs), CFG["priors"]["cost_samples"]
+    return (n * xs[n // 4] + k * seed) / (n + k), n
+
+
+def evidence_n(n):
+    """Effective sample count for blending history with priors: <5 weak (counts half), 5–19 moderate, ≥20 full."""
+    return n * 0.5 if n < 5 else float(n)
+
+
+def evidence_label(n):
+    return "weak" if n < 5 else "moderate" if n < 20 else "strong"
+
+
+def role_dim(role, intent=None, docs=False):
+    if role == "implementer":
+        return "docs" if docs else "edit"
+    if role == "architect":
+        return "debug" if intent == "DEBUG" else "architecture"
+    return {"answer": "analysis", "explorer": "explore", "reviewer": "review", "researcher": "research", "judge": "architecture"}.get(role, "analysis")
+
+
+def score(role, provider, tier, complexity, ctx, intent=None, docs=False):
+    """Expected cost to a successful result, in comparative units (not money)."""
+    spec = CFG["providers"][provider]["tiers"][str(tier)]
+    dim = role_dim(role, intent, docs)
+    base, nb = observed_baseline(provider, role == "answer")
+    cached = 0 if role == "answer" else CFG["cached_seed"].get(provider, 0)
+    out = CFG["expected_output"].get(role, 800) * CFG["effort_mult"].get(spec.get("effort") or "medium", 1.3)
+    secs = CFG.get("duration_seed", {}).get(provider, 15)
+    model = units(base + ctx, cached, out, secs)
+    same = [st for st in history() if st["provider"] == provider and st["role"] == role and st["tier"] == tier]
+    grouped = [st for st in same if st.get("intent") == intent]
+    hs = (grouped if len(grouped) >= CFG["priors"]["intent_group_min"] else same)[-20:]
+    n, kc, ks = len(hs), CFG["priors"]["cost_samples"], CFG["priors"]["success_samples"]
+    ne = evidence_n(n)
+    obs_cost = sum(units(st["in"], st["cached"], st["out"], st.get("s", secs)) for st in hs) / n if n else model
+    cost = (ne * obs_cost + kc * model) / (ne + kc)
+    prior = (CFG["tier_success"][str(tier)] - 0.08 * max(0, DEMAND.get(complexity, 1) - tier)) * CFG["strength"].get(provider, {}).get(dim, 0.7)
+    obs_p = sum(1 for st in hs if st["ok"]) / n if n else prior
+    p = min(0.99, max(0.05, (ne * obs_p + ks * prior) / (ne + ks)))
+    return {"provider": provider, "tier": tier, "E": cost / (p * p if dim == "edit" else p), "cost": cost, "p": p,
+            "baseline": base, "n": n, "dim": dim}
+
+
+def choose(role, tier, complexity, ctx=500, avoid=None, intent=None, docs=False):
+    """Capability gate first (within margin of the best success estimate), then cheapest expected cost."""
+    cands = [p for p in CFG["role_providers"][role] if p in available()]
+    if avoid and any(p != avoid for p in cands):
+        cands = [p for p in cands if p != avoid]
+    ranked = [score(role, p, tier, complexity, ctx, intent, docs) for p in cands]
+    if not ranked:
+        return []
+    best_p = max(r["p"] for r in ranked)
+    margin = CFG["capability_margin"].get(ranked[0]["dim"], CFG["capability_margin"]["default"])
+    for r in ranked:
+        r["eligible"] = r["p"] >= best_p - margin
+    return sorted(ranked, key=lambda r: (not r["eligible"], r["E"]))
+
+
+def explain(ranked, avoided=None, implementer=None):
+    """One short reason: what the stage needs and why this provider."""
+    b = ranked[0]
+    need = {"edit": "edits repo", "docs": "edits docs", "research": "external research"}.get(b["dim"], "read-only")
+    if len(ranked) == 1:
+        why = f"{need}; only available provider"
+    else:
+        o = ranked[1]
+        if not o["eligible"]:
+            why = f"{need}; capability over cost ({o['provider']} p={o['p']:.0%} < {b['p']:.0%})"
+        else:
+            why = f"{need}; cheapest capable ({o['provider']} ≈{o['E'] / 1000:.0f}k)"
+    if implementer:  # reviewer: say what kind of independence it actually is
+        why += "; cross-provider review" if b["provider"] != implementer else "; independent review session (same provider, fresh context)"
+    return why + (f"; n={b['n']} ({evidence_label(b['n'])})" if b["n"] else "")
+
+
+# ── targeted prompt packages ───────────────────────────────────────────────────
+SCHEMA = {
+    "explorer":    '{"status":"done|needs_change|no_change","confidence":0.0,"relevant_files":["path:line"],"relevant_symbols":[],"root_cause_candidate":"","root_causes":["only if several"],"affected_subsystems":[],"architecture_decision_required":false,"external_research_required":false,"risk":"low|medium|high","unresolved_questions":[],"recommended_next_stage":"implementer|architect|researcher|none","complexity":"MICRO|SMALL|MEDIUM|COMPLEX","findings":["fact or direct answer"],"next_action":"exact change if needed"}',
+    "implementer": '{"status":"done|no_change|blocked","confidence":0.0,"files":["changed paths"],"findings":["what changed"],"open_questions":[],"risks":[]}',
+    "reviewer":    '{"status":"done","issues":[{"severity":"critical|high|medium|low","file":"","line":0,"problem":"","fix":""}]}',
+    "architect":   '{"status":"done","confidence":0.0,"change_required":true,"decision":"","files":[],"risks":[],"workstreams":[{"files":[],"action":""}],"next_action":""}',
+    "researcher":  '{"status":"done","findings":["fact (source URL)"],"next_action":""}',
+    "judge":       '{"status":"done","decision":"","findings":["deciding evidence"],"issues":[{"severity":"","file":"","line":0,"problem":"","fix":""}]}',
+}
+NEEDS_PROJECT = {"explorer", "architect", "implementer", "reviewer", "judge"}
+NEEDS_MAP = {"explorer", "architect"}
+TRIM_ORDER = ("repo-map", "project", "docs")
+
+
+def build_prompt(role, handoff, root, rmap, complexity="SMALL", extra="", files_known=True):
+    """Stable prefix (role → schema → project → map) then volatile (handoff → diff). No timestamps or ids. → (prompt, sizes)."""
+    if role == "answer":
+        parts = [("task", handoff)]
+    else:
+        parts = [("role", (KIT / "roles" / f"{role}.md").read_text()),
+                 ("schema", f"End with ONE JSON object, nothing after it (omit empty fields): {SCHEMA[role]}")]
+        # Match only the task, not findings/diffs that happen to contain keywords.
+        task = handoff.splitlines()[0].removeprefix("TASK:").strip() if handoff else ""
+        parts.extend(capability_guidance(role, task, root))
+        if role in NEEDS_PROJECT:
+            parts.append(("project", project_context(root, role, complexity)))
+        if role in NEEDS_MAP or (role == "implementer" and not files_known):
+            compact = {k: rmap.get(k) for k in ("stacks", "package_manager", "dirs", "entry_points", "boundaries") if rmap.get(k)}
+            parts.append(("repo-map", "# Repo map (index — open files yourself)\n" + json.dumps(compact, separators=(",", ":"), ensure_ascii=False)))
+        parts.append(("handoff", "# Handoff\n" + handoff))
+        if extra:
+            parts.append(("diff", extra))
+    budget = CFG["context_budget"].get(complexity, 8000)
+    sizes = {k: tok(v) for k, v in parts}
+    if budget and sum(sizes.values()) > budget:  # drop least valuable first, then trim the diff to what is left
+        for drop in tuple(k for k, _ in parts if k.startswith(("workflow:", "optional:"))) + TRIM_ORDER:
+            parts = [(k, v) for k, v in parts if k != drop]
+            if sum(tok(v) for _, v in parts) <= budget:
+                break
+        room = max(0, budget - sum(tok(v) for k, v in parts if k != "diff")) * 4
+        parts = [(k, (v[:room] + "\n…(diff truncated to fit the context budget; run `git diff -- <file>` for the rest)") if k == "diff" and len(v) > room else v)
+                 for k, v in parts]
+        sizes = {k: tok(v) for k, v in parts}
+        sizes["_trimmed"] = True
+    return "\n\n".join(v for _, v in parts if v), sizes
+
+
+def make_handoff(task, st, next_action, constraints=""):
+    """TASK / RESULT / CONFIDENCE / FILES / EVIDENCE / RISKS / OPEN QUESTIONS / NEXT ACTION — non-empty sections only, paths not contents."""
+    out = [f"TASK: {task}"]
+    if st.get("result"):
+        out.append(f"RESULT: {st['result']}")
+    if st.get("confidence") is not None:
+        out.append(f"CONFIDENCE: {st['confidence']:.2f}")
+    if st["files"]:
+        out.append("FILES (open them yourself):\n" + "\n".join(f"- {x}" for x in sorted(st["files"])[:25]))
+    if st.get("docs"):
+        out.append("DOCS (open only if needed): " + ", ".join(st["docs"]))
+    if st["findings"]:
+        out.append("EVIDENCE:\n" + "\n".join(f"- {x}" for x in st["findings"][:12]))
+    if st["decision"]:
+        out.append(f"DECISION: {st['decision']}")
+    if st.get("risks"):
+        out.append("RISKS: " + "; ".join(st["risks"][:5]))
+    if st["open"]:
+        out.append("OPEN QUESTIONS:\n" + "\n".join(f"- {x}" for x in st["open"][:6]))
+    out.append(f"NEXT ACTION: {next_action}")
+    if constraints:
+        out.append(f"CONSTRAINTS: {constraints}")
+    return "\n".join(out)[:LIM["handoff_chars"]]
+
+
+# ── git change tracking ────────────────────────────────────────────────────────
+def snapshot(root):
+    rc, out = sh(["git", "status", "--porcelain", "-uall"], cwd=root)
+    if rc != 0:
+        return None
+    snap = {}
+    for line in out.splitlines():
+        p = line[3:].split(" -> ")[-1].strip('"')
+        if p.startswith(".ai/state/"):
+            continue
+        fp = root / p
+        snap[p] = hashlib.sha1(fp.read_bytes()).hexdigest() if fp.is_file() else "deleted"
+    return snap
+
+
+def changed(root, before):
+    after = snapshot(root)
+    if before is None or after is None:
+        return []
+    return sorted(p for p in set(before) | set(after) if before.get(p) != after.get(p))
+
+
+def diff_for(root, files):
+    if not files:
+        return "(no changes)"
+    _, stat = sh(["git", "diff", "--stat", "--"] + files, cwd=root)
+    _, body = sh(["git", "diff", "--"] + files, cwd=root)
+    _, untracked = sh(["git", "ls-files", "--others", "--exclude-standard", "--"] + files, cwd=root)
+    for p in untracked.split():
+        body += f"\n--- new file {p}\n" + (root / p).read_text(errors="replace")[:4000]
+    body = redact(body)
+    if len(body) > LIM["diff_chars"]:
+        body = body[:LIM["diff_chars"]] + "\n…(diff truncated; run `git diff -- <file>` for the rest)"
+    return f"# Diff\n{stat}\n{body}"
+
+
+# ── change-aware verification (T0) ────────────────────────────────────────────
+DOC_EXT = {".md", ".mdx", ".txt", ".rst", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico", ".avif"}
+STYLE_EXT = {".css", ".scss", ".sass", ".less"}
+CODE_EXT = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".go", ".rs", ".java", ".kt", ".cs", ".swift", ".rb", ".php", ".vue", ".svelte", ".dart"}
+DEP_RE = re.compile(r"(^|/)(package\.json|[\w.-]*lock[\w.-]*|pnpm-lock\.yaml|go\.(mod|sum)|Cargo\.(toml|lock)|pyproject\.toml|requirements[\w.-]*\.txt)$")
+CONFIG_RE = re.compile(r"(^|/)(package\.json|tsconfig[\w.-]*\.json|[\w.-]*\.config\.[cm]?[jt]s|\.eslintrc[\w.]*|Dockerfile|docker-compose[\w.-]*|"
+                       r"pyproject\.toml|go\.mod|Cargo\.toml|Makefile|[\w.-]*lock[\w.-]*|\.github/.*\.ya?ml|build\.gradle[\w.]*|pom\.xml|\.env\.example)$")
+TEST_RE = re.compile(r"(^|/)(tests?|__tests__|spec)/|[._-](test|spec)\.\w+$")
+
+
+def has_related_test(root, f):
+    if root is None:
+        return False
+    pth, stem = Path(f), Path(f).stem
+    cands = [pth.with_name(f"{stem}.test{pth.suffix}"), pth.with_name(f"{stem}.spec{pth.suffix}"), pth.parent / "__tests__" / pth.name,
+             pth.with_name(f"test_{stem}.py"), pth.with_name(f"{stem}_test.go"), Path("tests") / f"test_{stem}.py"]
+    return any((root / c).exists() for c in cands)
+
+
+def select_checks(files, complexity, task, cmds, root=None):
+    """Cheapest deterministic checks that meaningfully cover the change. → (commands, reason, json_files)."""
+    if not files:
+        return [], "no files changed", []
+    kinds, json_files = set(), []
+    for f in files:
+        ext = Path(f).suffix.lower()
+        if DEP_RE.search(f):
+            kinds.add("deps")
+        elif CONFIG_RE.search(f):
+            kinds.add("config")
+        elif TEST_RE.search(f):
+            kinds.add("test")
+        elif ext in DOC_EXT:
+            kinds.add("docs")
+        elif ext in STYLE_EXT:
+            kinds.add("style")
+        elif ext == ".json":
+            kinds.add("data"); json_files.append(f)
+        elif ext in CODE_EXT:
+            kinds.add("code")
+        else:
+            kinds.add("other")
+    big = rank(complexity) >= RANK["MEDIUM"] or sum(1 for f in files if Path(f).suffix in CODE_EXT) >= 4
+    want = []
+    if kinds & {"code", "config", "test", "deps"}:
+        want.append("typecheck")
+    if "style" in kinds or "config" in kinds or ("code" in kinds and big):
+        want.append("lint")
+    if "test" in kinds or ("code" in kinds and big) or any(Path(f).suffix in CODE_EXT and has_related_test(root, f) for f in files):
+        want.append("test")
+    if kinds & {"config", "deps"} or complexity == "CRITICAL":
+        want.append("build")
+    for key, rx in (("typecheck", r"typecheck|type-check"), ("lint", r"\blint|линт"), ("test", r"\btests?\b|тест"), ("build", r"\bbuild\b|сборк")):
+        if re.search(rx, task, re.I) and key not in want and not DOCS_KW.search(task):
+            want.append(key)  # explicitly requested
+    out = [cmds[k] for k in ("typecheck", "lint", "test", "build") if k in want and k in cmds]
+    return out, "+".join(sorted(kinds)) + " changed", json_files
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+DIAG_RE = re.compile(r"^(?P<file>[\w./@\[\]-]+\.\w{1,5})(?:[(:]\d+(?:[,:]\d+)?\)?)?:?\s*-?\s*(?P<sev>error|warning)\s*(?P<code>[A-Z]{1,6}\d+)?:?\s*(?P<msg>.*)$", re.I)
+ESLINT_ROW = re.compile(r"^\s+\d+:\d+\s+(?P<sev>error|warning)\s+(?P<msg>.*?)(?:\s{2,}(?P<code>[@\w/-]+))?$")
+NOISE_RE = re.compile(r"^(found \d+ errors?|error command failed|info visit|done in|\$ |yarn run|npm err|✖ \d+ problems?|\d+ problems?|checking formatting|all matched files use|> )", re.I)
+BROKEN_CHECK_RE = re.compile(r"no files matching the pattern|no inputs were found|no test files found|no tests found|missing script|command not found|"
+                             r"cannot find module|could not find (a )?(config|configuration)|couldn't find a configuration", re.I)
+
+
+def norm_msg(t):
+    t = ANSI_RE.sub("", t)
+    t = re.sub(r"(/private)?/(tmp|var/folders)/[^\s:'\"]+", "<tmp>", t)
+    t = re.sub(r"\b\d{1,2}:\d{2}(:\d{2})?(\.\d+)?\b|\b\d+(\.\d+)?\s?m?s\b", "", t)  # timestamps, durations
+    return re.sub(r"\s+", " ", t).strip().lower()
+
+
+def diagnostics(output):
+    """Normalized diagnostics → Counter{fingerprint: n} and {fingerprint: raw line}. Fingerprint = file|code|message;
+    line/column numbers and ordering are ignored (they shift with unrelated edits)."""
+    from collections import Counter
+    fps, raw, cur = Counter(), {}, None
+    for line in ANSI_RE.sub("", output or "").splitlines():
+        m = DIAG_RE.match(line.strip())
+        if m and not m.group("file").startswith(("node_modules", "_next")):
+            fp = f"{m.group('file')}|{(m.group('code') or '').upper()}|{norm_msg(m.group('msg'))}"
+        elif re.match(r"^[\w./@\[\]-]+\.\w{1,5}$", line.strip()):
+            cur = line.strip(); continue
+        elif cur and ESLINT_ROW.match(line):
+            e = ESLINT_ROW.match(line)
+            fp = f"{cur}|{e.group('code') or ''}|{norm_msg(e.group('msg'))}"
+        else:
+            continue
+        fps[fp] += 1; raw.setdefault(fp, line.strip()[:220])
+    if not fps:  # unparseable output: compare normalized non-noise lines, digits masked
+        for line in (output or "").splitlines():
+            t = re.sub(r"\d+", "#", norm_msg(line))
+            if t and not NOISE_RE.match(norm_msg(line)):
+                fps[t] += 1; raw.setdefault(t, line.strip()[:220])
+    return fps, raw
+
+
+def compare_checks(base_ok, base_out, after_ok, after_out):
+    """→ {status, pre, new, fixed, new_lines}. Statuses: PASS, PASS_WITH_BASELINE_FAILURES, FAIL_NEW_ERRORS, FAIL_REGRESSION."""
+    if after_ok:
+        return {"status": "PASS", "pre": 0, "new": 0, "fixed": 0 if base_ok else sum(diagnostics(base_out)[0].values()), "new_lines": []}
+    a, araw = diagnostics(after_out)
+    if base_ok:
+        return {"status": "FAIL_REGRESSION", "pre": 0, "new": sum(a.values()) or 1, "fixed": 0, "new_lines": list(araw.values())[:15]}
+    b, _ = diagnostics(base_out)
+    new, fixed = a - b, b - a
+    st = "FAIL_NEW_ERRORS" if new else "PASS_WITH_BASELINE_FAILURES"
+    return {"status": st, "pre": sum((a & b).values()), "new": sum(new.values()), "fixed": sum(fixed.values()),
+            "new_lines": [araw[k] for k in new][:15]}
+
+
+STATUS_RANK = {"PASS": 0, "PASS_WITH_WARNINGS": 1, "PASS_WITH_BASELINE_FAILURES": 2,
+               "FAIL": 3, "FAIL_NEW_ERRORS": 4, "FAIL_REGRESSION": 5, "BLOCKED": 6}
+
+
+def verify_status(res):
+    return max((r.get("status", "PASS" if r["ok"] else "FAIL") for r in res), key=lambda x: STATUS_RANK[x], default="PASS")
+
+
+def describe_check(r):
+    st = r.get("status", "PASS" if r["ok"] else "FAIL")
+    if st == "PASS":
+        return f"{r['cmd']} ✓" + (f" (also fixed {r['fixed']} pre-existing)" if r.get("fixed") else "")
+    if st == "PASS_WITH_BASELINE_FAILURES":
+        return (f"{r['cmd']} ⚠ pre-existing failures remain ({r['pre']}); new failures: 0"
+                + (f"; improved: {r['fixed']} fixed" if r.get("fixed") else ""))
+    if st == "PASS_WITH_WARNINGS":
+        return f"{r['cmd']} ⚠ passed with warnings"
+    if st == "BLOCKED":
+        return f"{r['cmd']} BLOCKED: check unavailable or misconfigured"
+    if st in ("FAIL_NEW_ERRORS", "FAIL_REGRESSION"):
+        return f"{r['cmd']} ✗ {st}: {r['new']} new" + (f", {r['pre']} pre-existing" if r.get("pre") else "")
+    return f"{r['cmd']} ✗"
+
+
+def verify(root, cmds, json_files, tdir, baseline=None):
+    """Run the checks. A failing check is compared with its pre-task baseline (lazy, only on failure): unchanged
+    pre-existing diagnostics → PASS_WITH_BASELINE_FAILURES (counts as success); only new/regressed ones fail."""
+    res = []
+    for jf in json_files:
+        try:
+            json.loads((root / jf).read_text())
+            res.append({"cmd": f"json:{jf}", "ok": True, "s": 0, "tail": ""})
+        except (ValueError, OSError) as e:
+            res.append({"cmd": f"json:{jf}", "ok": False, "s": 0, "tail": str(e)})
+    for c in cmds:
+        t0 = time.time()
+        try:
+            r = subprocess.run(c, shell=True, cwd=root, capture_output=True, text=True, timeout=LIM["verify_timeout_s"])
+            ok, out = r.returncode == 0, (r.stdout + r.stderr)
+        except subprocess.TimeoutExpired:
+            ok, out = False, "timeout"
+        entry = {"cmd": c, "ok": ok, "s": round(time.time() - t0), "tail": redact(out[-2500:]), "status": "PASS" if ok else "FAIL"}
+        if ok and re.search(r"\bwarning(?:\s+TS\d+|\s*:)|^\s+\d+:\d+\s+warning\b", out, re.M | re.I):
+            entry["status"] = "PASS_WITH_WARNINGS"
+        b = baseline(c) if (baseline and not ok) else None
+        if b is not None:
+            cmpr = compare_checks(b[0], b[1], ok, out)
+            entry.update(cmpr, ok=cmpr["status"] in ("PASS", "PASS_WITH_BASELINE_FAILURES"))
+            if cmpr["new_lines"]:
+                entry["tail"] = redact("NEW diagnostics (pre-existing ones omitted):\n" + "\n".join(cmpr["new_lines"]))
+        res.append(entry)
+    if tdir:
+        (tdir / "verification.json").write_text(json.dumps(res, indent=1))
+    return all(r["ok"] for r in res), res
+
+
+DIAG_CATS = ["typecheck", "lint", "test", "format", "build"]
+DIAG_SCRIPTS = {"typecheck": ("typecheck", "type-check", "check-types", "types", "tsc"),
+                "lint": ("lint:check", "lint:ci", "check:lint", "lint", "eslint"),
+                "test": ("test:ci", "test:unit", "test"),
+                "format": ("format:check", "prettier:check", "check:format", "prettier", "format"),
+                "build": ("build",)}
+MUTATING = re.compile(r"(^|\s)(--fix\b|--fix-type\b|--write\b|-w\b|--update-?snapshots?\b|-u\b|--apply\b|--save\b)")
+SIMPLE_CMD = re.compile(r"^[\w@./-]+( [^&|;<>`$]+)?$")  # one binary + args, no shell chaining
+
+
+def diag_categories(task):
+    """Categories a broad maintenance task requires: the ones it names, else all relevant ones (build deferred)."""
+    named = [c for c, rx in (("typecheck", r"type ?script|\bts\b|\btypes?\b|typecheck|type-check|\btsc\b|типиз"),
+                             ("lint", r"lint|eslint|линт|warnings?|предупрежд"), ("test", r"\btests?\b|тест"),
+                             ("build", r"\bbuild\b|compil|сборк"), ("format", r"format|prettier|формат")) if re.search(rx, task, re.I)]
+    if named and not re.search(r"\ball\b.{0,40}\b(errors|problems|issues|checks)\b(?!.{0,30}\b(type|lint|test|build))|\bevery\b|\bproject\b|все", task, re.I):
+        return named, []
+    return ["typecheck", "lint", "test", "format"], ["build"]
+
+
+def safe_diag_commands(root, rmap):
+    """→ {category: {cmd, source, note}} using only NON-mutating commands. A script that would modify files is replaced by a
+    derived read-only form (flags removed / --check), or marked unavailable — never run as a baseline."""
+    out = {}
+    pj = root / "package.json"
+    if pj.exists():
+        try:
+            pkg = json.loads(pj.read_text())
+        except ValueError:
+            pkg = {}
+        scripts, pm = pkg.get("scripts", {}), rmap.get("package_manager") or "npm"
+        run = {"yarn": "yarn", "pnpm": "pnpm", "bun": "bun run"}.get(pm, "npm run")
+        execp = {"yarn": "yarn", "pnpm": "pnpm exec", "bun": "bunx"}.get(pm, "npx")
+        deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+        for cat, names in DIAG_SCRIPTS.items():
+            mutating = None
+            for n in names:
+                body = scripts.get(n)
+                if not body:
+                    continue
+                if cat == "typecheck" and re.match(r"^\s*tsc(\s|$)", body) and "--noEmit" not in body and "--noemit" not in body.lower():
+                    mutating = mutating or (n, body, body.strip() + " --noEmit")  # plain tsc emits files
+                    continue
+                if cat == "format" and "--check" not in body and "--list-different" not in body and "-l " not in body:
+                    mutating = mutating or (n, body, re.sub(r"\s--write\b", " --check", body) if "--write" in body else None)
+                    continue
+                if MUTATING.search(body):
+                    mutating = mutating or (n, body, MUTATING.sub(" ", body).strip())
+                    continue
+                out[cat] = {"cmd": f"{run} {n}", "source": f"script `{n}`", "note": ""}
+                break
+            if cat not in out and mutating:
+                n, body, derived = mutating
+                derived = re.sub(r"\s+", " ", derived).strip() if derived else None
+                if derived and SIMPLE_CMD.match(derived):
+                    out[cat] = {"cmd": f"{execp} {derived}", "source": f"derived from `{n}`",
+                                "note": f"`{n}` modifies files ({body.strip()[:60]}); using a read-only form"}
+                else:
+                    out[cat] = {"cmd": None, "source": f"`{n}`", "note": f"`{n}` modifies files and no safe read-only form could be derived"}
+        if "typecheck" not in out and "typescript" in deps and (root / "tsconfig.json").exists():
+            out["typecheck"] = {"cmd": f"{execp} tsc --noEmit", "source": "derived (TypeScript project)", "note": ""}
+    else:
+        for cat in ("typecheck", "lint", "test", "build"):  # non-node commands from the repo map are read-only checks
+            c = rmap.get("commands", {}).get(cat)
+            if c and not MUTATING.search(c):
+                out[cat] = {"cmd": c, "source": "repo-map", "note": ""}
+    return out
+
+
+def diag_plan(task, root, rmap):
+    """→ list of {cat, cmd, state, note}; state: required | deferred | unavailable | not configured."""
+    req, deferred = diag_categories(task)
+    cmds = safe_diag_commands(root, rmap)
+    rows = []
+    for cat in DIAG_CATS:
+        if cat not in req and cat not in deferred:
+            continue
+        c = cmds.get(cat)
+        if not c:
+            if cat == "format" and cat not in req:
+                continue  # format checks join broad runs only when configured
+            rows.append({"cat": cat, "cmd": None, "state": "not configured", "note": ""})
+        elif not c["cmd"]:
+            rows.append({"cat": cat, "cmd": None, "state": "unavailable", "note": c["note"]})
+        else:
+            rows.append({"cat": cat, "cmd": c["cmd"], "state": "deferred" if cat in deferred else "required", "note": c["note"] or c["source"]})
+    return rows
+
+
+def run_diag(root, row, want_warnings, runner=None):
+    """Run one read-only diagnostic. → result with status PASS / FAIL (errors, or warnings when the task asks for them)."""
+    t0 = time.time()
+    if runner:
+        ok, out = runner(row["cmd"])
+    else:
+        try:
+            r = subprocess.run(row["cmd"], shell=True, cwd=root, capture_output=True, text=True, timeout=LIM["verify_timeout_s"])
+            ok, out = r.returncode == 0, r.stdout + r.stderr
+        except subprocess.TimeoutExpired:
+            ok, out = False, "timeout"
+    fps, raw = diagnostics(out)
+    errs = (sum(fps.values()) or 1) if not ok else 0
+    warns = len(re.findall(r"^\s+\d+:\d+\s+warning\b", out, re.M)) + len(re.findall(r"\bwarning TS\d+", out))
+    status = "FAIL" if not ok else ("FAIL" if want_warnings and warns else "PASS")
+    note = row.get("note", "")
+    structured = any(DIAG_RE.match(x.strip()) or ESLINT_ROW.match(x) for x in ANSI_RE.sub("", out).splitlines())
+    if not ok and not structured and BROKEN_CHECK_RE.search(out):
+        status = "BROKEN"  # the check itself is misconfigured: not a code problem, but it also can't prove "clean"
+        note = "check misconfigured: " + BROKEN_CHECK_RE.search(out).group(0)
+    return dict(row, ok=ok, status=status, note=note, errors=errs if not ok else 0, warnings=warns, out=redact(out[-60000:]), s=round(time.time() - t0))
+
+
+def overall_state(results):
+    """CLEAN only if every required category ran and passed. Unrun or unavailable required categories → INCOMPLETE."""
+    req = [r for r in results if r["state"] in ("required", "unavailable")]
+    if any(r.get("status") == "FAIL" for r in results):
+        return "DIRTY"
+    if any(r["state"] == "unavailable" or r.get("status") in (None, "BROKEN") for r in req):
+        return "INCOMPLETE"
+    return "CLEAN"
+
+
+def group_diags(results, limit=12):
+    """Deterministic root-cause groups: same category + error code + message template. → [{key, count, files, example}]"""
+    groups = {}
+    for r in results:
+        if r.get("status") != "FAIL":
+            continue
+        fps, raw = diagnostics(r["out"])
+        for fp, n in fps.items():
+            parts = fp.split("|")
+            if len(parts) == 3:
+                f, code, msg = parts
+                tmpl = re.sub(r"'[^']*'|\"[^\"]*\"|\d+", "X", msg)[:90]
+            else:
+                f, code, tmpl = "(output)", "", fp[:90]
+            g = groups.setdefault(f"{r['cat']}|{code}|{tmpl}", {"key": f"{r['cat'].upper()} {code} {tmpl}".strip(), "count": 0, "files": set(), "example": raw[fp]})
+            g["count"] += n
+            g["files"].add(f)
+    return sorted(groups.values(), key=lambda g: (-g["count"], len(g["files"])))[:limit]
+
+
+def render_diags(results):
+    lines = []
+    for r in results:
+        if r["state"] in ("not configured", "unavailable"):
+            lines.append(f"  {r['cat'].upper():<10} {'skipped — not configured' if r['state'] == 'not configured' else 'UNAVAILABLE — ' + r['note']}")
+        elif r.get("status") is None:
+            lines.append(f"  {r['cat'].upper():<10} deferred until static checks are clean ({r['cmd']})")
+        elif r["status"] == "BROKEN":
+            lines.append(f"  {r['cat'].upper():<10} ⚠ {r['cmd']} — {r['note']} (fix the script; not counted as code errors)")
+        else:
+            detail = (f"{r['errors']} error(s)" if not r["ok"] else "") + (f"{' · ' if not r['ok'] else ''}{r['warnings']} warning(s)" if r["warnings"] else "")
+            lines.append(f"  {r['cat'].upper():<10} {'✓' if r['status'] == 'PASS' else '✗'} {r['cmd']}" + (f" — {detail}" if detail else "")
+                         + (f"   ({r['note']})" if r.get("note") and "modifies" in r["note"] else ""))
+    return "\n".join(lines)
+
+
+ERR_LINE = re.compile(r"^(?P<file>[\w./@-]+\.\w{1,5})[(:](?P<line>\d+)")
+
+
+def diagnose(root, task, cmds):
+    """T0 diagnostics for 'fix all errors' tasks: run the check, group errors by file. → (cmd, ok, {file: [lines]})."""
+    key = "lint" if re.search(r"lint|eslint|линт", task, re.I) else "test" if re.search(r"\btests?\b|тест", task, re.I) else \
+          "build" if re.search(r"\bbuild\b|compile|сборк", task, re.I) else "typecheck"
+    c = cmds.get(key) or cmds.get("typecheck")
+    if not c:
+        return None, True, {}
+    try:
+        r = subprocess.run(c, shell=True, cwd=root, capture_output=True, text=True, timeout=LIM["verify_timeout_s"])
+    except subprocess.TimeoutExpired:
+        return c, False, {"(timeout)": ["check timed out"]}
+    groups, cur = {}, None
+    for line in (r.stdout + r.stderr).splitlines():
+        m = ERR_LINE.match(line.strip())
+        if m and not m.group("file").startswith(("node_modules", "_next")):
+            cur = m.group("file"); groups.setdefault(cur, []).append(redact(line.strip())[:200])
+        elif cur and re.match(r"^\s+\d+:\d+\s+(error|warning)", line):
+            groups[cur].append(redact(line.strip())[:200])
+    if r.returncode != 0 and not groups:
+        groups["(unparsed)"] = [redact(x)[:200] for x in (r.stdout + r.stderr).strip().splitlines()[-15:]]
+    return c, r.returncode == 0, groups
+
+
+# ── stage gates (T0) ───────────────────────────────────────────────────────────
+ARCH_TRIGGER = "confidence < {c:.2f} | architecture decision | >1 root cause | >{s} subsystem | >{f} files | open questions | risk"
+REVIEW_TRIGGER = "security/concurrency/public-API/config change, ≥{l} lines, several modules, low confidence, unverified, repaired failures, or off-plan files"
+SECURITY_CODE = re.compile(r"auth|session|token|password|crypt|permission|payment|stripe|checkout|migration|secret|credential", re.I)
+CONCURRENCY = re.compile(r"\b(async|await|Promise\.|mutex|lock\(|setTimeout|setInterval|useEffect|AbortController|Atomic|synchronized|goroutine|chan\b|thread|queue)", re.I)
+PUBLIC_API = re.compile(r"(^|/)(api|routes?|public|sdk)/|(^|/)index\.[jt]sx?$|\.d\.ts$|openapi|schema\.(graphql|json)")
+
+
+def architect_gate(out, p, planned):
+    """→ (run?, [reason codes], text). Planned architects are pruned when explorer evidence is sufficient;
+    unplanned ones are added only on strong evidence. CRITICAL / ARCHITECTURE / PLAN always keep the stage."""
+    g = CFG["gates"]["architect"]
+    cx, intent = p["complexity"], p["intent"]
+    if cx == "CRITICAL" or intent in ("ARCHITECTURE", "PLAN"):
+        return True, ["ARCHITECTURE_CHANGE" if intent == "ARCHITECTURE" else "SECURITY_RISK"], f"{intent}/{cx} keeps its reasoning stage"
+    thr = g["min_confidence_high_risk"] if p["signals"].get("high_risk") else g["min_confidence"]
+    conf = float(out.get("confidence", 0) or 0)
+    files = {str(f).split(":")[0] for f in (out.get("relevant_files") or out.get("affected_files") or out.get("files") or []) if f}
+    subs = [x for x in out.get("affected_subsystems", []) or [] if x]
+    causes = [x for x in out.get("root_causes", []) or [] if x]
+    unresolved = out.get("unresolved_questions") or out.get("open_questions") or []
+    strong, weak = [], []
+    if out.get("_unstructured"):
+        strong.append(("CONFLICTING_EVIDENCE", "explorer evidence unstructured"))
+    if out.get("architecture_decision_required"):
+        strong.append(("ARCHITECTURE_CHANGE", "architecture decision required"))
+    if str(out.get("risk", "")).lower() == "high" or out.get("risk_ambiguity"):
+        strong.append(("SECURITY_RISK", "high risk reported"))
+    if len(causes) > 1:
+        strong.append(("MULTIPLE_ROOT_CAUSES", f"{len(causes)} plausible root causes"))
+    if conf < 0.5:
+        strong.append(("LOW_CONFIDENCE", f"confidence {conf:.2f}"))
+    if conf < thr:
+        weak.append(("LOW_CONFIDENCE", f"confidence {conf:.2f} < {thr:.2f}" + (" (high-risk bar)" if p["signals"].get("high_risk") else "")))
+    if len(subs) > g["max_subsystems"]:
+        weak.append(("MULTIPLE_ROOT_CAUSES" if intent == "DEBUG" else "ARCHITECTURE_CHANGE", f"{len(subs)} subsystems"))
+    if len(files) > g["max_files"]:
+        weak.append(("ARCHITECTURE_CHANGE", f"{len(files)} files"))
+    if unresolved:
+        weak.append(("CONFLICTING_EVIDENCE", f"{len(unresolved)} unresolved question(s)"))
+    if intent == "DEBUG" and not out.get("root_cause_candidate"):
+        weak.append(("LOW_CONFIDENCE", "no localized root cause"))
+    if str(out.get("recommended_next_stage", "")).lower() == "architect":
+        weak.append(("ARCHITECTURE_CHANGE", "explorer recommends architect"))
+    if p["signals"].get("high_risk") and CONCURRENCY_KW.search(" ".join(map(str, causes + [out.get("root_cause_candidate", "")]))) and conf < 0.95:
+        weak.append(("CONCURRENCY_AMBIGUITY", "concurrency root cause below 0.95"))
+    reasons = strong + (weak if planned else [])
+    if reasons:
+        return True, sorted({c for c, _ in reasons}), "; ".join(t for _, t in reasons)
+    return False, [], f"localized: confidence {conf:.2f} ≥ {thr:.2f}, {len(files)} file(s), {len(subs) or 1} subsystem, no architecture decision"
+
+
+def review_gate(root, files, p, outs, vres, planned_files, repaired=False):
+    """→ (run?, reason) from the actual diff and verification — decided after deterministic checks."""
+    mode = p["review"]
+    if mode == "always":
+        return True, "quality budget reviews every code change"
+    if all(Path(f).suffix.lower() in DOC_EXT for f in files):
+        return False, "docs-only change"
+    _, num = sh(["git", "diff", "--numstat", "--"] + files, cwd=root)
+    lines = sum(int(a) + int(b) for a, b, *_ in (x.split("\t") for x in num.splitlines()) if a.isdigit() and b.isdigit())
+    _, diff = sh(["git", "diff", "-U0", "--"] + files, cwd=root)
+    touched = "\n".join(x for x in diff.splitlines() if x.startswith(("+", "-")) and not x.startswith(("+++", "---")))
+    code = [f for f in files if Path(f).suffix in CODE_EXT]
+    modules = {f.split("/")[0] if "/" in f else "." for f in code}
+    reasons = []
+    if p["complexity"] == "CRITICAL":
+        reasons.append("CRITICAL task")
+    if any(SECURITY_CODE.search(f) for f in files) or SECURITY_CODE.search(touched):
+        reasons.append("auth/security code changed")
+    if mode != "critical-only":
+        if lines >= CFG["gates"]["review"]["max_lines"]:
+            reasons.append(f"{lines} changed lines")
+        if len(modules) > 1:
+            reasons.append(f"{len(modules)} modules")
+        if any(CONFIG_RE.search(f) for f in files):
+            reasons.append("config/build files")
+        if any(PUBLIC_API.search(f) for f in files):
+            reasons.append("public API surface")
+        if CONCURRENCY.search(touched):
+            reasons.append("concurrency-related code")
+        if any(float(o.get("confidence", 1) or 0) < CFG["gates"]["review"]["min_implementer_confidence"] for o in outs):
+            reasons.append("low implementer confidence")
+        if code and not vres:
+            reasons.append("code changed but no check could run")
+        if repaired:
+            reasons.append("checks failed before they passed")
+        if planned_files and set(files) - set(planned_files):
+            reasons.append("files outside the plan: " + ", ".join(sorted(set(files) - set(planned_files))[:3]))
+    if reasons:
+        return True, "; ".join(reasons)
+    return False, f"small verified diff ({len(files)} file(s), {lines} lines)"
+
+
+LOGIC = re.compile(r"\b(if|else|switch|case|for|while|return|throw|try|catch|await)\b|&&|\|\||\?\?")
+
+
+def review_size(root):
+    """REVIEW tasks: → (tier, class, reason). tier 0 = no model needed. Uses diff size AND semantic risk; size alone never decides."""
+    snap = snapshot(root) or {}
+    files = sorted(snap)
+    if not files:
+        return 0, "NONE", "working tree is clean — nothing to review"
+    if all(Path(f).suffix.lower() in DOC_EXT for f in files):
+        return 0, "DOCS", f"docs-only diff ({len(files)} file(s)) — no model review needed"
+    _, num = sh(["git", "diff", "HEAD", "--numstat", "--"] + files, cwd=root)
+    lines = sum(int(a) + int(b) for a, b, *_ in (x.split("\t") for x in num.splitlines()) if a.isdigit() and b.isdigit())
+    _, diff = sh(["git", "diff", "HEAD", "-U0", "--"] + files, cwd=root)
+    touched = "\n".join(x for x in diff.splitlines() if x.startswith(("+", "-")) and not x.startswith(("+++", "---")))
+    _, untracked = sh(["git", "ls-files", "--others", "--exclude-standard", "--"] + files, cwd=root)
+    for u in untracked.split():  # new files: count their lines and scan their content like added lines
+        try:
+            body = (root / u).read_text(errors="replace").splitlines()[:400]
+        except OSError:
+            continue
+        lines += len(body)
+        touched += "\n" + "\n".join("+" + x for x in body)
+    code = [f for f in files if Path(f).suffix in CODE_EXT]
+    modules = {f.split("/")[0] if "/" in f else "." for f in files}
+    risk = []
+    if any(SECURITY_CODE.search(f) for f in files) or SECURITY_CODE.search(touched):
+        risk.append("auth/security/payment/migration code")
+    if any(PUBLIC_API.search(f) for f in files):
+        risk.append("public API surface")
+    if CONCURRENCY.search(touched):
+        risk.append("concurrency")
+    if any(CONFIG_RE.search(f) or DEP_RE.search(f) for f in files):
+        risk.append("config/infrastructure/dependencies")
+    logic = len(LOGIC.findall(touched)) if code else 0
+    if logic >= 3:
+        risk.append(f"business logic ({logic} control-flow edits)")
+    size = f"{len(files)} file(s), {lines} lines"
+    if risk:
+        return 2, "HIGH", f"{size}; risk: {', '.join(risk)}"
+    if len(files) > 5 or lines > 150 or len(modules) > 2:
+        return 2, "MEDIUM", f"{size} across {len(modules)} module(s)"
+    if len(files) <= 2 and lines <= 20:
+        return 1, "MICRO", f"{size}; no risky semantics"
+    return (1 if lines <= 60 and not logic else 2), "SMALL", f"{size}; {'no logic changes' if not logic else 'some logic changes'}"
+
+
+# ── planning ───────────────────────────────────────────────────────────────────
+def plan(task, budget, forced=None, root=None, apply=False):
+    intent, cx, conf, sig = classify(task, root, forced)
+    b = CFG["budgets"][budget]
+    base = {"intent": intent, "complexity": cx, "confidence": conf, "signals": sig, "budget": budget, "steps": [], "apply": apply,
+            "max_tier": b["max_tier"], "max_parallel": b["max_parallel"], "judge": b["judge"], "review": b["review"],
+            "cross_review": rank(cx) >= rank(b["cross_review_from"])}
+    if intent == "REVIEW" and root is not None:
+        rt, rcls, rwhy = review_size(root)
+        base.update(review_class=rcls, review_reason=rwhy)
+        if rt == 0 and not (rcls == "DOCS" and budget == "quality"):
+            return dict(base, local=True, complexity="TRIVIAL")
+    if intent in ("META", "INSPECTION", "TOOL"):
+        return dict(base, local=True)
+    if intent == "QUESTION":
+        pipe = {"explorer" if REPO_CUE.search(task) or sig["paths"] else "answer": 1}
+    elif intent == "UNKNOWN":
+        pipe = {"explorer": 1, "implementer": 1}
+    elif intent == "RESEARCH":
+        pipe = {"researcher": 1}
+    elif intent == "REVIEW":
+        rt = {"DOCS": 1, "MICRO": 1, "SMALL": 1, "MEDIUM": 2, "HIGH": 2}.get(base.get("review_class"), 2)
+        if base.get("review_class") == "SMALL" and "some logic" in base.get("review_reason", ""):
+            rt = 2
+        pipe = {"reviewer": 1 if budget == "economy" else rt}
+    elif intent == "PLAN":
+        pipe = {"explorer": 1, "architect": 2} if cx != "SMALL" else {"explorer": 1}
+    else:
+        pipe = dict(CFG["pipelines"][cx])
+        pipe.update(b.get("add", {}).get(cx, {}) if cx != "MICRO" else {})
+        for r in b.get("drop", {}).get(cx, []):
+            pipe.pop(r, None)
+        if sig["maintenance"]:
+            pipe = {"implementer": 2, "reviewer": 2}  # deterministic diagnostics replace the explorer
+            if root is not None:
+                base["diagnostics"] = diag_plan(task, root, load_map(root))
+        elif cx == "MEDIUM" and sig["paths"] and not sig["analysis_first"]:
+            pipe.pop("explorer", None)
+        if sig["analysis_first"]:
+            pipe.setdefault("explorer", 1)
+            if cx not in ("MICRO", "SMALL"):
+                pipe.setdefault("architect", 2)
+        if intent == "ARCHITECTURE":
+            pipe.setdefault("explorer", 1); pipe.setdefault("architect", 2)
+        if RESEARCH.search(task):
+            pipe["researcher"] = 1
+    rmap = load_map(root) if root else {}
+    impl_provider, g = None, CFG["gates"]["architect"]
+    for role in ("answer", "explorer", "researcher", "architect", "implementer", "reviewer"):
+        if role not in pipe:
+            continue
+        tier = max(1, min(pipe[role] + b["tier_delta"].get(f"{cx}.{role}", 0), b["max_tier"], 2))  # T3 only via escalation
+        _, sizes = build_prompt(role, f"TASK: {task}\nNEXT ACTION: …", root or Path.cwd(), rmap, cx)
+        ctx = sum(v for k, v in sizes.items() if not k.startswith("_"))
+        avoid = impl_provider if role == "reviewer" and base["cross_review"] else None
+        ranked = choose(role, tier, cx, ctx, avoid, intent, docs=sig.get("docs") and role == "implementer")
+        if not ranked:
+            base["steps"].append({"role": role, "tier": tier, "provider": None, "model": None, "note": "no provider installed", "stage": "skipped"})
+            continue
+        best = ranked[0]
+        spec = CFG["providers"][best["provider"]]["tiers"][str(tier)]
+        step = {"role": role, "tier": tier, "provider": best["provider"], "model": spec["model"], "effort": spec.get("effort"),
+                "est": round(best["E"]), "ctx": ctx, "ctx_parts": {k: v for k, v in sizes.items() if not k.startswith("_")},
+                "why": explain(ranked, implementer=impl_provider if role == "reviewer" else None), "stage": "required", "trigger": "", "likely": True}
+        if role == "architect" and intent in ("IMPLEMENTATION", "DEBUG") and cx != "CRITICAL" and "explorer" in pipe:
+            thr = g["min_confidence_high_risk"] if sig.get("high_risk") else g["min_confidence"]
+            step.update(stage="conditional", trigger="if " + ARCH_TRIGGER.format(c=thr, s=g["max_subsystems"], f=g["max_files"]),
+                        likely=bool(sig.get("high_risk")))
+        if role == "implementer":
+            impl_provider = best["provider"]
+            if intent == "UNKNOWN":
+                step.update(stage="conditional", trigger="if the probe finds a required change", likely=False)
+            elif intent == "ARCHITECTURE" and not apply:
+                step.update(stage="approval", trigger="after approval: rerun with --apply", likely=False)
+            elif sig["analysis_first"]:
+                step.update(stage="conditional", trigger="if the diagnosis finds a required change", likely=True)
+            elif sig["maintenance"]:
+                step["trigger"] = "after T0 aggregate diagnostics; skipped only if ALL required checks are clean"
+        if role == "reviewer" and intent == "REVIEW" and base.get("review_reason"):
+            step["why"] = f"{base['review_class']} review: {base['review_reason']}; " + step["why"]
+        if role == "reviewer" and intent != "REVIEW":
+            step.update(stage="required" if b["review"] == "always" else "conditional",
+                        trigger="" if b["review"] == "always" else "if " + ("CRITICAL or auth/security change" if b["review"] == "critical-only"
+                                                                            else REVIEW_TRIGGER.format(l=CFG["gates"]["review"]["max_lines"])),
+                        likely=b["review"] == "always" or rank(cx) >= RANK["COMPLEX"] or bool(sig.get("risk_keyword")))
+        if role == "researcher" and intent in CODE_INTENTS:
+            step["trigger"] = "task asks for current external knowledge"
+        base["steps"].append(step)
+    return base
+
+
+def print_plan(p, root, rmap, task):
+    cool = cooldowns()
+    print(f"Intent: {p['intent']}   Complexity: {p['complexity']} ({p['confidence']})   Budget: {p['budget']}   "
+          f"Providers: {', '.join(available()) or 'none'}" + "".join(f" ({k} limited until {v[11:16]})" for k, v in cool.items()))
+    if p["signals"].get("note"):
+        print(f"Note:   {p['signals']['note']}")
+    if p.get("local"):
+        what = {"META": f"local answer ({p['signals'].get('meta', 'status')})", "INSPECTION": "git status / diff --stat",
+                "REVIEW": p.get("review_reason", "nothing to review"),
+                "TOOL": "project command from .ai/repo-map.json"}[p["intent"]]
+        print(f"  T0 {what} — 0 model calls, 0 tokens; verify skipped")
+        return
+    llm = [s for s in p["steps"] if s["provider"]]
+    if p.get("diagnostics") is not None:
+        print("  T0 aggregate diagnostics (read-only; 'clean' only if every required category passes):")
+        for d in p["diagnostics"]:
+            print(f"     {d['cat'].upper():<10} {d['state']:<15} {d['cmd'] or ''}" + (f"   ({d['note']})" if d.get("note") else ""))
+    for s in p["steps"]:
+        if not s["provider"]:
+            print(f"  T{s['tier']} {s['role']:<11} SKIPPED — {s['note']}")
+            continue
+        print(f"  T{s['tier']} {s['role']:<11} {s['provider'] + '/' + s['model']:<21} {s['stage']:<11} ≈{s['est'] / 1000:>3.0f}k  {s['why']}")
+        if s.get("trigger"):
+            print(f"     {'':<11} {s['trigger']}")
+    writes = any(s["role"] == "implementer" and s["stage"] != "approval" for s in llm)
+    print("  T0 verify      " + ("local, only if files change; checks chosen by changed file types" if writes else "skipped (read-only)"))
+    if any(s["role"] == "explorer" for s in llm) and not any(s["role"] == "researcher" for s in llm):
+        print("     (+ researcher T1 only if the explorer reports external_research_required)")
+    req = [s for s in llm if s["stage"] == "required"]
+    likely = [s for s in llm if s["stage"] == "required" or (s["stage"] == "conditional" and s["likely"])]
+    exp = [s for s in llm if s["stage"] in ("required", "conditional")]
+
+    def path(xs):
+        return f"≈{sum(s['est'] for s in xs) / 1000:.0f}k ({' + '.join(s['role'] for s in xs) or 'none'})"
+    print(f"Cost:   minimum {path(req)} · likely {path(likely)} · expanded {path(exp)}" + ("  — units, not money" if req else ""))
+    if any(s["stage"] == "approval" for s in llm):
+        print("        approval stages are in no path until --apply")
+    print(f"T3:     {'only by escalation with a reason code' if p['max_tier'] >= 3 else 'not allowed in this budget'}")
+
+
+def print_context_plan(p, root, rmap, task):
+    """T0: what each call WOULD receive, by source. Provider-native baseline shown separately."""
+    print(f"Intent: {p['intent']}   Complexity: {p['complexity']}   Budget: {p['budget']}")
+    if p.get("local"):
+        print("Context: none — T0 local path, no model call")
+        return
+    ga = Path.home() / ".codex" / "AGENTS.md"
+    print("Provider-native (not built by ai-team): " + ", ".join(f"{n} ~{observed_baseline(n)[0] / 1000:.1f}k (n={observed_baseline(n)[1]})" for n in available()))
+    print(f"  auto-loaded instructions for workers: codex project AGENTS.md off (project_doc_max_bytes=0), global ~/.codex/AGENTS.md "
+          f"{tok(ga.read_text()) / 1000:.1f}k still loaded; claude CLAUDE.md/skills/plugins off (--setting-sources \"\")" if ga.exists() else "")
+    total, budget = 0, CFG["context_budget"].get(p["complexity"], 8000)
+    docs = relevant_docs(task, rmap)
+    for s in p["steps"]:
+        if not s["provider"]:
+            continue
+        parts = s.get("ctx_parts", {})
+        if s["stage"] == "required":
+            total += s["ctx"]
+        sec = [k for k in context_sections(root)] if s["role"] in NEEDS_PROJECT else []
+        print(f"  {s['role']:<11} {s['provider']}/{s['model']:<14} {s['stage']:<11} "
+              + " · ".join(f"{k} {v / 1000:.1f}k" for k, v in parts.items()) + f"  = {s['ctx'] / 1000:.1f}k  (budget {budget / 1000:.1f}k {'✓' if s['ctx'] <= budget else '✗'})")
+        selected = [k for k in parts if k.startswith(("workflow:", "optional:"))]
+        lazy = ["files: paths only, agent opens them", f"docs: {', '.join(docs) if docs else 'none matched'}",
+                "canonical guidance: " + (", ".join(selected) or "role only")]
+        if s["role"] == "reviewer":
+            lazy[0] = "diff: git diff of changed files only (added at run time)"
+        print(f"  {'':<11} lazy — {'; '.join(lazy)}" + (f"; project sections available: {', '.join(sec)}" if sec else ""))
+    print(f"Orchestration context on the minimum path: ~{total / 1000:.1f}k tokens (plus provider-native baseline per call)")
+
+
+# ── local (T0) handlers ────────────────────────────────────────────────────────
+def show_providers():
+    for name, pc in CFG["providers"].items():
+        path = shutil.which(pc["bin"])
+        cool = cooldowns().get(name)
+        state = "available" if name in available() else "not installed" if not path else f"limit→{cool[11:16]}" if cool else "disabled"
+        tiers = "  ".join(f"T{t}={v['model']}" + (f"/{v['effort']}" if v.get("effort") else "") for t, v in pc["tiers"].items())
+        base, n = observed_baseline(name)
+        print(f"  {name:<7} {state:<13} {tiers}   observed baseline ~{base / 1000:.1f}k " + (f"(n={n})" if n else "(seed)"))
+
+
+def show_models():
+    show_providers()
+    dims = list(next(iter(CFG["strength"].values())))
+    print("Capability priors (" + " / ".join(dims) + "):")
+    for prov, st in CFG["strength"].items():
+        print(f"  {prov:<7} " + " / ".join(f"{st.get(d, 0):.2f}" for d in dims))
+
+
+def show_last(root):
+    ms = [m for m in metrics() if m.get("repo") == root.name] or metrics()
+    if not ms:
+        print("no runs recorded yet"); return
+    m = ms[-1]
+    print(f"{m['ts']} · {m['repo']} · {m.get('intent', '?')} · {m['complexity']} · {m['budget']} · {'ok' if m['ok'] else 'NOT ok'} · {m['s']}s")
+    for s in m["steps"]:
+        parts = " · ".join(f"{k} {v / 1000:.1f}k" for k, v in (s.get("ctx_parts") or {}).items())
+        print(f"  {s['role']:<11} {s['provider']}/{s['model']} T{s['tier']}  fresh {s['in'] / 1000:.1f}k · cached {s['cached'] / 1000:.1f}k · out {s['out'] / 1000:.1f}k"
+              f" · {s.get('s', 0)}s" + (f"\n      ours ~{s['ctx'] / 1000:.1f}k ({parts}) · provider/tool turns ~{max(0, s['in'] + s['cached'] - s['ctx']) / 1000:.1f}k" if s.get("ctx") is not None else ""))
+    print(f"  verify: {m.get('verify_reason', '')} {m['verify']}  review: {m['review']}  escalations: {m['escalations'] or 'none'}"
+          + (f"  pruned: {', '.join(m['pruned'])}" if m.get("pruned") else ""))
+    if m.get("state"):
+        print(f"  state: {m['state']}")
+
+
+def show_cost():
+    """T0 rolling statistics per provider/tier (last 200 runs)."""
+    hs, ms = history(), metrics()
+    print(f"{len(ms)} runs recorded · {sum(1 for m in ms if not m['steps'])} answered with 0 model calls")
+    if not hs:
+        print("no model calls recorded yet"); return
+    print(f"{'provider / tier':<24}{'baseline':>9}{'fresh':>8}{'cached':>8}{'out':>7}{'time':>6}{'n':>5} {'success':>10}{'retry':>7}{'esc.':>6}")
+    for prov in CFG["providers"]:
+        for t in ("1", "2", "3"):
+            rows = [h for h in hs if h["provider"] == prov and str(h["tier"]) == t][-50:]
+            if not rows:
+                continue
+            n = len(rows); base, _ = observed_baseline(prov)
+            avg = lambda k: sum(r.get(k) or 0 for r in rows) / n  # noqa: E731
+            ks = CFG["priors"]["success_samples"]
+            smooth = (sum(r["ok"] for r in rows) + ks * 0.85) / (n + ks)
+            succ = f"{sum(r['ok'] for r in rows)}/{n}≈{smooth:.0%}"
+            print(f"{prov + ' T' + t + ' ' + CFG['providers'][prov]['tiers'][t]['model']:<24}{base / 1000:>8.1f}k{avg('in') / 1000:>7.1f}k{avg('cached') / 1000:>7.1f}k"
+                  f"{avg('out') / 1000:>6.1f}k{avg('s'):>5.0f}s{n:>5} {succ:>10}"
+                  f"{sum(1 for r in rows if (r.get('attempt') or 1) > 1) / n:>7.0%}{sum(1 for r in rows if r.get('escalated_after')) / n:>6.0%}")
+    usd = sum(h.get("usd") or 0 for h in hs)
+    if usd:
+        print(f"Reported spend (Claude only): ${usd:.2f}")
+    print("success = raw k/n ~ smoothed with a prior of 8 samples; small n is weak evidence.")
+
+
+def show_status(root):
+    print("GLOBAL KIT STATUS (T0; no model calls)")
+    print("AI-kit: " + str(KIT) + " · version " + (KIT / "VERSION").read_text().strip())
+    for label, args in (("repository", ["remote", "get-url", "origin"]), ("branch", ["branch", "--show-current"]),
+                        ("commit", ["rev-parse", "--short", "HEAD"])):
+        rc, value = sh(["git", "-C", str(KIT), *args])
+        print(f"  {label}: {value.strip() if rc == 0 else 'not available'}")
+    print("Providers:"); show_providers()
+    if root.resolve() == KIT:
+        print("CURRENT PROJECT STATUS: global kit directory (no application context required)")
+        return
+    print("CURRENT PROJECT STATUS: " + str(root))
+    print("Repo: " + "  ".join(f"{'✓' if (root / r).exists() else '✗'} {r}" for r in (".ai/CONTEXT.md", ".ai/repo-map.json", "AGENTS.md", "CLAUDE.md")))
+    ms = [m for m in metrics() if m.get("repo") == root.name and m["steps"]]
+    if ms:
+        m = ms[-1]
+        print(f"Last model run: {m['ts']} · {m.get('intent', '?')}/{m['complexity']} · {len(m['steps'])} call(s) · {'ok' if m['ok'] else 'NOT ok'}")
+    print(f"Default budget: {os.environ.get('AI_TEAM_BUDGET', 'balanced')}. Try: ai-team --plan \"<task>\"")
+
+
+def show_project(root):
+    m = load_map(root)
+    print(f"Package manager: {m.get('package_manager') or 'unknown'} · stack: {', '.join(m.get('stacks', [])) or 'unknown'}   (from .ai/repo-map.json, 0 tokens)")
+    for k, v in m.get("commands", {}).items():
+        print(f"  {k:<10} {v}")
+
+
+ROUTING_HELP = """How ai-team routes (every decision is local, 0 tokens):
+  status / providers / models / cost / project commands → T0 local answer
+  git status/diff, run lint/tests/build               → T0 command
+  question about the repo → T1 explorer (read-only) · general question → T1 answer (no tools)
+  MICRO edit (rename, typo, color, radius, label)      → one T1 editor → checks for the changed file types
+  SMALL change → one editor + targeted checks · MEDIUM → explorer + editor + review if the diff warrants it
+  COMPLEX/CRITICAL → explorer → [architect if evidence] → editor → verify → [review if risk]
+  "fix all errors" → T0 diagnostics first, grouped by file, then a bounded fix
+  failures → retry once with the error, then one tier up with a reason code; T3 at most once
+See any task's routing:  ai-team --plan "<task>"   ·   its context:  ai-team --context-plan "<task>\""""
+
+
+def record(root, p, log, ok, review, vres, vreason, tdir, dur, escalations, pruned=()):
+    rec = {"ts": datetime.datetime.now().isoformat(timespec="seconds"), "repo": root.name, "intent": p["intent"],
+           "complexity": p["complexity"], "budget": p["budget"], "steps": log, "escalations": escalations, "ok": ok,
+           "review": review, "verify": [r["ok"] for r in vres], "verify_status": verify_status(vres) if vres else None, "verify_reason": vreason, "s": dur, "pruned": list(pruned),
+           "state": str(tdir.relative_to(root)) if tdir else None}
+    mp = KIT / "state" / "metrics.jsonl"
+    mp.parent.mkdir(exist_ok=True)
+    with open(mp, "a") as f:
+        f.write(json.dumps(rec) + "\n")
+    lines = mp.read_text().splitlines()
+    if len(lines) > 2 * LIM["metrics_max_lines"]:  # rotate: raw metrics stay small; history() only reads the tail anyway
+        mp.write_text("\n".join(lines[-LIM["metrics_max_lines"]:]) + "\n")
+
+
+def local(p, root, rmap, task):
+    k = p["signals"].get("meta", "status") if p["intent"] == "META" else p["intent"]
+    rc = 0
+    if k == "providers":
+        show_providers()
+    elif k == "models":
+        show_models()
+    elif k == "cost":
+        show_cost()
+    elif k == "last":
+        show_last(root)
+    elif k == "routing":
+        print(ROUTING_HELP)
+    elif k == "project":
+        show_project(root)
+    elif k == "REVIEW":
+        print(p.get("review_reason", "nothing to review"))
+        print(sh(["git", "diff", "HEAD", "--stat"], cwd=root)[1].rstrip() or "(clean)")
+        print("Force a model review with: ai-team --budget quality \"review my changes\"" if p.get("review_class") == "DOCS" else "")
+    elif k == "INSPECTION":
+        for c in (["git", "status", "--short"], ["git", "diff", "--stat"]):
+            print(f"$ {' '.join(c)}"); print(sh(c, cwd=root)[1].rstrip() or "(clean)")
+    elif k == "TOOL":
+        words = {"lint": r"lint|линт", "typecheck": r"type|тип", "build": r"build|сборк", "format": r"format|prettier|формат", "test": r"test|тест"}
+        key = next((kk for kk, rx in words.items() if re.search(rx, task, re.I)), "test")
+        c = rmap.get("commands", {}).get(key)
+        if not c:
+            print(f"ai-team: no '{key}' command in .ai/repo-map.json (run `ai-team map`)"); return 1
+        print(f"$ {c}")
+        rc = subprocess.call(c, shell=True, cwd=root)
+    else:
+        show_status(root)
+    record(root, p, [], rc == 0, "skipped", [], "T0 local", None, 0, [])
+    return rc
+
+
+def prune_state(root):
+    """Retention: keep the newest N task dirs and nothing older than D days. Metrics and decisions are separate."""
+    d = root / ".ai" / "state" / "tasks"
+    if not d.exists():
+        return
+    dirs = sorted((x for x in d.iterdir() if x.is_dir()), key=lambda x: x.name, reverse=True)
+    cutoff = time.time() - LIM["retain_days"] * 86400
+    for i, x in enumerate(dirs):
+        if i >= LIM["retain_tasks"] or x.stat().st_mtime < cutoff:
+            shutil.rmtree(x, ignore_errors=True)
+
+
+# ── execution ──────────────────────────────────────────────────────────────────
+class Run:
+    def __init__(self, task, p, root, rmap):
+        self.task, self.p, self.root, self.rmap = task, p, root, rmap
+        prune_state(root)
+        slug = re.sub(r"[^a-z0-9]+", "-", task.lower())[:32].strip("-") or "task"
+        self.id = datetime.datetime.now().strftime("T%Y%m%d-%H%M%S-") + slug
+        self.dir = root / ".ai" / "state" / "tasks" / self.id
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.st = {"findings": [], "files": set(p["signals"].get("paths", [])), "decision": "", "open": [], "risks": [],
+                   "docs": relevant_docs(task, rmap), "result": "", "confidence": None}
+        self.log, self.escalations, self.t0 = [], [], time.time()
+        self.last, self.pruned, self.fingerprints = {}, [], {}
+        self.cmds = rmap.get("commands", {})
+        self.diag_cmd = None
+        self.before, self.pre, self.base_cache = None, {}, {}
+        (self.dir / "plan.json").write_text(redact(json.dumps({**p, "task": task}, indent=1, default=str)))
+
+    def say(self, msg):
+        print(msg, flush=True)
+
+    def agent(self, role, tier, handoff, provider=None, write=False, label=None, avoid=None, extra="", attempt=1):
+        label = label or role
+        tried = []
+        prompt, sizes = build_prompt(role, handoff, self.root, self.rmap, self.p["complexity"], extra, files_known=bool(self.st["files"]))
+        ctx = sum(v for k, v in sizes.items() if not k.startswith("_"))
+        (self.dir / f"input-{label}.md").write_text(redact(prompt))
+        if sizes.get("_trimmed"):
+            self.say(f"  ! {label}: over the {self.p['complexity']} context budget — trimmed (repo map, project, docs, then diff)")
+        while True:
+            prov = provider if provider and provider in available() and provider not in tried else pick_provider(role, avoid=avoid)
+            if prov in tried:
+                prov = next((x for x in CFG["role_providers"][role] if x in available() and x not in tried), None)
+            if not prov:
+                raise SystemExit(f"ai-team: no working provider for {role} (tried {tried or 'none'})")
+            tried.append(prov)
+            t0 = time.time()
+            self.say(f"  … {label:<16} {prov} T{tier}")
+            try:
+                text, usage, model = run_provider(prov, tier, prompt, write, role, self.dir, label, list(self.cmds.values()), cwd=self.root)
+            except (ProviderError, subprocess.TimeoutExpired) as e:
+                msg = str(e).strip().splitlines()[-1][:160] if str(e).strip() else "timeout"
+                if LIMIT_RE.search(str(e)):
+                    set_cooldown(prov); msg = "usage/rate limit — excluded for 60 min"
+                self.say(f"  ! {label}: {prov} failed ({msg}) — falling back")
+                BROKEN.add(prov); provider = None
+                continue
+            out = parse_output(text, role)
+            out.update({"_provider": prov, "_model": model, "_tier": tier, "_usage": usage, "_s": round(time.time() - t0)})
+            (self.dir / f"{label}.json").write_text(redact(json.dumps(out, indent=1, ensure_ascii=False)))
+            parts = {k: v for k, v in sizes.items() if not k.startswith("_")}
+            self.log.append({"role": role, "provider": prov, "model": model, "tier": tier, "status": out.get("status"), "attempt": attempt,
+                             "in": usage["in"], "cached": usage["cached"], "out": usage["out"], "usd": usage["usd"], "s": out["_s"],
+                             "ctx": ctx, "ctx_parts": parts, "ok": out.get("status") in ("done", "no_change", "needs_change")})
+            self.say(f"  {'✓' if out.get('status') in ('done', 'no_change', 'needs_change') else '✗'} {label:<16} {prov}/{model} T{tier}"
+                     f"  fresh {usage['in'] / 1000:.1f}k · cached {usage['cached'] / 1000:.1f}k · out {usage['out'] / 1000:.1f}k"
+                     + (f" · ${usage['usd']:.3f}" if usage["usd"] else "") + f" · {out['_s']}s")
+            self.say(f"      ours ~{ctx / 1000:.1f}k (" + " · ".join(f"{k} {v / 1000:.1f}k" for k, v in parts.items())
+                     + f") · provider baseline + tool turns ~{max(0, usage['in'] + usage['cached'] - ctx) / 1000:.1f}k")
+            return out
+
+    def absorb(self, out):
+        self.st["findings"] += [str(x) for x in out.get("findings", [])][:10]
+        self.st["files"] |= {str(f).split(":")[0] for f in (out.get("files") or []) + (out.get("relevant_files") or []) + (out.get("affected_files") or []) if f}
+        self.st["open"] = [str(x) for x in (out.get("unresolved_questions") or out.get("open_questions") or [])]
+        self.st["risks"] = [str(x) for x in (out.get("risks") or [])] or ([f"risk: {out['risk']}"] if out.get("risk") not in (None, "", "low") else self.st["risks"])
+        if out.get("confidence") is not None:
+            try:
+                self.st["confidence"] = float(out["confidence"])
+            except (TypeError, ValueError):
+                pass
+        if out.get("root_cause_candidate"):
+            self.st["result"] = "Root cause: " + str(out["root_cause_candidate"])
+        if out.get("decision"):
+            self.st["decision"] = str(out["decision"])[:800]
+
+    def run_diagnostics(self, rows, runner=None):
+        """Read-only diagnostics; anything a check writes is restored immediately and reported (never silent)."""
+        want_warn = bool(re.search(r"warning|предупрежд", self.task, re.I))
+        results = []
+        for row in rows:
+            if row["state"] != "required" or not row["cmd"]:
+                results.append(dict(row, status=None))
+                continue
+            snap = snapshot(self.root)
+            saved = {f: ((self.root / f).read_bytes() if (self.root / f).is_file() else None) for f in (snap or {})}
+            r = run_diag(self.root, row, want_warn, runner)
+            touched = changed(self.root, snap) if snap is not None else []
+            if touched:
+                for f in touched:
+                    old = (self.root / f)
+                    prev = saved[f] if f in saved else self.pre_content(f)
+                    if prev is None:
+                        old.unlink(missing_ok=True)
+                    else:
+                        old.write_bytes(prev)
+                r["note"] = f"check modified {len(touched)} file(s) — restored; treat this command as mutating"
+                r["status"], r["ok"] = "BROKEN", False
+                self.say(f"  ! {row['cmd']} modified files during a read-only baseline ({', '.join(touched[:3])}); restored")
+            results.append(r)
+        return results
+
+    def aggregate_repair(self, steps, cons, runner=None):
+        """Broad maintenance: baseline every required category → group by root cause → fix groups in bounded batches →
+        re-run while progress is made. 'Clean' only when ALL required categories pass."""
+        rows = diag_plan(self.task, self.root, self.rmap)
+        results = self.run_diagnostics(rows, runner)
+        state = overall_state(results)
+        (self.dir / "diagnostics-baseline.json").write_text(json.dumps([{k: v for k, v in r.items() if k != "out"} for r in results], indent=1))
+        self.say("  T0 diagnostics baseline:\n" + render_diags(results) + f"\n  Overall: {state}")
+        if state == "CLEAN":
+            deferred = [r for r in rows if r["state"] == "deferred" and r["cmd"]]
+            if deferred:  # static checks clean → run the deferred build once before calling the project clean
+                results = self.run_diagnostics([dict(r, state="required") for r in deferred], runner)
+                self.say(render_diags(results))
+                if overall_state(results) == "CLEAN":
+                    return self.finish(True, [], "skipped", [{"cmd": r["cmd"], "ok": True, "status": "PASS"} for r in results], "all required diagnostics clean")
+                state = "DIRTY"
+            else:
+                return self.finish(True, [], "skipped", [], "all required diagnostics clean")
+        if state == "INCOMPLETE":
+            gaps = ", ".join(r["cat"] + (" (misconfigured)" if r.get("status") == "BROKEN" else "") for r in results
+                             if r["state"] == "unavailable" or r.get("status") == "BROKEN")
+            self.say(f"  no failures in the checks that could run; NOT reporting clean — unavailable: {gaps}")
+            return self.finish(False, [], "skipped", [{"cmd": gaps, "ok": False, "status": "BLOCKED"}],
+                               f"BLOCKED: {gaps} not checkable read-only")
+        base = {r["cmd"]: r for r in results if r.get("status")}
+        self.aggregate_base = {c: (r["ok"], r["out"]) for c, r in base.items()}
+        impl = steps.get("implementer")
+        if not impl or not impl.get("provider"):
+            raise SystemExit("ai-team: no implementer provider installed")
+        prov, tier = impl["provider"], impl["tier"]
+        total0 = sum(r["errors"] + (r["warnings"] if r["status"] == "FAIL" and r["ok"] else 0) for r in results if r.get("status"))
+        prev_total, stalls, escalated, batch_no, outs, done_keys = total0, 0, False, 0, [], set()
+        had_stall = False
+        before = self.before
+        while batch_no < 8:
+            groups = [g for g in group_diags(results) if g["key"] not in done_keys] or group_diags(results)
+            if not groups:
+                break
+            batch, files = [], set()
+            for g in groups:  # a few root-cause groups per call, bounded by files touched
+                if batch and (len(batch) >= 3 or len(files | g["files"]) > 8):
+                    break
+                batch.append(g); files |= g["files"]
+            batch_no += 1
+            n_batch = sum(g["count"] for g in batch)
+            if batch_no == 1:
+                tier = 1 if (n_batch <= 5 and len(files) <= 2) else max(tier, 2)
+                self.p["complexity"] = "SMALL" if tier == 1 else "MEDIUM"
+            summary = "\n".join(f"GROUP {i + 1} [{g['key']}] ×{g['count']} — files: {', '.join(sorted(g['files'])[:6])}"
+                                + (f" (+{len(g['files']) - 6})" if len(g["files"]) > 6 else "") + f"\n  e.g. {g['example']}" for i, g in enumerate(batch))
+            st = dict(self.st, files={f for f in files if not f.startswith("(")},
+                      findings=[f"Baseline: {total0} diagnostics; {prev_total} remaining", "Fix these root-cause groups (same cause → one consistent fix):\n" + summary])
+            action = ("Fix the root cause of each GROUP below with the smallest correct change. Do not suppress diagnostics "
+                      "(no ts-ignore / eslint-disable / any) unless there is no real fix. Don't touch unrelated files.")
+            batch_snapshot = snapshot(self.root)
+            batch_saved = {f: ((self.root / f).read_bytes() if (self.root / f).is_file() else None) for f in (batch_snapshot or {})}
+            batch_base = {r["cmd"]: (r["ok"], r["out"]) for r in results if r.get("status")}
+            out = self.agent("implementer", tier, make_handoff(self.task, st, action, cons), provider=prov, write=True,
+                             label=f"implementer-g{batch_no}-t{tier}", attempt=batch_no)
+            outs = [out]
+            results = self.run_diagnostics([dict(r, state="required") if r.get("status") else r for r in rows], runner)
+            new_lines, new_count = [], 0
+            for r in results:
+                if r.get("status") and r["cmd"] in batch_base and not r["ok"]:
+                    b_ok, b_out = batch_base[r["cmd"]]
+                    cmpr = compare_checks(b_ok, b_out, r["ok"], r["out"])
+                    new_lines += cmpr["new_lines"] if cmpr["status"] in ("FAIL_NEW_ERRORS", "FAIL_REGRESSION") else []
+                    new_count += cmpr["new"]
+            total = sum(r["errors"] + (r["warnings"] if r["status"] == "FAIL" and r["ok"] else 0) for r in results if r.get("status"))
+            state = overall_state(results)
+            self.say(f"  diagnostics after batch {batch_no}: {prev_total} → {total}" + (f" · {len(new_lines)} NEW" if new_lines else "") + f" · {state}")
+            if new_lines:
+                # Restore this batch only; preserve earlier progress and pre-existing dirty files.
+                for f in changed(self.root, batch_snapshot):
+                    path = self.root / f
+                    data = batch_saved[f] if f in batch_saved else self.pre_content(f)
+                    if data is None:
+                        path.unlink(missing_ok=True)
+                    else:
+                        path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(data)
+                self.say("  FAIL_REGRESSION: batch restored; stop for a different approach, no automatic T3 escalation")
+                vres = [{"cmd": "aggregate diagnostics", "ok": False, "status": "FAIL_REGRESSION",
+                         "pre": prev_total, "new": new_count, "fixed": 0, "new_lines": new_lines[:10]}]
+                return self.finish(False, changed(self.root, before), "skipped", vres,
+                                   f"FAIL_REGRESSION: {prev_total} → {total}; batch restored")
+            if state == "CLEAN":
+                break
+            if total < prev_total and not new_lines:
+                done_keys |= {g["key"] for g in batch}
+                prev_total, stalls = total, 0
+                continue
+            stalls += 1
+            had_stall = True
+            for e in self.log[-1:]:
+                e["ok"] = False
+            if new_lines:
+                self.st["findings"] = ["The last change INTRODUCED these diagnostics — fix them first:"] + new_lines[:10]
+            if stalls >= 2:
+                if escalated or tier >= min(3, self.p["max_tier"]):
+                    self.escalations.append(f"stop [REPEATED_FAILURE] no diagnostic progress after {stalls} batches")
+                    break
+                tier = self.escalate(tier, f"FAILED_T{tier}", f"no diagnostic progress ({prev_total} remaining)")
+                escalated, stalls = True, 0
+        if state == "CLEAN":
+            deferred = [r for r in rows if r["state"] == "deferred" and r["cmd"]]
+            if deferred:
+                extra = self.run_diagnostics([dict(r, state="required") for r in deferred], runner)
+                self.say(render_diags(extra))
+                results += extra
+                state = overall_state(results)
+        files = changed(self.root, before)
+        vres = [{"cmd": r["cmd"], "ok": r["status"] == "PASS", "s": r.get("s", 0), "tail": "",
+                 "status": "PASS" if r["status"] == "PASS" else "FAIL", "pre": r["errors"], "new": 0, "fixed": 0}
+                for r in results if r.get("status")]
+        ok = state == "CLEAN"
+        review_state = "skipped"
+        if files and "reviewer" in steps:
+            run_rev, why = review_gate(self.root, files, self.p, outs, vres, [], had_stall)  # initial failures are the task, not a repair
+            if run_rev and ok:
+                self.say(f"  → reviewer: {why}")
+                review_state, ok, vres = self.review(steps["reviewer"], files, prov, tier, before, outs, ok, vres)
+        return self.finish(ok, files, review_state, vres, f"aggregate diagnostics {total0} → {prev_total if not ok else 0}"
+                           + ("" if ok else " (NOT clean: " + ", ".join(r["cat"] for r in results if r.get("status") == "FAIL") + ")"))
+
+    def pre_content(self, f):
+        if f in self.pre:
+            return self.pre[f]
+        rc = subprocess.run(["git", "show", f"HEAD:{f}"], cwd=self.root, capture_output=True)
+        return rc.stdout if rc.returncode == 0 else None  # None = file did not exist before the task
+
+    def baseline(self, cmd):
+        """Pre-task result of one check: briefly put the task's changed files back to their pre-task content (HEAD or the
+        user's own dirty version), run the check, restore. Cached per command. Other files are never touched."""
+        if cmd == self.diag_cmd:
+            return None  # "fix all errors": the pre-existing errors are the task, so no baseline tolerance
+        if cmd in getattr(self, "aggregate_base", {}):
+            return self.aggregate_base[cmd]  # broad maintenance: the initial diagnostics are the baseline
+        if cmd in self.base_cache:
+            return self.base_cache[cmd]
+        files = changed(self.root, self.before)
+        saved = {}
+        try:
+            for f in files:
+                fp = self.root / f
+                saved[f] = fp.read_bytes() if fp.is_file() else None
+                old = self.pre_content(f)
+                if old is None:
+                    if fp.exists():
+                        fp.unlink()
+                else:
+                    fp.parent.mkdir(parents=True, exist_ok=True); fp.write_bytes(old)
+            try:
+                r = subprocess.run(cmd, shell=True, cwd=self.root, capture_output=True, text=True, timeout=LIM["verify_timeout_s"])
+                result = (r.returncode == 0, r.stdout + r.stderr)
+            except subprocess.TimeoutExpired:
+                result = None
+        finally:
+            for f, data in saved.items():
+                fp = self.root / f
+                if data is None:
+                    if fp.exists():
+                        fp.unlink()
+                else:
+                    fp.write_bytes(data)
+        self.base_cache[cmd] = result
+        return result
+
+    def reclassify(self, out, steps):
+        """Explorer evidence may move complexity up or down (MICRO..COMPLEX); CRITICAL is never entered or left automatically."""
+        new, old = str(out.get("complexity", "")).upper(), self.p["complexity"]
+        if new not in ("MICRO", "SMALL", "MEDIUM", "COMPLEX") or old == "CRITICAL" or new == old or self.p["intent"] == "ARCHITECTURE":
+            return
+        self.p["complexity"] = new
+        if "implementer" in steps:
+            t = CFG["pipelines"][new]["implementer"]
+            r = choose("implementer", t, new, intent=self.p["intent"], docs=self.p["signals"].get("docs"))
+            steps["implementer"] = {"tier": t, "provider": r[0]["provider"] if r else steps["implementer"]["provider"]}
+        self.say(f"  ↺ reclassified {old}→{new} from explorer evidence")
+
+    def escalate(self, tier, code, why):
+        cap = min(CFG["escalation_cap"].get(self.p["complexity"], 3), self.p["max_tier"] if self.p["complexity"] != "CRITICAL" else 3)
+        new = min(tier + 1, cap)
+        if new == tier:
+            return tier
+        self.escalations.append(f"T{tier}→T{new} [{code}] {why}")
+        self.say(f"  ↑ escalate T{tier}→T{new} [{code}] {why}")
+        return new
+
+    def answer_only(self, out, label):
+        self.say("\n" + ("\n".join(str(x) for x in out.get("findings", []) if x) or "(no answer)"))
+        if out.get("files") or out.get("relevant_files"):
+            self.say("Files: " + ", ".join(map(str, out.get("files") or out.get("relevant_files"))))
+        return self.finish(True, [], "skipped", [], f"read-only ({label})")
+
+    def execute(self):
+        p, cons = self.p, "Stay within FILES unless the change requires otherwise."
+        steps = {s["role"]: s for s in p["steps"] if s["provider"]}
+        before = snapshot(self.root)
+        self.before = before
+        for f in (before or {}):  # user's own uncommitted work: remember it exactly, never assume ai-team made it
+            fp = self.root / f
+            self.pre[f] = fp.read_bytes() if fp.is_file() else None
+        if before:
+            self.say(f"  note: {len(before)} file(s) already modified; excluded from change detection unless touched")
+        if "answer" in steps:
+            return self.answer_only(self.agent("answer", 1, self.task, provider=steps["answer"]["provider"]), "answer")
+        if p["intent"] == "REVIEW":
+            files = sorted(before or [])
+            if not files:
+                self.say("  nothing to review: working tree is clean")
+                return self.finish(True, [], "skipped", [], "no changes")
+            s = steps["reviewer"]
+            rv = self.agent("reviewer", s["tier"], make_handoff(self.task, dict(self.st, files=set(files)), "Review the diff."),
+                            provider=s["provider"], extra=diff_for(self.root, files))
+            for i in rv.get("issues", []):
+                self.say(f"  [{i.get('severity')}] {i.get('file')}:{i.get('line')} {i.get('problem')} → {i.get('fix')}")
+            return self.finish(True, [], f"{len(rv.get('issues', []))} issue(s)", [], "review only")
+        if p["signals"].get("aggregate"):
+            return self.aggregate_repair(steps, cons)
+        if False:
+            c, ok0, groups = diagnose(self.root, self.task, self.cmds)
+            if ok0:
+                self.say(f"  ✓ T0 diagnostics: `{c}` passes — nothing to fix, 0 model calls")
+                return self.finish(True, [], "skipped", [{"cmd": c, "ok": True}] if c else [], "diagnostics clean")
+            n = sum(len(v) for v in groups.values())
+            self.say(f"  ✗ T0 diagnostics: `{c}` → {n} error line(s) in {len(groups)} file(s)")
+            self.st["files"] |= {f for f in groups if not f.startswith("(")}
+            self.st["findings"] = [x for f in list(groups)[:12] for x in groups[f][:4]][:LIM["diagnostic_errors"]]
+            self.p["complexity"] = "SMALL" if len(groups) <= 2 and n <= 5 else "MEDIUM"
+            self.diag_cmd = c
+            steps["implementer"]["tier"] = 1 if self.p["complexity"] == "SMALL" else 2
+        for role in ("explorer", "researcher"):
+            if role not in steps:
+                continue
+            s = steps[role]
+            if role == "researcher" and p["intent"] in CODE_INTENTS and not RESEARCH.search(self.task):
+                continue  # added dynamically below if the explorer asks
+            probe = p["intent"] in ("QUESTION", "UNKNOWN", "PLAN") or (p["signals"].get("analysis_first") and "architect" not in steps)
+            action = {"researcher": "Collect only the external facts this task needs.",
+                      "explorer": ("If this is a question, answer it (status done). If it needs file changes, give the exact change "
+                                   "(status needs_change). If nothing is needed, status no_change." if probe else
+                                   "Find the files, symbols and behaviour the implementer needs; nothing else.")}[role]
+            out = self.agent(role, s["tier"], make_handoff(self.task, self.st, action), provider=s["provider"])
+            self.last[role] = out
+            self.absorb(out)
+            if role == "researcher" and p["intent"] == "RESEARCH":
+                return self.answer_only(out, "research")
+            if role != "explorer":
+                continue
+            if probe:
+                if p["intent"] == "PLAN":
+                    if "architect" not in steps:
+                        return self.answer_only(out, "plan")
+                    continue
+                if out.get("status") != "needs_change":
+                    return self.answer_only(out, "diagnosis" if p["signals"].get("analysis_first") else "probe")
+                cx = str(out.get("complexity", "SMALL")).upper()
+                self.p["complexity"] = cx if cx in ("MICRO", "SMALL", "MEDIUM") else "MEDIUM"
+                t = 2 if self.p["complexity"] == "MEDIUM" else 1
+                r = choose("implementer", t, self.p["complexity"], intent=p["intent"], docs=p["signals"].get("docs"))
+                steps["implementer"] = {"tier": t, "provider": r[0]["provider"] if r else None}
+                if out.get("next_action"):
+                    self.st["findings"].append("Requested change: " + str(out["next_action"]))
+                self.say(f"  → probe: change needed ({self.p['complexity']}) → implementer T{t}")
+                continue
+            if out.get("status") == "no_change":
+                self.say("  ✓ explorer: NO_CHANGE_REQUIRED — stopping")
+                return self.finish(True, [], "skipped", [], "no change required")
+            self.reclassify(out, steps)
+            if out.get("external_research_required") or out.get("external_knowledge_needed"):
+                r = choose("researcher", 1, self.p["complexity"])
+                if r:
+                    self.say("  → researcher: explorer reports missing external knowledge")
+                    rs = self.agent("researcher", 1, make_handoff(self.task, self.st, "Collect only the external facts this task needs."), provider=r[0]["provider"])
+                    self.absorb(rs)
+            planned = "architect" in steps
+            run_arch, codes, why = architect_gate(out, self.p, planned)
+            if planned and not run_arch:
+                steps.pop("architect"); self.pruned.append("architect")
+                self.say(f"  ⤼ skip architect: {why}")
+                if out.get("next_action"):
+                    self.st["findings"].append("Fix: " + str(out["next_action"]))
+            elif run_arch and not planned:
+                t = self.escalate(1, codes[0], f"explorer evidence needs a reasoning stage ({why})")
+                r = choose("architect", max(2, t), self.p["complexity"], intent=p["intent"])
+                steps["architect"] = {"tier": max(2, t), "provider": r[0]["provider"] if r else None}
+            elif run_arch:
+                self.say(f"  → architect [{','.join(codes)}]: {why}")
+        workstreams = [{"files": sorted(self.st["files"]), "action": "Implement TASK."}]
+        if "architect" in steps:
+            s = steps["architect"]
+            action = ("Find the root cause from the evidence; set change_required and, if true, the exact fix as next_action."
+                      if p["signals"].get("analysis_first") else "Decide the approach; outline the implementation.")
+            out = self.agent("architect", s["tier"], make_handoff(self.task, self.st, action), provider=s.get("provider"))
+            conf = float(out.get("confidence", 1) or 0)
+            if conf < CFG["gates"]["architect"]["t3_below_confidence"] and s["tier"] < 3 and rank(self.p["complexity"]) >= RANK["COMPLEX"]:
+                t = self.escalate(s["tier"], "LOW_CONFIDENCE", f"architect confidence {conf:.2f} on {self.p['complexity']}")
+                if t > s["tier"]:
+                    self.absorb(out)
+                    r = choose("architect", t, self.p["complexity"], intent=p["intent"])
+                    out = self.agent("architect", t, make_handoff(self.task, self.st, action + " A cheaper model was unsure; verify its decision."),
+                                     provider=r[0]["provider"] if r else None, label="architect-t3")
+            self.absorb(out)
+            summary = {"findings": [out.get("decision", "")] + list(out.get("findings", [])) + [out.get("next_action", "")], "files": out.get("files", [])}
+            if p["intent"] == "PLAN":
+                return self.answer_only(summary, "plan")
+            if p["intent"] == "ARCHITECTURE" and not p.get("apply"):
+                summary["findings"].append(f"Not applied. To implement: ai-team --apply \"{self.task}\"")
+                return self.answer_only(summary, "architecture decision")
+            if p["signals"].get("analysis_first") and (out.get("change_required") is False or out.get("status") == "no_change"):
+                return self.answer_only(summary, "root cause, no change required")
+            ws = [w for w in out.get("workstreams", []) if w.get("files")]
+            flat = [f for w in ws for f in w["files"]]
+            if len(ws) >= 2 and len(flat) == len(set(flat)) and p["max_parallel"] > 1:
+                workstreams = ws[:p["max_parallel"]]
+                self.say(f"  ∥ {len(workstreams)} parallel workstreams on disjoint files")
+            elif out.get("next_action"):
+                workstreams = [{"files": sorted(self.st["files"]), "action": str(out["next_action"])}]
+        impl = steps.get("implementer")
+        if not impl or not impl.get("provider"):
+            raise SystemExit("ai-team: no implementer provider installed")
+        return self.implement(impl, workstreams, steps, before, cons)
+
+    def implement(self, impl, workstreams, steps, before, cons):
+        tier, at_tier, evidence, ok, vres, vreason = impl["tier"], 0, "", True, [], "no files changed"
+        prov, files, outs, repaired, attempt = impl["provider"], [], [], False, 0
+        while True:
+            attempt += 1
+
+            def one(i_w):
+                i, w = i_w
+                st = dict(self.st, files=set(w["files"]) or self.st["files"])
+                action = w["action"] + " If no change is actually needed, return status no_change."
+                if evidence:
+                    action += f"\nPREVIOUS ATTEMPT FAILED — fix this root cause, do not repeat the same approach:\n{evidence}"
+                return self.agent("implementer", tier, make_handoff(self.task, st, action, cons), provider=prov, write=True, attempt=attempt,
+                                  label=f"implementer{'-' + str(i + 1) if len(workstreams) > 1 else ''}-t{tier}a{at_tier + 1}")
+            start = len(self.log)
+            with ThreadPoolExecutor(max_workers=max(1, min(len(workstreams), self.p["max_parallel"]))) as ex:
+                outs = list(ex.map(one, enumerate(workstreams)))
+            at_tier += 1
+            files = changed(self.root, before)
+            if not files and all(o.get("status") in ("no_change", "done") for o in outs):
+                self.say("  ✓ implementer: NO_CHANGE_REQUIRED — verification and review skipped")
+                return self.finish(True, [], "skipped", [], "no change required")
+            limit = LIM["max_attempts_t3"] if tier >= 3 else LIM["max_attempts_per_tier"]
+            if any(o.get("status") in ("blocked", "failed") or float(o.get("confidence", 1) or 0) < 0.5 for o in outs):
+                q = "; ".join(str(x) for o in outs for x in o.get("open_questions", []))[:500]
+                new = self.escalate(tier, "LOW_CONFIDENCE" if q else f"FAILED_T{tier}", f"implementer blocked/low confidence ({q or 'no reason given'})")
+                if new == tier:
+                    ok = False; break
+                tier, at_tier, evidence = new, 0, q
+                continue
+            cmds, vreason, jfiles = select_checks(files, self.p["complexity"], self.task, self.cmds, self.root)
+            if self.diag_cmd and files and self.diag_cmd not in cmds:
+                cmds = [self.diag_cmd] + cmds  # "fix all errors": the diagnostic itself is the acceptance check
+            if not cmds and not jfiles:
+                self.say(f"  ✓ verify           skipped — {vreason}, no check applies")
+                ok, vres = True, []
+                break
+            ok, vres = verify(self.root, cmds, jfiles, self.dir, self.baseline)
+            vst = verify_status(vres)
+            self.say("  " + {"PASS": "✓", "PASS_WITH_BASELINE_FAILURES": "⚠"}.get(vst, "✗") + f" verify           ({vreason}) {vst}: "
+                     + "  ".join(describe_check(r) for r in vres))
+            if ok:
+                break
+            repaired = True
+            for e in self.log[start:]:
+                e["ok"] = False
+            failed = [r for r in vres if not r["ok"]]
+            fp = hashlib.sha1("|".join(r["cmd"] + "|" + ",".join(sorted(diagnostics(r["tail"])[0])) for r in failed).encode()).hexdigest()[:10]
+            self.fingerprints[fp] = self.fingerprints.get(fp, 0) + 1
+            evidence = "\n".join(f"$ {r['cmd']}\n{r['tail'][-1500:]}" for r in failed)
+            if self.fingerprints[fp] >= 3:
+                self.escalations.append(f"stop [REPEATED_FAILURE] same failure fingerprint {fp} three times")
+                self.say(f"  ■ stop: the same failure repeated three times ({fp}); needs new evidence or a narrower task")
+                break
+            if at_tier >= limit:
+                new = self.escalate(tier, f"FAILED_T{tier}", f"{at_tier} attempt(s) failed verification")
+                if new == tier:
+                    break
+                tier, at_tier = new, 0
+        for e in self.log:
+            if e["role"] == "implementer" and e["tier"] < tier:
+                e["escalated_after"] = True
+        review_state = "skipped"
+        if ok and files and "reviewer" in steps:
+            run_rev, why = review_gate(self.root, files, self.p, outs, vres, sorted(self.st["files"]), repaired)
+            if run_rev:
+                self.say(f"  → reviewer: {why}")
+                review_state, ok, vres = self.review(steps["reviewer"], files, prov, tier, before, outs, ok, vres)
+            else:
+                self.pruned.append("reviewer")
+                self.say(f"  ⤼ skip reviewer: {why}")
+                review_state = f"skipped ({why})"
+        return self.finish(ok, changed(self.root, before), review_state, vres, vreason)
+
+    def review(self, s, files, prov, tier, before, outs, ok, vres):
+        rounds = 0
+        vsum = "; ".join(f"{r['cmd']} {'passed' if r['ok'] else 'FAILED'}" for r in vres) or "no checks applied"
+        while True:
+            rv = self.agent("reviewer", s["tier"], make_handoff(self.task, dict(self.st, files=set(files)), f"Review the diff below. Checks: {vsum}."),
+                            provider=s["provider"], label=f"reviewer-r{rounds + 1}", avoid=prov if self.p["cross_review"] else None,
+                            extra=diff_for(self.root, files))
+            blocking = [i for i in rv.get("issues", []) if str(i.get("severity", "")).lower() in ("critical", "high")]
+            if not blocking:
+                return f"passed ({len(rv.get('issues', []))} non-blocking)", ok, vres
+            if rounds >= LIM["max_review_rounds"]:
+                if self.p["judge"]:
+                    self.escalations.append("T2→T3 [CONFLICTING_EVIDENCE] reviewer vs implementer after a fix round")
+                    jd = self.agent("judge", 3, make_handoff(self.task, self.st,
+                                    "Question: are these review issues real defects that block completion?\n"
+                                    f"Reviewer issues: {json.dumps(blocking, ensure_ascii=False)[:2500]}\n"
+                                    f"Implementer position: {json.dumps([o.get('findings') for o in outs], ensure_ascii=False)[:1200]}"),
+                                    label="judge", extra=diff_for(self.root, files)[:12000])
+                    jb = [i for i in jd.get("issues", []) if str(i.get("severity", "")).lower() in ("critical", "high")]
+                    return ("judge: blocking issues remain" if jb else "judge: resolved, no blocking issues"), ok and not jb, vres
+                return f"{len(blocking)} blocking issue(s) unresolved", False, vres
+            rounds += 1
+            fix = "Fix these review issues only:\n" + "\n".join(f"- [{i.get('severity')}] {i.get('file')}:{i.get('line')} {i.get('problem')} → {i.get('fix')}" for i in blocking)
+            outs = [self.agent("implementer", tier, make_handoff(self.task, self.st, fix), provider=prov, write=True, label=f"implementer-fix{rounds}")]
+            files = changed(self.root, before)
+            cmds, _, jfiles = select_checks(files, self.p["complexity"], self.task, self.cmds, self.root)
+            ok, vres = verify(self.root, cmds, jfiles, self.dir, self.baseline)
+            self.say("  " + ("✓" if ok else "✗") + f" verify           {verify_status(vres)}: " + "  ".join(describe_check(r) for r in vres))
+            if not ok:
+                return "fix round failed verification", False, vres
+
+    def finish(self, ok, files, review_state, vres, vreason):
+        dur = round(time.time() - self.t0)
+        tin = sum(x["in"] for x in self.log); tc = sum(x["cached"] for x in self.log); tout = sum(x["out"] for x in self.log)
+        usd = sum(x["usd"] or 0 for x in self.log)
+        print("\n" + "─" * 60)
+        print(f"{'DONE' if ok else 'NOT DONE'} · {self.id} · {self.p['intent']} · {self.p['complexity']} · {self.p['budget']} · {dur}s")
+        print(f"Changed:     {', '.join(files) or 'nothing'}")
+        print(f"Verify:      {verify_status(vres) + ' · ' + '; '.join(describe_check(r) for r in vres) if vres else 'skipped'} ({vreason})")
+        print(f"Review:      {review_state}")
+        print(f"Escalations: {'; '.join(self.escalations) or 'none'}")
+        if self.pruned:
+            print(f"Pruned:      {', '.join(self.pruned)} (evidence was sufficient; call not paid)")
+        print(f"Model calls: {len(self.log)} · fresh {tin / 1000:.1f}k · cached {tc / 1000:.1f}k · out {tout / 1000:.1f}k"
+              + (f" · ${usd:.3f}" if usd else "") + f" · ours ~{sum(x['ctx'] for x in self.log) / 1000:.1f}k")
+        print(f"State:       {self.dir.relative_to(self.root)}  (input-*.md = exact prompts; kept for the last {LIM['retain_tasks']} tasks)")
+        if not ok:
+            print("Next:        read the last *.json / verification.json there, or rerun with --budget quality")
+        record(self.root, self.p, self.log, ok, review_state, vres, vreason, self.dir, dur, self.escalations, self.pruned)
+        return 0 if ok else 1
+
+
+# ── maintenance subcommands ────────────────────────────────────────────────────
+def cmd_map(root):
+    p = root / ".ai" / "repo-map.json"
+    new = detect_map(root)
+    if p.exists():  # keep hand-written keys
+        old = json.loads(p.read_text())
+        for k in ("boundaries", "notes", "docs"):
+            if k in old:
+                new[k] = old[k]
+        for k, v in old.get("commands", {}).items():
+            new["commands"].setdefault(k, v)
+    p.parent.mkdir(exist_ok=True)
+    p.write_text(json.dumps(new, indent=2, ensure_ascii=False) + "\n")
+    print(f"wrote {p.relative_to(root)} (~{tok(p.read_text())} tokens): stacks={new['stacks']} pm={new['package_manager']} commands={list(new['commands'])}")
+
+
+def cmd_doctor(root, probe):
+    if not probe:
+        return subprocess.run([sys.executable, str(KIT / "scripts/manage.py"), "doctor", "--project", str(root)],
+                              env={**os.environ, "AI_KIT": str(KIT)}).returncode
+    print("Providers:"); show_providers()
+    if probe:
+        d = root / ".ai" / "state" / "doctor"; d.mkdir(parents=True, exist_ok=True)
+        for name in available():
+            for t in CFG["providers"][name]["tiers"]:
+                try:
+                    _, u, model = run_provider(name, int(t), 'Reply with exactly: {"status":"done"}', False, "explorer", d, f"probe-{name}-{t}", [], cwd=root)
+                    print(f"  probe {name} T{t} {model}: OK ({(u['in'] + u['cached']) / 1000:.1f}k in)")
+                except Exception as e:  # noqa: BLE001
+                    print(f"  probe {name} T{t}: FAILED {str(e)[-200:]}")
+    if shutil.which("codex") and not shutil.which("codex-code-mode-host"):
+        print("  ! codex-code-mode-host not on PATH: `codex exec` cannot run shell commands. Link it from the Codex/ChatGPT app bundle.")
+    print("Repo:")
+    for rel in (".ai/CONTEXT.md", ".ai/repo-map.json", ".ai/decisions.md", "AGENTS.md", "CLAUDE.md", "GEMINI.md"):
+        fp = root / rel
+        print(f"  {'✓' if fp.exists() else '✗'} {rel}" + (f"  ~{tok(fp.read_text())} tokens" if fp.exists() else ""))
+    rc, _ = sh(["git", "check-ignore", "-q", ".ai/state/x"], cwd=root)
+    print(f"  {'✓' if rc == 0 else '✗'} .ai/state/ is git-ignored")
+
+
+def cmd_stats():
+    runs = metrics()
+    if not runs:
+        print("no runs recorded yet"); return
+    print(f"{len(runs)} runs · {sum(1 for r in runs if not r['steps'])} answered locally with 0 model calls")
+    for cx in RANK:
+        rs = [r for r in runs if r["complexity"] == cx and r["steps"]]
+        if not rs:
+            continue
+        rev = [r for r in rs if not str(r["review"]).startswith("skipped")]
+        found = sum(1 for r in rev if not str(r["review"]).startswith("passed (0"))
+        print(f"  {cx:<9} runs {len(rs):>3} · calls/run {sum(len(r['steps']) for r in rs) / len(rs):.1f} · escalated {sum(1 for r in rs if r['escalations']) / len(rs):.0%}"
+              f" · pruned {sum(len(r.get('pruned', [])) for r in rs)} · reviewer found something {found}/{len(rev)}"
+              f" · ~{sum(s['in'] for r in rs for s in r['steps']) / len(rs) / 1000:.1f}k fresh/run")
+        if len(rev) >= 5 and found == 0:
+            print(f"    hint: reviewer never found issues on {cx} — consider dropping it for {cx}")
+
+
+ADAPTER_ROLES = {"explorer": 1, "architect": 2, "implementer": 2, "reviewer": 2}
+
+
+def adapter_specs():
+    """Six supported entrypoints; bodies load canonical instructions on invocation."""
+    specs = []
+    desc = {"explorer": "Read-only investigation: files, symbols, callers, root causes. Cheap.",
+            "architect": "Read-only decision for ambiguous or cross-module work, only when evidence requires it.",
+            "implementer": "Bounded implementation from a handoff (fallback when ai-team is not used).",
+            "reviewer": "Read-only diff review for risky or non-trivial changes."}
+    for role, tier in ADAPTER_ROLES.items():
+        model = CFG["providers"]["claude"]["tiers"][str(tier)]["model"]
+        ro = role != "implementer"
+        fm = (f"---\nname: {role}\ndescription: {desc[role]}\nmodel: {model}\nmaxTurns: {8 if ro else 14}\n"
+              f"tools: Read, Grep, Glob, Bash{'' if ro else ', Edit, Write'}\n" + ("disallowedTools: Write, Edit\n" if ro else "") + "---\n\n")
+        body = f"Load `ai-team instructions {role}` with the task as an optional quoted argument; follow its canonical guidance.\n"
+        legacy = fm + (KIT / "roles" / f"{role}.md").read_text() + "Reply concisely: files, findings, decision/risks, next action.\n"
+        specs.append({"path": f".claude/agents/{role}.md", "provider": "claude", "role": role, "body": fm + body, "legacy": legacy})
+    orch = (KIT / "roles" / "orchestrator.md").read_text()
+    body = "Load `ai-team instructions orchestrator` and follow its canonical workflow for this task.\n"
+    cf = "---\ndescription: Run a task with the cheapest capable agent team (ai-team)\nargument-hint: <task>\n---\n\nTask: $ARGUMENTS\n\n"
+    sf = '---\nname: team\ndescription: "Use for /team or requested Codex/Claude orchestration; runs ai-team."\n---\n\n'
+    specs.extend([
+        {"path": ".claude/commands/team.md", "provider": "claude", "role": "orchestrator", "body": cf + body, "legacy": cf + orch},
+        {"path": ".codex/skills/team/SKILL.md", "provider": "codex", "role": "orchestrator", "body": sf + body, "legacy": sf + orch},
+    ])
+    return specs
+
+
+def cmd_install():
+    """Replace only absent or byte-proven generated adapters; preserve custom content."""
+    for spec in adapter_specs():
+        p = Path.home() / spec["path"]
+        if p.is_symlink() or (p.exists() and p.read_text() not in (spec["legacy"], spec["body"])):
+            print(f"kept custom adapter: {p}")
+            continue
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(spec["body"])
+        print(f"generated thin adapter: {p}")
+
+
+# ── self-test ──────────────────────────────────────────────────────────────────
+CATEGORY = {"Eval": "Routing scenarios", "ZeroToken": "Zero-token paths", "ContextBudget": "Context budgets", "Fallback": "Provider fallback",
+            "StagePruning": "Conditional DAG", "PrunedExecution": "Conditional DAG", "Verification": "Verification matrix",
+            "Escalation": "T3 / escalation", "Security": "Security", "CostAware": "Cost-aware selection", "Budgets": "Budget modes",
+            "ReviewGate": "Review gate", "Maintenance": "Diagnostics-first",
+            "EvidenceGuard": "History sample guard", "ReviewerWording": "Reviewer wording", "ReviewSizing": "Review sizing", "BaselineVerification": "Baseline-aware verify", "AggregateDiagnostics": "Aggregate diagnostics"}
+
+
+def cmd_self_test(live):
+    import unittest
+    suite = unittest.defaultTestLoader.discover(str(KIT / "tests"))
+    res = unittest.TestResult()
+    stats = {}
+
+    def walk(s):
+        for t in s:
+            if isinstance(t, unittest.TestSuite):
+                walk(t)
+            else:
+                cat = CATEGORY.get(type(t).__name__, type(t).__name__)
+                before = len(res.failures) + len(res.errors)
+                t.run(res)
+                bad = len(res.failures) + len(res.errors) > before
+                ok, n = stats.get(cat, (0, 0))
+                stats[cat] = (ok + (0 if bad else 1), n + 1)
+    calls_before = MODEL_CALLS[0]
+    import contextlib, io
+    with contextlib.redirect_stdout(io.StringIO()):  # task output from stubbed runs is noise here
+        walk(suite)
+    print("AI-Team Self Test")
+    for cat, (ok, n) in stats.items():
+        print(f"  {cat:<22} {ok}/{n} {'✓' if ok == n else '✗'}")
+    for t, tb in res.failures + res.errors:
+        print(f"  FAIL {t.id().split('.', 1)[-1]}: {tb.strip().splitlines()[-1][:160]}")
+    print(f"  Model calls used: {MODEL_CALLS[0] - calls_before} (tests stub every provider)")
+    rc = 0 if res.wasSuccessful() else 1
+    subprocess.run([sys.executable, str(KIT / "scripts/manage.py"), "health-write", "--result", "pass" if rc == 0 else "fail"],
+                   env={**os.environ, "AI_KIT": str(KIT)}, check=True)
+    if live:
+        rc |= live_eval()
+    return rc
+
+
+def live_eval():
+    """Minimal real calls: one T0 path, one cheap read-only answer, one micro edit in a throwaway fixture repo."""
+    import tempfile
+    print("Live eval (real providers, smallest subset)")
+    d = Path(tempfile.mkdtemp(prefix="ai-team-live-"))
+    try:
+        (d / "a.js").write_text("const x = 1;\nmodule.exports = x;\n")
+        (d / "package.json").write_text('{"name":"fixture","private":true,"scripts":{"typecheck":"node --check a.js"}}\n')
+        subprocess.run("git init -q && git add -A && git -c user.email=t@t -c user.name=t commit -qm init", shell=True, cwd=d, check=True)
+        rmap = detect_map(d)
+        c0 = MODEL_CALLS[0]
+        p = plan("ты работаешь?", "balanced", None, d)
+        print(f"  T0 meta            {'✓' if p.get('local') and MODEL_CALLS[0] == c0 else '✗'} 0 model calls")
+        p = plan("what is a race condition? one sentence", "balanced", None, d)
+        rc = Run("what is a race condition? one sentence", p, d, rmap).execute()
+        print(f"  T1 read-only       {'✓' if rc == 0 else '✗'}")
+        p = plan("rename the variable x to y in a.js", "balanced", None, d)
+        rc2 = Run("rename the variable x to y in a.js", p, d, rmap).execute()
+        body = (d / "a.js").read_text()
+        good = rc2 == 0 and "const y" in body and "exports = y" in body
+        print(f"  micro mutation     {'✓' if good else '✗'} ({p['complexity']}, fixture removed afterwards)")
+        return 0 if rc == 0 and good else 1
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def main():
+    argv = sys.argv[1:]
+    root = repo_root()
+    if argv[:1] == ["--version"]:
+        print((KIT / "VERSION").read_text().strip()); return 0
+    if argv[:1] == ["init"]:
+        return subprocess.run([sys.executable, str(KIT / "scripts/bootstrap.py"), "--root", str(root), *argv[1:]],
+                              env={**os.environ, "AI_KIT": str(KIT)}).returncode
+    if argv[:1] == ["update"]:
+        return subprocess.run([sys.executable, str(KIT / "scripts/manage.py"), "update"],
+                              env={**os.environ, "AI_KIT": str(KIT)}).returncode
+    if argv[:1] == ["--all-providers"]:
+        show_providers(); print("  gemini  inactive; no configuration or installation required"); return 0
+    flags = {"--status": lambda: show_status(root), "--providers": show_providers, "--models": show_models,
+             "--last": lambda: show_last(root), "--cost": show_cost, "--routing": lambda: print(ROUTING_HELP)}
+    if len(argv) == 1 and argv[0] in flags:
+        return flags[argv[0]]() or 0
+    if argv[:1] == ["--diagnose"]:
+        task = " ".join(argv[1:]) or "fix all existing errors and warnings in this project"
+        rmap = load_map(root)
+        r = Run(task, {"intent": "IMPLEMENTATION", "complexity": "MEDIUM", "budget": "balanced", "signals": {}, "steps": [], "max_tier": 3}, root, rmap)
+        snap = snapshot(root)
+        r.before, r.pre = snap, {f: ((root / f).read_bytes() if (root / f).is_file() else None) for f in (snap or {})}
+        res = r.run_diagnostics(diag_plan(task, root, rmap))
+        print(f"Diagnostics (read-only, 0 model calls) for: {task}\n" + render_diags(res) + f"\nOverall: {overall_state(res)}")
+        for g in group_diags(res):
+            print(f"  group ×{g['count']:<3} {g['key'][:80]}  ({len(g['files'])} file(s))")
+        shutil.rmtree(r.dir, ignore_errors=True)
+        return 0 if overall_state(res) == "CLEAN" else 1
+    if argv[:1] == ["--self-test"]:
+        return cmd_self_test("--live" in argv)
+    if argv[:1] == ["map"]:
+        return cmd_map(root)
+    if argv[:1] in (["doctor"], ["--doctor"]):
+        return cmd_doctor(root, "--probe" in argv)
+    if argv[:1] == ["stats"]:
+        return cmd_stats()
+    if argv[:1] == ["install"]:
+        return subprocess.run([sys.executable, str(KIT / "scripts/manage.py"), "install"],
+                              env={**os.environ, "AI_KIT": str(KIT)}).returncode
+    if argv[:1] == ["instructions"]:
+        ap = argparse.ArgumentParser(prog="ai-team instructions")
+        ap.add_argument("role", choices=["orchestrator", "explorer", "architect", "implementer", "reviewer", "researcher", "judge"])
+        ap.add_argument("task", nargs="*", help="optional task text for conditional guidance")
+        a = ap.parse_args(argv[1:])
+        print(role_instructions(a.role, " ".join(a.task), root))
+        return 0
+    if argv[:1] == ["role"]:
+        ap = argparse.ArgumentParser(prog="ai-team role")
+        ap.add_argument("role"); ap.add_argument("handoff"); ap.add_argument("--tier", type=int, default=1)
+        ap.add_argument("--provider"); ap.add_argument("--write", action="store_true")
+        a = ap.parse_args(argv[1:])
+        h = Path(a.handoff[1:]).read_text() if a.handoff.startswith("@") else a.handoff
+        p = {"intent": "ROLE", "complexity": "SMALL", "budget": "balanced", "signals": {}, "steps": [], "max_tier": 3}
+        out = Run(f"role {a.role}", p, root, load_map(root)).agent(a.role, a.tier, h, provider=a.provider, write=a.write or a.role == "implementer")
+        print(json.dumps({k: v for k, v in out.items() if not k.startswith("_")}, indent=1, ensure_ascii=False))
+        return 0
+    ap = argparse.ArgumentParser(prog="ai-team", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("task", nargs="+")
+    ap.add_argument("--plan", action="store_true", help="routing only; no model calls")
+    ap.add_argument("--context-plan", action="store_true", help="context sources each call would receive; no model calls")
+    ap.add_argument("--budget", choices=list(CFG["budgets"]), default=os.environ.get("AI_TEAM_BUDGET", "balanced"))
+    ap.add_argument("--complexity", choices=LEVELS)
+    ap.add_argument("--json", action="store_true", help="with --plan: machine-readable plan")
+    ap.add_argument("--apply", action="store_true", help="ARCHITECTURE tasks: implement the decision instead of stopping at it")
+    a = ap.parse_args(argv)
+    task = " ".join(a.task)
+    p = plan(task, a.budget, a.complexity, root, a.apply)
+    rmap = {} if p.get("local") and p["intent"] != "TOOL" and p["signals"].get("meta") != "project" else load_map(root)
+    if a.plan and a.json:
+        print(json.dumps(p, indent=1, ensure_ascii=False)); return 0
+    if a.context_plan:
+        print_context_plan(p, root, rmap, task); return 0
+    print_plan(p, root, rmap, task)
+    if a.plan:
+        return 0
+    print()
+    if p.get("local"):
+        return local(p, root, rmap, task)
+    if not available():
+        sys.exit("ai-team: no active AI provider CLI found (codex or claude). Install one and rerun `ai-team doctor`.")
+    return Run(task, p, root, rmap).execute()
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

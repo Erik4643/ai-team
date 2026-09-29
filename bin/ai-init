@@ -1,0 +1,4 @@
+#!/bin/sh
+# Backwards-compatible entrypoint. Never wrap or modify git.
+set -eu
+exec "$(dirname -- "$0")/ai-team" init "$@"
