@@ -633,9 +633,9 @@ class AggregateDiagnostics(Base):
             with self.subTest(t=t):
                 p = plan(t)
                 self.assertTrue(p["signals"]["aggregate"])
-        cats = {d["cat"]: d["state"] for d in plan("Fix all existing errors and warnings in this project")["diagnostics"]}
-        self.assertEqual((cats["typecheck"], cats["lint"]), ("required", "required"))
-        self.assertEqual(cats.get("build"), "deferred")
+        rows = {d["cat"]: d for d in plan("Fix all existing errors and warnings in this project")["diagnostics"]}
+        self.assertEqual([(rows[c]["need"], rows[c]["state"]) for c in ("typecheck", "lint")], [("required", "run")] * 2)
+        self.assertEqual((rows["test"]["need"], rows["build"]["need"], rows["build"]["state"]), ("optional", "optional", "deferred"))
 
     def test_7_targeted_task_disables_aggregate(self):
         for t in ("fix this button", "add loading state to submit button", "fix the login form error message"):
@@ -737,6 +737,159 @@ class BatchRegression(Base):
         self.assertTrue(ok)
         self.assertEqual(m.verify_status(rows), "PASS_WITH_WARNINGS")
         self.assertEqual(m.verify_status([{"ok": False, "status": "BLOCKED"}]), "BLOCKED")
+
+
+def run_aggregate(root, task, runner, rmap=None):
+    """aggregate_repair with an injected check runner (no package manager needed). → (rc, stdout)."""
+    r = m.Run(task, plan(task, root=root), root, rmap or {"package_manager": "npm"})
+    r.before, r.pre = m.snapshot(root), {}
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = r.aggregate_repair({x["role"]: x for x in r.p["steps"] if x["provider"]}, "", runner=runner)
+    return rc, buf.getvalue()
+
+
+class ReadOnlyDerivation(Base):
+    def cmds(self, scripts, pm="npm"):
+        root = git_repo({"package.json": json.dumps({"name": "fx", "private": True, "scripts": scripts})})
+        return m.safe_diag_commands(root, {"package_manager": pm})
+
+    def test_eslint_fix_derives_read_only_lint(self):
+        c = self.cmds({"lint": "eslint \"**/*.+(ts|tsx)\" --fix --ignore-pattern 'node_modules/'"}, "yarn")["lint"]  # quoted | is not a pipe
+        self.assertEqual(c["cmd"], "yarn eslint '**/*.+(ts|tsx)' --ignore-pattern node_modules/")
+        self.assertEqual((c["configured_command"], c["derived_read_only_command"], c["confidence"]), ("yarn lint", c["cmd"], "high"))
+        self.assertIn("--fix", c["derivation_reason"])
+        self.assertEqual(self.cmds({"lint": "eslint . --fix-type problem --fix"})["lint"]["cmd"], "npx eslint .")
+
+    def test_prettier_write_derives_check(self):
+        self.assertEqual(self.cmds({"format": "prettier --write src"})["format"]["cmd"], "npx prettier --check src")
+        c = self.cmds({"prettier": "prettier --ignore-path .gitignore \"**/*.+(ts|tsx)\"", "format": "yarn run prettier --write"}, "yarn")["format"]
+        self.assertEqual(c["cmd"], "yarn prettier --ignore-path .gitignore '**/*.+(ts|tsx)' --check")   # script references resolved
+        self.assertEqual(m.read_only_form("yarn format", {"format": "yarn run prettier --write", "prettier": "prettier src"}, "yarn")["cmd"],
+                         "yarn prettier src --check")
+
+    def test_stylelint_fix_derives_read_only(self):
+        c = self.cmds({"lint:css": "stylelint \"src/**/*.css\" --fix"})["style"]
+        self.assertEqual((c["cmd"], c["confidence"]), ("npx stylelint 'src/**/*.css'", "high"))
+
+    def test_unknown_mutating_command_is_unavailable(self):
+        c = self.cmds({"lint": "mylinter --fix src"})["lint"]
+        self.assertIsNone(c["cmd"]); self.assertEqual(c["confidence"], "none"); self.assertIn("not in the read-only allowlist", c["derivation_reason"])
+        self.assertIsNone(m.read_only_form("tsc -b")["cmd"])                                # no read-only equivalent
+        self.assertEqual(m.read_only_form("tsc -p tsconfig.app.json")["cmd"], "tsc -p tsconfig.app.json --noEmit")
+
+    def test_already_read_only_command_is_unchanged(self):
+        for scripts, cat, cmd in (({"lint": "eslint ."}, "lint", "npm run lint"),
+                                  ({"check-format": "prettier --list-different .", "format": "prettier --write ."}, "format", "npm run check-format"),
+                                  ({"typecheck": "tsc --noEmit -p tsconfig.app.json"}, "typecheck", "npm run typecheck")):
+            with self.subTest(cat=cat):
+                c = self.cmds(scripts)[cat]
+                self.assertEqual((c["cmd"], c["derived_read_only_command"], c["confidence"]), (cmd, None, "exact"))
+
+    def test_dangerous_shell_operators_are_not_derived(self):
+        for body in ("eslint . --fix; rm -rf dist", "eslint . --fix && prettier --write .", "eslint . --fix | tee log",
+                     "eslint $(git ls-files) --fix", "eslint `ls` --fix", "eslint . --fix > out.txt"):
+            with self.subTest(body=body):
+                self.assertIsNone(self.cmds({"lint": body})["lint"]["cmd"])
+                self.assertIsNone(m.read_only_form(body)["cmd"])
+        self.assertEqual(m.read_only_form("tsc --noEmit && vitest run")["cmd"], "tsc --noEmit && vitest run")  # not mutating: as configured
+
+    def test_verification_never_runs_a_mutating_script(self):
+        root = git_repo({"package.json": json.dumps({"scripts": {"lint": "eslint . --fix", "format": "mytool --write"}})})
+        cmds = m.Run("t", plan("add loading state to submit button", root=root), root,
+                     {"commands": {"lint": "npm run lint", "format": "npm run format", "typecheck": "tc"}}).cmds
+        self.assertEqual(cmds, {"lint": "npx eslint .", "typecheck": "tc"})
+
+
+class GeneratedOutput(Base):
+    SRC_ERR = 'src/styles/app.css\n  1:4  ✖  Unexpected unknown property "colr"  property-no-unknown'
+    GEN_WARN = 'dist-dev/assets/index.css\n  1:1  ⚠  Unexpected vendor-prefixed property "-webkit-box"  property-no-vendor-prefix'
+    TASK = "fix all errors and warnings in this project"
+
+    def repo(self):
+        root = git_repo({".gitignore": "dist-*\n", "src/styles/app.css": ".a{colr:red}\n", "build/gen.js": "module.exports = 1\n",
+                         "vite.config.ts": "export default { build: { outDir: `dist-${mode}` } }\n",
+                         "package.json": json.dumps({"scripts": {"lint:css": "stylelint \"**/*.css\""}})})
+        (root / "dist-dev/assets").mkdir(parents=True)
+        (root / "dist-dev/assets/index.css").write_text(".b{-webkit-box:1}\n")
+        (root / ".idea").mkdir()
+        return root
+
+    def runner(self, root):
+        def check(cmd):
+            src_bad = "colr" in (root / "src/styles/app.css").read_text()
+            return (not src_bad), ((self.SRC_ERR + "\n") if src_bad else "") + self.GEN_WARN
+        return check
+
+    def test_generated_dirs_need_evidence(self):
+        root = self.repo()
+        self.assertEqual(m.generated_dirs(root), {"dist-dev": "git-ignored, output in vite.config.ts"})   # tracked build/ is source
+        mp = m.detect_map(root)
+        self.assertIn("dist-dev", mp["generated_dirs"]); self.assertNotIn("dist-dev", mp["dirs"])
+        is_gen = m.generated_classifier(root)
+        self.assertTrue(is_gen("dist-dev/assets/index.css")); self.assertTrue(is_gen(str(root / "dist-dev/a.css")))
+        self.assertFalse(is_gen("src/styles/app.css")); self.assertFalse(is_gen("build/gen.js"))
+
+    def test_generated_only_ide_warnings_are_classified_separately(self):
+        root = self.repo()
+        (root / "src/styles/app.css").write_text(".a{color:red}\n")
+        rc, out = run_aggregate(root, self.TASK + " (WebStorm flags dist-dev/assets/index.css)", self.runner(root))  # forbid(): no model call
+        self.assertEqual(rc, 0)
+        self.assertIn("only in generated/vendor output", out)
+        self.assertIn("IDE_ONLY   dist-dev/assets/index.css: generated output named in the task", out)
+        self.assertIn("mark dist-dev/ as Excluded in the IDE (local setting; .idea is not tracked, nothing written)", out)
+        self.assertIn("DONE", out); self.assertIn("Verify:      PASS_WITH_WARNINGS", out)
+        self.assertFalse(list((root / ".idea").iterdir()))
+
+    def test_source_css_issue_still_triggers_implementation(self):
+        root, prompts = self.repo(), []
+        def run(provider, tier, prompt, write, role, tdir, label, allow, **k):
+            prompts.append(prompt)
+            (root / "src/styles/app.css").write_text(".a{color:red}\n")
+            return json.dumps({"status": "done", "confidence": 0.9}), {"in": 1, "cached": 0, "out": 1, "usd": None}, "stub"
+        m.run_provider = run
+        rc, out = run_aggregate(root, self.TASK, self.runner(root))
+        self.assertEqual((rc, len(prompts)), (0, 1))
+        self.assertIn("- src/styles/app.css", prompts[0]); self.assertNotIn("- dist-dev", prompts[0])
+        self.assertIn("Never edit generated output (dist-dev/)", prompts[0])
+
+    def test_generated_dist_css_is_not_edited(self):
+        root = self.repo()
+        def run(provider, tier, prompt, write, role, tdir, label, allow, **k):
+            (root / "dist-dev/assets/index.css").write_text(".b{display:flex}\n")   # agent "fixes" the build output too
+            (root / "dist-dev/assets/new.css").write_text("x\n")
+            (root / "src/styles/app.css").write_text(".a{color:red}\n")
+            return json.dumps({"status": "done", "confidence": 0.9}), {"in": 1, "cached": 0, "out": 1, "usd": None}, "stub"
+        m.run_provider = run
+        rc, out = run_aggregate(root, self.TASK, self.runner(root))
+        self.assertEqual(rc, 0)
+        self.assertEqual((root / "dist-dev/assets/index.css").read_text(), ".b{-webkit-box:1}\n")
+        self.assertFalse((root / "dist-dev/assets/new.css").exists())
+        self.assertIn("implementer edited generated output", out); self.assertIn("generated-file edit(s) reverted", out)
+
+
+class RequiredOptional(Base):
+    def repo(self, scripts):
+        return git_repo({"package.json": json.dumps({"scripts": scripts}), "src/a.js": "x\n"})
+
+    def test_optional_unavailable_diagnostic_does_not_block(self):
+        root = self.repo({"lint": "eslint .", "format": "mytool --write ."})           # format: no safe read-only form
+        rc, out = run_aggregate(root, "fix all existing errors and warnings in this project", lambda c: (True, ""))
+        self.assertEqual(rc, 0)
+        self.assertIn("UNAVAILABLE — `format` modifies files", out); self.assertIn("warning, does not block", out)
+        self.assertIn("DONE", out); self.assertNotIn("NOT DONE", out)
+        self.assertIn("Verify:      PASS_WITH_WARNINGS", out); self.assertIn("format unavailable (optional)", out)
+
+    def test_required_unavailable_diagnostic_blocks(self):
+        root = self.repo({"lint": "mylinter --fix src", "format": "prettier --check ."})
+        rc, out = run_aggregate(root, "fix all existing errors and warnings in this project", lambda c: (True, ""))
+        self.assertEqual(rc, 1)
+        self.assertIn("NOT DONE", out); self.assertIn("Verify:      BLOCKED", out); self.assertIn("→ blocks", out)
+
+    def test_nothing_runnable_is_never_done(self):
+        root = self.repo({"format": "mytool --write ."})                                # only an optional gap, nothing ran
+        rc, out = run_aggregate(root, "fix all existing errors and warnings in this project", lambda c: (True, ""))
+        self.assertEqual(rc, 1); self.assertIn("Verify:      BLOCKED", out)
 
 
 class Security(Base):
