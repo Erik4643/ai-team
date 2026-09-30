@@ -506,43 +506,6 @@ def available():
     return list(_AVAIL[key])
 
 
-_CODEX_FLAGS, _CODEX_KNOWN = None, set()
-
-
-def codex_lean_flags():
-    """Disable optional Codex tool surfaces present in this version (−1.2k tokens/call). Feature list cached 24 h per binary."""
-    global _CODEX_FLAGS, _CODEX_KNOWN
-    if _CODEX_FLAGS is None:
-        binp = Path(shutil.which("codex") or "codex").resolve()
-        cache = KIT / "state" / "codex-features.json"
-        stamp = f"{binp}:{binp.stat().st_mtime if binp.exists() else 0}"
-        known = None
-        try:
-            c = json.loads(cache.read_text())
-            if c.get("stamp") == stamp and time.time() - c.get("t", 0) < 86400:
-                known = set(c["features"])
-        except (OSError, ValueError, KeyError):
-            pass
-        if known is None:
-            _, feats = sh(["codex", "features", "list"])
-            known = {line.split()[0] for line in feats.splitlines() if line.strip()}
-            cache.parent.mkdir(exist_ok=True)
-            cache.write_text(json.dumps({"stamp": stamp, "t": time.time(), "features": sorted(known)}))
-        flags = []
-        for f in CFG.get("codex_disable_features", []):
-            if f in known:
-                flags += ["--disable", f]
-        for f in CFG.get("codex_enable_features", []):
-            if f in known:
-                flags += ["--enable", f]
-        cfg = Path.home() / ".codex" / "config.toml"
-        if cfg.exists():
-            for name in re.findall(r"^\[mcp_servers\.([A-Za-z0-9_-]+)\]\s*$", cfg.read_text(), re.M):
-                flags += ["-c", f"mcp_servers.{name}.enabled=false"]
-        _CODEX_FLAGS, _CODEX_KNOWN = flags, known
-    return _CODEX_FLAGS
-
-
 class ProviderError(Exception):
     pass
 
@@ -563,29 +526,8 @@ def ro_bash(extra=()):
 
 
 ENV_DENY = ["Read(./.env)", "Read(./.env.*)", "Read(**/.env)", "Read(**/.env.*)"]
-ANSWER_SYSTEM = "You are ai-team's quick assistant. Answer briefly and precisely. No tools are available."
-
-
-def codex_research_flags():
-    """Codex web search, for tasks that need current external facts — only if this Codex version has the feature."""
-    codex_lean_flags()
-    return ["--enable", "web_search_request"] if "web_search_request" in _CODEX_KNOWN else []
-
-
-READ_TOOLS = ["Read", "Grep", "Glob", "Bash"]
-WRITE_TOOLS = ["Read", "Grep", "Glob", "Bash", "Edit", "Write", "NotebookEdit", "TodoWrite"]
-WEB_TOOLS = ["WebSearch", "WebFetch"]
-# Claude Code's own Bash sandbox (writes limited to the project, no network), like Codex's workspace-write sandbox:
-# a writer runs whatever commands it needs, without an allowlist kept by ai-team.
-CLAUDE_SANDBOX = json.dumps({"sandbox": {"enabled": True, "autoAllowBashIfSandboxed": True, "allowUnsandboxedCommands": False}})
-
-
 def run_provider(provider, tier, prompt, write, role, tdir, label, cwd=None, research=False):
-    """One native agent turn. As with ACP agents, the CLI owns its model, tools and execution; ai-team only picks the role's
-    permissions from each CLI's own safety model — Codex's sandbox (read-only / workspace-write), Claude Code's Bash
-    sandbox with edits accepted — and reads back the final message and usage. Agents load the project's own instructions
-    (AGENTS.md / CLAUDE.md → .ai/CONTEXT.md) natively, but not the user's global plugins, skills or MCP servers (token
-    cost). cwd = repo root: agents work in the repository even when ai-team starts in a subdirectory. → (text, usage, model)"""
+    """Run the native CLI with its configured tools and permissions; constrain explicit read-only roles only."""
     MODEL_CALLS[0] += 1
     spec = CFG["providers"][provider]["tiers"][str(tier)]
     model, effort = spec["model"], spec.get("effort")
@@ -593,8 +535,8 @@ def run_provider(provider, tier, prompt, write, role, tdir, label, cwd=None, res
     if provider == "codex":
         out = tdir / f"{label}.codex.out"
         cmd = (["codex", "exec", "-m", model] + (["-c", f"model_reasoning_effort={effort}"] if effort else [])
-               + ["-s", "workspace-write" if write else "read-only", "--skip-git-repo-check", "--ephemeral", "--json"]
-               + (["-C", str(cwd)] if cwd else []) + codex_lean_flags() + (codex_research_flags() if research else [])
+               + ([] if write or role == "answer" else ["-s", "read-only"]) + ["--skip-git-repo-check", "--ephemeral", "--json"]
+               + (["-C", str(cwd)] if cwd else [])
                + ["-o", str(out), "-"])
         r = subprocess.run(cmd, input=prompt, text=True, capture_output=True, timeout=3600, cwd=cwd)
         raw = r.stdout + r.stderr
@@ -607,20 +549,15 @@ def run_provider(provider, tier, prompt, write, role, tdir, label, cwd=None, res
         cached = usage.get("cached_input_tokens", 0)  # codex counts cached tokens inside input_tokens
         return text, {"in": usage.get("input_tokens", 0) - cached, "cached": cached, "out": usage.get("output_tokens", 0), "usd": None}, model
     if provider == "claude":
-        base = ["claude", "-p", "--model", model, "--output-format", "json", "--strict-mcp-config", "--disable-slash-commands",
+        base = ["claude", "-p", "--model", model, "--output-format", "json",
                 "--max-budget-usd", str(spec.get("max_usd", 2))]
         if effort and tier > 1:
             base += ["--effort", effort]
-        web = WEB_TOOLS if research else []
-        if role == "answer":  # a general question: no tools, no project files, tiny system prompt (~1.1k input measured)
-            cmd = base + ["--setting-sources", "", "--tools", "", "--system-prompt", ANSWER_SYSTEM]
-        elif write:
-            cmd = base + ["--setting-sources", "project,local", "--permission-mode", "acceptEdits", "--settings", CLAUDE_SANDBOX,
-                          "--tools", *(WRITE_TOOLS + web), "--allowedTools", *[t for t in WRITE_TOOLS + web if t != "Bash"],
-                          "--disallowedTools", *ENV_DENY, "Bash(git push:*)"]
-        else:
-            cmd = base + ["--setting-sources", "project,local", "--permission-mode", "dontAsk", "--tools", *(READ_TOOLS + web),
-                          "--allowedTools", "Read", "Grep", "Glob", *ro_bash(), *web, "--disallowedTools", *ENV_DENY]
+        cmd = base
+        if not write and role != "answer":
+            # A read-only operation cannot pre-authorize unknown mutating MCP tools.
+            cmd += ["--permission-mode", "dontAsk", "--allowedTools", "Read", "Grep", "Glob", *ro_bash(),
+                    "WebSearch", "WebFetch", "--disallowedTools", "Edit", "Write", "NotebookEdit", *ENV_DENY]
         r = subprocess.run(cmd, input=prompt, text=True, capture_output=True, timeout=3600, cwd=cwd)
         log.write_text(redact(r.stdout[-20000:] + "\n--stderr--\n" + r.stderr[-4000:]))
         try:
@@ -795,10 +732,12 @@ def task_prompt(role, task, root=None, write=False, extra="", gdirs=()):
         return task
     lines = [task, "", "---", "ai-team: non-interactive run — solve this yourself with your own tools, then stop."]
     if role == "reviewer":
-        lines.append("Read-only review of the uncommitted changes (`git status`, `git diff`): report real defects only.")
+        lines.append("Read-only review of the requested subject: report concrete findings.")
+        if root is not None and repository_task(task, root):
+            lines.append("Inspect `git status` and `git diff` when reviewing repository changes.")
     elif not write:
         lines.append("Read-only: do not modify files.")
-    else:
+    elif gdirs:
         lines.append("Do not commit or push." + (f" Never edit generated output ({', '.join(d + '/' for d in gdirs)}); fix its source."
                                                  if gdirs else ""))
     if root is not None and graph_ready(Path(root)):
@@ -825,6 +764,8 @@ def snapshot(root):
 
 
 def changed(root, before):
+    if before is None:
+        return []
     after = snapshot(root)
     if before is None or after is None:
         return []
@@ -1103,17 +1044,26 @@ def estimate_context(task, sig, root):
     return "module", 20000
 
 
+REPOSITORY_TASK = R(r"\b(code|codebase|repo(?:sitory)?|project|git|diff|uncommitted|commit|lint|typecheck|tests?|build|function|component|endpoint|button|imports?|readme|css|typescript|javascript|page|authentication race condition|authentication architecture|session ttl|current changes)\b|код|проект|файл|компонент|тест|сборк")
+
+
+def repository_task(task, root):
+    return (root is not None and bool(REPOSITORY_TASK.search(task) or PATH_RE.search(task))
+            and sh(["git", "rev-parse", "--is-inside-work-tree"], cwd=root)[0] == 0)
+
+
 def plan(task, budget, forced=None, root=None, apply=False):
     """T0 routing decision → ONE native agent: its role (permissions, output contract, capability prior), the cheapest
     capable tier (T3 only by escalation) and the cheapest capable provider at that tier (cost model + routing history)."""
-    intent, cx, conf, sig = classify(task, root, forced)
+    repo = repository_task(task, root)
+    intent, cx, conf, sig = classify(task, root if repo else None, forced)
     b = CFG["budgets"][budget]
     base = {"intent": intent, "complexity": cx, "confidence": conf, "signals": sig, "budget": budget, "steps": [], "apply": apply,
-            "max_tier": b["max_tier"], "review": b["review"]}
+            "max_tier": b["max_tier"], "review": b["review"], "repository_task": repo}
     if intent in ("META", "INSPECTION", "TOOL"):
         return dict(base, local=True)
     tier = None
-    if intent == "REVIEW" and root is not None:
+    if intent == "REVIEW" and repo:
         rt, rcls, rwhy = review_size(root)
         base.update(review_class=rcls, review_reason=rwhy)
         if rt == 0 and not (rcls == "DOCS" and budget == "quality"):
@@ -1133,7 +1083,7 @@ def plan(task, budget, forced=None, root=None, apply=False):
         role = "implementer"
     write = role == "implementer"
     research = role == "researcher" or bool(sig.get("research"))
-    scope, est = estimate_context(task, sig, root) if role != "answer" else ("none", 0)
+    scope, est = estimate_context(task, sig, root) if repo else ("none", 0)
     if tier is None:
         tier = CFG["start_tier"].get(cx, 1) if write else (2 if role == "architect" and rank(cx) >= RANK["COMPLEX"] else 1)
         tier += b.get("tier_delta", 0) if write else 0
@@ -1152,7 +1102,7 @@ def plan(task, budget, forced=None, root=None, apply=False):
     base["steps"].append({"role": role, "tier": tier, "provider": best["provider"], "model": spec["model"], "effort": spec.get("effort"),
                           "est": round(best["E"]), "ctx": ctx, "why": explain(ranked), "stage": "required", "trigger": "", "likely": True,
                           "write": write, "research": research})
-    if write and b["review"] != "never":
+    if write and repo and b["review"] != "never":
         rctx = tok(task_prompt("reviewer", task, root, extra="Review only these changed files: …"))
         rv = choose("reviewer", 2, cx, rctx, best["provider"], intent)
         if rv:
@@ -1177,7 +1127,7 @@ def print_plan(p, root, rmap, task):
                 "REVIEW": p.get("review_reason", "nothing to review"), "TOOL": "project command from .ai/repo-map.json"}[p["intent"]]
         print(f"  T0 {what} — 0 model calls, 0 tokens")
         return
-    needs = ["edits (the CLI's own sandbox)" if p.get("write") else "read-only"] + (["web research"] if p.get("research") else [])
+    needs = ["actions (native CLI permissions)" if p.get("write") else "read-only"] + (["web research"] if p.get("research") else [])
     print(f"Needs:  {' · '.join(needs)}" + (f"   Context: {p['scope']} ~{p['context_estimate'] / 1000:.0f}k tokens (the agent reads it itself)"
                                             + (" → long context: T2+" if p.get("long_context") else "") if p.get("scope") not in (None, "none") else ""))
     for s in p["steps"]:
@@ -1187,7 +1137,7 @@ def print_plan(p, root, rmap, task):
         print(f"  T{s['tier']} {s['role']:<11} {s['provider'] + '/' + s['model']:<21} {s['stage']:<11} ≈{s['est'] / 1000:>3.0f}k  {s['why']}")
         if s.get("trigger"):
             print(f"     {'':<11} {s['trigger']}")
-    if p.get("write"):
+    if p.get("write") and p.get("repository_task"):
         print("  T0 verify      after the agent: the project's checks for the changed files (baseline-aware, 0 tokens)")
     print("On failure: transient → retry · limit/error/gave up → other provider · failed checks → retry, then one tier up"
           + ("" if p["max_tier"] >= 3 else " (T3 not allowed in this budget)"))
@@ -1203,7 +1153,7 @@ def print_context_plan(p, root, rmap, task):
     if s is None:
         print("Context: no provider installed")
         return
-    prompt = task_prompt(s["role"], task, root, s.get("write"), gdirs=sorted(generated_dirs(root)) if s.get("write") else ())
+    prompt = task_prompt(s["role"], task, root, s.get("write"), gdirs=sorted(generated_dirs(root)) if s.get("write") and p.get("repository_task") else ())
     print(f"ai-team → {s['provider']} T{s['tier']} ({s['role']}): ~{tok(prompt)} tokens")
     print("  " + prompt.replace("\n", "\n  "))
     print("The agent itself loads its system prompt and tools" + ("." if s["role"] == "answer" else
@@ -1301,10 +1251,10 @@ def show_project(root):
 ROUTING_HELP = """How ai-team routes (every decision is local, 0 tokens):
   status / providers / models / cost / project commands → T0 local answer
   git status/diff, run lint/tests/build               → T0 command
-  question about the repo → read-only agent · general question → answer, no tools · research → web tools
+  question about the repo → read-only agent · general question → native answer agent · research → native research agent
   review → read-only reviewer (T1 small, T2 risky) · plan / architecture → read-only (edits only with --apply)
-  change or fix → ONE agent with edits (the CLI's own sandbox): MICRO/SMALL → T1 · MEDIUM+ or long context → T2
-  after edits → the project's checks for the changed files (0 tokens) · risky diffs → one independent review
+  change or fix → ONE agent with actions (native CLI permissions): MICRO/SMALL → T1 · MEDIUM+ or long context → T2
+  after repository edits → the project's checks for the changed files (0 tokens) · risky diffs → one independent review
   agent fails → transient: retry · limit: cooldown + other provider · gave up: other provider · failed checks: retry, then tier up
 See any task's routing:  ai-team --plan "<task>"   ·   its prompt:  ai-team --context-plan "<task>\""""
 
@@ -1382,14 +1332,14 @@ class Run:
         self.dir.mkdir(parents=True, exist_ok=True)
         self.log, self.escalations, self.trace, self.gen_edits, self.t0 = [], [], [], [], time.time()
         self.fingerprints, self.base_cache, self.before, self.pre = {}, {}, None, {}
-        self.cmds = check_commands(root, rmap)  # never a mutating script as a check (e.g. `lint` = eslint --fix)
+        self.cmds = check_commands(root, rmap) if p.get("repository_task") else {}  # never a mutating script as a check (e.g. `lint` = eslint --fix)
         named = {k for k, rx in (("typecheck", r"type ?script|\bts\b|\btypes?\b|typecheck|type-check|\btsc\b|типиз"),
                                  ("lint", r"\blint|eslint|линт"), ("test", r"\btests?\b|тест"), ("build", r"\bbuild\b|compil|сборк"))
                  if re.search(rx, task, re.I)}
         maintenance = (p.get("signals") or {}).get("maintenance")
         # A check the task is about (every check, for "fix all errors") must pass outright: no baseline tolerance.
         self.strict = {c for k, c in self.cmds.items() if k in named or (maintenance and k != "format")}
-        self.gdirs = sorted(generated_dirs(root))
+        self.gdirs = sorted(generated_dirs(root)) if p.get("repository_task") else []
         (self.dir / "plan.json").write_text(redact(json.dumps({**p, "task": task}, indent=1, default=str)))
 
     def say(self, msg):
@@ -1418,7 +1368,7 @@ class Run:
             if out.get("status") in ("blocked", "failed") and any(x in available() and x not in tried for x in CFG["role_providers"][role]):
                 why = "; ".join(questions(out))[:300]
                 note = (f"\n\nNOTE: a previous {prov} attempt ended {out['status']}" + (f" ({why})" if why else "")
-                        + (". Check `git status` / `git diff` for its partial edits before continuing." if write else "."))
+                        + (". Check `git status` / `git diff` for its partial edits before continuing." if write and self.p.get("repository_task") else "."))
                 self.say(f"  ! {label}: {prov} could not complete the task — handing over to the next provider")
                 last = out
                 continue
@@ -1492,7 +1442,7 @@ class Run:
             return self.finish(False, changed(self.root, self.before), "skipped", [], str(e), header="BLOCKED", hint=hint)
 
     def _execute(self):
-        self.before = snapshot(self.root)
+        self.before = snapshot(self.root) if self.p.get("repository_task") else None
         for f in (self.before or {}):  # the user's own uncommitted work: remembered exactly, never attributed to ai-team
             fp = self.root / f
             self.pre[f] = fp.read_bytes() if fp.is_file() else None
@@ -1560,6 +1510,10 @@ class Run:
                     break
                 tier, at_tier, prov, evidence = new, 0, self.pick("implementer", new), str(out.get("summary") or out.get("answer") or "")[-800:]
                 continue
+            if not self.p.get("repository_task"):
+                if out.get("answer"):
+                    self.say("\n" + out["answer"])
+                return self.finish(True, [], "skipped", [], "native agent result; repository checks do not apply", answer=out)
             if not files:
                 if out.get("_unstructured"):  # nothing changed and no status line: not a confirmed result
                     self.say("\n" + ((out.get("answer") or "").strip()[-1500:] or "(no answer)"))
@@ -1959,7 +1913,9 @@ def main():
     a = ap.parse_args(argv)
     task = " ".join(a.task)
     p = plan(task, a.budget, a.complexity, root, a.apply)
-    rmap = {} if p.get("local") and p["intent"] != "TOOL" and p["signals"].get("meta") != "project" else load_map(root)
+    if not p.get("repository_task") and not p.get("local"):
+        root = Path.cwd()
+    rmap = load_map(root) if p.get("repository_task") or p["intent"] == "TOOL" or p["signals"].get("meta") == "project" else {}
     if a.plan and a.json:
         print(json.dumps(p, indent=1, ensure_ascii=False)); return 0
     if a.context_plan:

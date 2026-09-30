@@ -42,8 +42,7 @@
   "_cost_doc": "Comparative units, not money: fresh*w.fresh + cached*w.cached + output*w.output + seconds*w.seconds, divided by expected success (p for read-only roles, p\u00b2 for repo-mutating roles). Seeds are measured; history blends in with priors (cost prior = 5 samples, success prior = 8 samples) so a few runs never dominate.",
   "baseline_seed": {
     "codex": 12400,
-    "claude": 2400,
-    "claude_answer": 1100
+    "claude": 2400
   },
   "cached_seed": {
     "codex": 25000,
@@ -147,21 +146,6 @@
       "review": "always"
     }
   },
-  "codex_disable_features": [
-    "plugins",
-    "apps",
-    "browser_use",
-    "browser_use_external",
-    "computer_use",
-    "in_app_browser",
-    "image_generation",
-    "goals",
-    "tool_suggest",
-    "multi_agent"
-  ],
-  "codex_enable_features": [
-    "skip_host_skill_discovery"
-  ],
   "limits": {
     "max_attempts_per_tier": 2,
     "provider_retries": 1,

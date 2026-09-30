@@ -1,15 +1,15 @@
 # ai-team policy (`ai-team` applies it deterministically from `routing.json`; read only when orchestrating)
 
-ai-team is a router, not a problem-solving framework. It classifies the task, picks ONE native agent (Codex or Claude Code)
+ai-team is a universal model router for any task: coding, research, computer problems, IDEs, tools, configuration and general investigation. It classifies the task, picks ONE native agent (Codex or Claude Code)
 at the cheapest capable tier, passes the original task on, and handles failure. The agent solves the task with its own tools.
 
 ## 1. Classify (T0, 0 tokens)
 Intent, complexity, context size and needs (edits, web research) come from the task text and cheap repo facts.
 META / project facts / INSPECTION (git status, diff) / TOOL (run lint, tests, build) / review of a clean tree → local, 0 model calls.
-QUESTION → read-only (repo cues → explorer with tools; general → answer, no tools). RESEARCH → researcher with web tools.
-REVIEW → reviewer on the current diff. PLAN / ARCHITECTURE → architect, read-only (`--apply` implements the decision).
-"Find why X happens" → explorer (read-only diagnosis). Everything that changes the project → implementer.
-CRITICAL needs repo evidence (auth/payment/migration code exists), not keywords alone.
+QUESTION → read-only (repo cues → explorer with tools; general → native answer agent). RESEARCH → researcher with web tools.
+REVIEW → reviewer of the requested subject; explicitly repository-related reviews use the current diff. PLAN / ARCHITECTURE → architect, read-only (`--apply` implements the decision).
+"Find why X happens" → explorer (read-only diagnosis). Other action tasks → implementer (a native execution role, not a coding restriction).
+Repository tasks use code evidence for auth/payment/migration risk; unrelated tasks do not depend on repository evidence.
 
 ## 2. One agent, cheapest capable tier
 Edits start at T1 (MICRO/SMALL) or T2 (MEDIUM+); the economy budget starts one tier lower. Read-only roles start at T1
@@ -26,9 +26,11 @@ the cheapest eligible wins. Unavailable, broken or rate-limited providers are ne
 ## 4. The prompt
 The original task, untouched, plus a few router lines: non-interactive, permissions (read-only; or don't commit/push and never
 edit generated output) and a one-line JSON status contract. No project dump, role essay or workflow text: each CLI loads its
-own project instructions (AGENTS.md / CLAUDE.md → .ai/CONTEXT.md) and reads files itself. Codex runs in its own sandbox
-(read-only / workspace-write); Claude Code writers run in its Bash sandbox with acceptEdits, readers with read-only tools,
-`.env*` reads and `git push` denied. Fresh session per call; secrets are redacted before anything is written.
+own instructions and selects its native tools. Browser, computer, MCP, plugins, skills and user settings are inherited;
+ai-team does not disable capabilities to reduce prompt tokens or force a writer sandbox/permission mode.
+Read-only roles retain safety constraints: Codex read-only sandbox; Claude non-interactive read permissions with file
+mutation tools denied. General answers inherit native permissions. Fresh session per call; stored logs are redacted.
+
 
 ## 5. Failure handling
 rate limit → cooldown until the CLI's reported reset (default 60 min), next provider · transient (5xx, overloaded, network)
@@ -39,7 +41,8 @@ fingerprint three times → stop (REPEATED_FAILURE). An edit task with no change
 BLOCKED only when no provider can take the call, or the agent needs information only the user has.
 
 ## 6. Verification (T0, after edits)
-The project's own check commands for the changed files — never a mutating one (`--fix`, `--write`, `-u`, tsc without
+Only explicitly repository-related tasks use repository verification, generated-output protection and diff review.
+Non-project work succeeds from the native agent's result, without requiring a Git diff. The project's own check commands for the changed files — never a mutating one (`--fix`, `--write`, `-u`, tsc without
 `--noEmit`, or a script that calls them). nothing changed → none · docs/images → none · CSS → lint · copy JSON → parse ·
 code MICRO/SMALL → typecheck (+ a sibling test) · MEDIUM+ → typecheck + lint + tests · config → + build · CRITICAL → + build.
 Baseline-aware: failures that existed before the task don't fail it; a check the task is about ("fix the failing tests",

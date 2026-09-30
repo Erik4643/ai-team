@@ -353,45 +353,55 @@ class NativeExecution(Base):
                 Path(cmd[cmd.index("-o") + 1]).write_text('done\n{"status":"done"}')
                 return subprocess.CompletedProcess(cmd, 0, '{"usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3}}', "")
             return subprocess.CompletedProcess(cmd, 0, json.dumps({"result": "ok", "usage": {}}), "")
-        with patch.object(m.subprocess, "run", side_effect=fake_run), patch.object(m, "codex_lean_flags", return_value=["--disable", "plugins"]), \
-                patch.object(m, "_CODEX_KNOWN", {"web_search_request"}):
+        with patch.object(m.subprocess, "run", side_effect=fake_run):
             REAL_RUN_PROVIDER(provider, tier, "the task", write, role, Path(tempfile.mkdtemp()), "t", cwd="/repo", research=research)
         m.MODEL_CALLS[0] -= 1  # the command was captured, not executed
         self.assertEqual(captured["cwd"], "/repo")
         return captured["cmd"]
 
-    def test_codex_uses_its_own_sandbox_and_project_instructions(self):
-        w, r = self.command("codex", True), self.command("codex", False, "explorer")
-        self.assertEqual(w[w.index("-s") + 1], "workspace-write"); self.assertEqual(r[r.index("-s") + 1], "read-only")
-        self.assertNotIn("project_doc_max_bytes=0", w)                              # AGENTS.md → .ai/CONTEXT.md loads natively
-        self.assertNotIn("web_search_request", w)
-        self.assertIn("web_search_request", self.command("codex", False, "researcher", research=True))
+    def test_native_capabilities_are_preserved(self):
+        for provider in ("codex", "claude"):
+            for role, write in (("implementer", True), ("answer", False), ("researcher", False)):
+                c = self.command(provider, write, role)
+                for flag in ("--disable", "--strict-mcp-config", "--disable-slash-commands", "--tools",
+                             "--setting-sources", "--system-prompt", "--settings"):
+                    self.assertNotIn(flag, c)
+                self.assertFalse(any("enabled=false" in x for x in c))
+        self.assertNotIn("-s", self.command("codex", True))
+        self.assertNotIn("--permission-mode", self.command("claude", True))
 
-    def test_claude_writer_runs_freely_inside_its_bash_sandbox(self):
-        c = self.command("claude", True)
-        sandbox = json.loads(c[c.index("--settings") + 1])["sandbox"]
-        self.assertTrue(sandbox["enabled"] and sandbox["autoAllowBashIfSandboxed"] and not sandbox["allowUnsandboxedCommands"])
-        self.assertEqual(c[c.index("--permission-mode") + 1], "acceptEdits")
-        tools = c[c.index("--tools") + 1:c.index("--allowedTools")]
-        self.assertTrue({"Bash", "Edit", "Write", "Read"} <= set(tools))
-        self.assertNotIn("Bash", c[c.index("--allowedTools") + 1:c.index("--disallowedTools")])  # no allowlist: the sandbox decides
-        deny = c[c.index("--disallowedTools") + 1:]
-        self.assertIn("Read(./.env)", deny); self.assertIn("Bash(git push:*)", deny)
-        self.assertEqual(c[c.index("--setting-sources") + 1], "project,local")     # project CLAUDE.md → .ai/CONTEXT.md
-        self.assertIn("--strict-mcp-config", c)                                    # no user plugins/MCP: token cost
-
-    def test_claude_reader_is_read_only(self):
+    def test_explicit_reader_permissions(self):
+        c = self.command("codex", False, "explorer")
+        self.assertEqual(c[c.index("-s") + 1], "read-only")
         c = self.command("claude", False, "explorer")
         self.assertEqual(c[c.index("--permission-mode") + 1], "dontAsk")
-        tools = c[c.index("--tools") + 1:c.index("--allowedTools")]
-        self.assertFalse({"Edit", "Write"} & set(tools))
-        self.assertIn("Bash(git diff:*)", c); self.assertIn("Read(./.env)", c)
+        self.assertIn("WebSearch", c)
+        self.assertIn("Edit", c[c.index("--disallowedTools") + 1:])
 
-    def test_answers_and_research(self):
-        a = self.command("claude", False, "answer")
-        self.assertEqual((a[a.index("--tools") + 1], a[a.index("--setting-sources") + 1]), ("", ""))   # no tools, no project files
-        r = self.command("claude", False, "researcher", research=True)
-        self.assertTrue({"WebSearch", "WebFetch"} <= set(r))
+
+class UniversalRouter(Base):
+    def test_general_review_is_not_a_clean_tree_shortcut(self):
+        p = plan("review my travel itinerary")
+        self.assertFalse(p.get("local"))
+        self.assertFalse(p["repository_task"])
+        self.assertNotIn("git diff", m.task_prompt("reviewer", "review my itinerary"))
+
+    def test_nonrepo_tasks_skip_repository_verification(self):
+        for task in ("fix my Bluetooth connection", "configure my IDE settings", "create a travel itinerary"):
+            calls = stub({"implementer": "Completed the requested task."})
+            with patch.object(m, "snapshot", side_effect=AssertionError("repo snapshot")), \
+                 patch.object(m, "check_commands", side_effect=AssertionError("repo checks")), \
+                 patch.object(m, "generated_dirs", side_effect=AssertionError("repo outputs")):
+                rc, out, run = execute(task)
+            self.assertEqual(rc, 0, out)
+            self.assertEqual(len(calls), 1)
+            self.assertIn("Completed the requested task.", out)
+
+    def test_non_git_directory_routes(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = plan("research laptop troubleshooting", root=Path(d))
+            self.assertFalse(p.get("local"))
+            self.assertTrue(p["steps"])
 
 
 class SingleAgent(Base):
