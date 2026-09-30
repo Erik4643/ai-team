@@ -33,7 +33,10 @@ Both modes preserve application source and are idempotent. Backups retain three 
 ## Use
 
 ```bash
-ai-team "task"
+ai-team "fix all WebStorm errors"
+ai-team "implement this feature"
+ai-team "fix this bug"
+ai-team "review current changes"
 ai-team --plan "task"          # routing, no model calls
 ai-team --context-plan "task"  # context accounting, no model calls
 ai-team --cost
@@ -42,8 +45,6 @@ ai-team --doctor
 ai-team --self-test
 ai-team --version
 ai-team update                 # explicit fetch + fast-forward + validated install
-ai-team "fix Stylelint errors" # a named evidence source is REQUIRED: read and clean before DONE
-ai-team --evidence JETBRAINS_INSPECTION=./inspections "fix WebStorm inspection warnings"
 ```
 
 Update refuses a dirty working tree, detached HEAD or missing upstream. It does not overwrite local changes and never touches the current project. After an update that changed the kit, refresh each project with `ai-team init` (idempotent; project facts are preserved). Diagnostics, tests and installation do not call models. `--self-test --live` is an explicit opt-in to real calls.
@@ -52,7 +53,11 @@ Update refuses a dirty working tree, detached HEAD or missing upstream. It does 
 
 T0 handles triage, mapping, budgeting, verification and cost estimation. T1/T2 roles are selected by capability and expected cost; T3 is reserved for evidence-based escalation. Routing, cooldowns, baseline-aware checks, aggregate diagnostics and risk-based review remain deterministic. Review uses a fresh isolated session and is labeled cross-provider only when providers differ.
 
-**Diagnostic evidence.** A task that names a source — TypeScript, ESLint, Stylelint, tests, build, WebStorm/JetBrains inspections, Qodana, CI, a project custom check, or an unknown tool such as Sonar — makes it REQUIRED: it is read (T0, read-only) and the task is DONE only when it is clean. If it cannot be read (WebStorm keeps its results inside the running IDE), the task is BLOCKED before any check or model call, with the exact way to unblock it: `--evidence SOURCE=PATH` accepts SARIF, a JetBrains XML/JSON export, JUnit, JSON findings or tool/CI output. Broad maintenance uses the project's configured checks and needs none of these. Findings are normalized and classified (real source, generated, third-party, IDE false positive, spelling, configuration noise, low value); only real source findings reach an implementer. A new source is one module in `diagnostics/` that exports `ADAPTERS`; projects declare read-only checks in `.ai/repo-map.json` → `custom_checks`.
+**Agents and fallback.** Work is delegated to the native Codex and Claude Code CLIs, which use their own tools; ai-team only sets the role's sandbox and reads the result, usage and cost. The provider and tier come from the cost model and routing history. If a provider fails, the call moves along a fallback chain (inspired by claude-code-router): a rate limit cools the provider down until its reported reset, a transient error is retried once with backoff, an auth or CLI error takes the provider out for the run, and an agent that gives up hands over to the other provider. Verification failures retry and then escalate a tier. BLOCKED appears only when no provider can continue or the agents need information from you; `Fallbacks:` in the summary and `route.json` in the task state show what happened.
+
+**Diagnostics support normal tasks.** Missing IDE exports, tools or reports do not prevent a model from inspecting source and configuration and attempting the task. Available diagnostics localize repairs (zero tokens when everything readable is clean); verification follows implementation. A missing source is reported as not verified, never as proof that the IDE or remote CI is clean. Real check failures still matter, generated-file protection stays active, and existing user changes are preserved.
+
+`--evidence SOURCE=PATH` remains optional for reports you already have (SARIF, JetBrains exports, JUnit, JSON or tool output). Diagnostic adapters and project `custom_checks` remain supported. No special syntax or exported evidence is required for ordinary development tasks.
 
 Only the selected role and relevant guidance load. [Canonical capabilities](docs/CANONICAL_CAPABILITIES.md) lists the 15 capabilities. [Skill audit summary](docs/SKILL_INVENTORY.md) explains why the historical 4,661 definitions are not the runtime set. Graphify is optional and uses existing project graphs; `AI_TEAM_GRAPHIFY=off` disables it.
 

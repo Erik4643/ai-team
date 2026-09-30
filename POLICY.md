@@ -14,7 +14,7 @@ IMPLEMENTATION / DEBUG / ARCHITECTURE → complexity below. ARCHITECTURE stops a
 | MEDIUM | explorer T1 (skipped if paths given) → editor T2 → [reviewer if the diff warrants it] |
 | COMPLEX | explorer T1 → [architect T2 if evidence] → editor T2 → verify → [reviewer if risk] |
 | CRITICAL (needs repo evidence) | explorer → architect T2 → editor T2 → verify incl. build → reviewer T2, independent vendor |
-"Fix all errors" → T0 diagnostics grouped by file → bounded editor → the diagnostic re-runs as the acceptance check.
+"Fix all errors" → use available T0 diagnostics to localize repairs; if unavailable, let the selected model inspect source/configuration directly. Verify after implementation.
 Explorer evidence can reclassify MICRO..COMPLEX (down as well as up); CRITICAL is never entered or left automatically.
 
 ## 3. Gates (evidence, not keywords)
@@ -28,20 +28,25 @@ Docs-only and small verified diffs skip review. Economy reviews only CRITICAL or
 ## 4. Verification matrix (cheapest meaningful check)
 nothing changed → none · docs/images → none · CSS → lint · copy JSON → JSON parse · code (MICRO/SMALL) → typecheck (+ tests if a
 sibling test exists) · code (MEDIUM+ or ≥4 files) → typecheck + lint + tests · config → + lint + build · dependencies → typecheck + build ·
-CRITICAL → + build. Checks the user names always run.
+CRITICAL → + build. Run available checks the user names; explicitly report unavailable checks as verification limitations.
 
 ## 5. Providers (capability first, then cost)
 Expected cost = (observed baseline + our context + 0.1×cached + 4×output×effort + 30×seconds) ÷ p (read-only) or ÷ p² (edits).
 p = tier prior × capability (analysis, explore, edit, docs, architecture, review, debug, research), lowered when demand exceeds the
 tier, blended with history (prior 8 samples for success, 5 for cost; intent-specific history only from 5 samples up).
 Eligible = within 0.10 (edits) or 0.25 (others) of the best p; cheapest eligible wins. Unavailable, broken or rate-limited
-providers (60 min cooldown) are never selected.
+providers are never selected. Workers are the native Codex / Claude Code CLIs using their own tools; ai-team sets only the
+role's sandbox (read-only or workspace-write), sends one prompt per call and reads the result and usage.
 
 ## 6. Failures and escalation (reason codes)
 Same tier at most 2 attempts (T3: 1). Identical failure fingerprint three times → stop (REPEATED_FAILURE).
 Codes: LOW_CONFIDENCE, MULTIPLE_ROOT_CAUSES, SECURITY_RISK, CONCURRENCY_AMBIGUITY, ARCHITECTURE_CHANGE, CONFLICTING_EVIDENCE,
 FAILED_T1, FAILED_T2, INCOMPLETE_VERIFICATION. T3 only via: architect confidence < 0.6 on COMPLEX+, FAILED_T2, or a judge on
 unresolved review disagreement (question + both positions + diff only).
+Provider failures fall back along the role's provider chain: rate limit → cooldown until the CLI's reported reset (default 60 min);
+transient (5xx, overloaded, network) → one retry with backoff; auth/CLI error → provider off for the run; budget/turn limit or
+timeout → next provider for that call. An agent that answers blocked/failed hands over to the next provider. BLOCKED only when no
+provider can take the call or the agents need information only the user has.
 
 ## 7. Context
 Each call: role (≤0.1k) + one-line output schema + project sections the role needs (Rules always; facts for explorer/architect/
@@ -52,10 +57,10 @@ no timestamps or ids in prompts. Fresh sessions per call (no reuse across tasks)
 State: last 30 task dirs / 14 days; metrics rotate at 1000 runs and store numbers only.
 
 ## 8. Evidence (T0, `diagnostics/`)
-A source the task names (tool + findings word, or a fix verb: "Stylelint errors", "WebStorm inspection results", "CI failures"),
-supplied with `--evidence`, or required by a project custom check is REQUIRED; broad maintenance adds the configured checks.
-DONE only when every REQUIRED source was read clean; unreadable → BLOCKED before any model call, never inferred from other checks.
-Only REAL_SOURCE findings go to an implementer (generated, third-party, IDE false positives, spelling, config noise, low value never do).
+Named sources, supplied reports and project custom checks describe the desired verification coverage, not prerequisites for starting work.
+Unavailable or broken diagnostic sources trigger direct model inspection, with explicit verification limitations. Never infer clean IDE/CI results from another tool. Available actionable findings remain acceptance checks; findings from a supplied static report that were addressed are reported as not re-verified.
+Reserve BLOCKED for work that cannot proceed without genuinely required information, not a missing diagnostic export. Preserve zero-token planning, useful local checks and audits of readable reports.
+Only REAL_SOURCE diagnostic findings go to an implementer (generated, third-party, IDE false positives, spelling, config noise, low value never do). Direct inspection must also protect generated output and user changes.
 
 ## 9. Canonical capability loading
 `capabilities.json` lists owned runtime capabilities, not an alternative routing policy. Keep deterministic decisions in

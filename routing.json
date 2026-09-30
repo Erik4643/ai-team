@@ -223,6 +223,7 @@
   ],
   "limits": {
     "max_attempts_per_tier": 2,
+    "provider_retries": 1,
     "max_review_rounds": 1,
     "handoff_chars": 4000,
     "diff_chars": 24000,

@@ -1,4 +1,4 @@
-"""Evidence routing: task-dependent required sources, the early-exit rule, the adapter registry, supplied evidence, project
+"""Evidence routing: task-dependent diagnostic sources, model fallback, the adapter registry, supplied evidence, project
 custom checks and finding classes. No model calls: providers are stubbed (forbid() raises) and CLIs are faked."""
 import contextlib, hashlib, importlib.machinery, importlib.util, io, json, os, shutil, subprocess, sys, tempfile, unittest
 from pathlib import Path
@@ -104,45 +104,51 @@ class EvidenceRouting(Base):
         self.assertNotIn("JETBRAINS_INSPECTION", [r["source"] for r in p["diagnostics"]])
         self.assertTrue(self.marker.exists())                                   # the ordinary checks really ran
 
-    def test_explicit_webstorm_task_cannot_early_exit_on_tsc_eslint(self):
+    def test_missing_webstorm_evidence_starts_model_inspection(self):
         root = self.frontend()
+        self.stub()
         rc, out, p = self.run_task(root, WEBSTORM_TASK)
-        self.assertEqual(rc, 1)
-        self.assertIn("BLOCKED ·", out); self.assertNotIn("DONE ·", out)
-        self.assertIn("REQUIRED_EVIDENCE_UNAVAILABLE: JETBRAINS_INSPECTION", out)
-        self.assertIn("--evidence JETBRAINS_INSPECTION=", out)                  # precise unblock step
-        self.assertIn("Model calls: 0", out)
-        self.assertFalse(self.marker.exists())                                  # blocked before any check ran
-        rc, out, p = self.run_task(root, "Audit WebStorm project inspection results")  # read-only phrasing: local audit
-        self.assertTrue(p["evidence_audit"]); self.assertEqual(rc, 1); self.assertIn("BLOCKED ·", out)
+        self.assertEqual([role for role, _ in self.calls], ["implementer"], out)      # the model starts; no export demanded
+        self.assertIn("Not readable by ai-team here: JETBRAINS_INSPECTION", self.calls[0][1])
+        self.assertEqual(rc, 0, out); self.assertIn("DONE ·", out); self.assertNotIn("BLOCKED ·", out)
+        self.assertIn("JETBRAINS_INSPECTION not verified", out)                       # never reported as clean
+        self.calls.clear()
+        rc, out, p = self.run_task(root, "Audit WebStorm project inspection results")
+        self.assertEqual([role for role, _ in self.calls], ["explorer"], out)          # read-only inspection, no edits
+        self.assertEqual(rc, 0, out); self.assertNotIn("BLOCKED ·", out)
 
     def test_explicit_stylelint_task_makes_stylelint_required(self):
         root = git_repo({".ai/repo-map.json": {"commands": {"typecheck": "true", "lint": "true"}}, "src/app.css": ".a{}\n"})
         rows = m.plan("fix Stylelint errors", "balanced", None, root)["diagnostics"]
         self.assertEqual([(r["source"], r["need"], r["state"]) for r in rows], [("STYLELINT", "required", "unavailable")])
+        self.stub()
         rc, out, _ = self.run_task(root, "fix Stylelint errors")
-        self.assertEqual(rc, 1); self.assertIn("REQUIRED_EVIDENCE_UNAVAILABLE: STYLELINT", out)
+        self.assertTrue(self.calls, out); self.assertNotIn("BLOCKED ·", out)
+        self.assertEqual(rc, 0, out); self.assertIn("STYLELINT not verified", out)
         rows = {r["source"]: r for r in m.plan("fix all existing errors and warnings in this project", "balanced", None, root)["diagnostics"]}
         self.assertEqual((rows["STYLELINT"]["need"], rows["STYLELINT"]["state"]), ("optional", "not configured"))  # not a gap here
         node = git_repo({"package.json": {"scripts": {"lint:css": "stylelint \"**/*.css\" --fix"}}, "src/app.css": ".a{}\n"})
         row = m.plan("fix Stylelint errors", "balanced", None, node)["diagnostics"][0]
         self.assertEqual((row["state"], row["cmd"]), ("run", "npx stylelint '**/*.css'"))
 
-    def test_required_unavailable_blocks_and_optional_unavailable_warns(self):
+    def test_missing_source_falls_back_and_optional_unavailable_warns(self):
         root = git_repo({"package.json": {"scripts": {"typecheck": "tsc -b"}}, "src/a.ts": "x\n"})       # tsc -b: no read-only form
         clean = jetbrains_export([])
         rc, out, _ = self.run_task(root, "Audit WebStorm inspection results", {"JETBRAINS_INSPECTION": [str(clean)]})
         self.assertEqual(rc, 0, out)
         self.assertIn("DONE ·", out); self.assertIn("Verify:      PASS_WITH_WARNINGS", out)      # optional companion unavailable
+        self.stub()
         rc, out, _ = self.run_task(root, "Audit WebStorm inspection results")
-        self.assertEqual(rc, 1); self.assertIn("BLOCKED ·", out)                                  # required source unreadable
+        self.assertTrue(self.calls, out); self.assertNotIn("BLOCKED ·", out)
 
-    def test_blocked_result_needs_no_provider_cli(self):
+    def test_blocked_only_when_no_provider_can_continue(self):
         root = self.frontend()
         r = subprocess.run([sys.executable, str(KIT / "bin/ai-team"), "Fix WebStorm inspection errors"], cwd=root, capture_output=True, text=True,
                            env={**os.environ, "AI_KIT": str(KIT), "PATH": "/usr/bin:/bin", "AI_TEAM_PROVIDERS": "none"})
         self.assertEqual(r.returncode, 1)
-        self.assertIn("BLOCKED ·", r.stdout); self.assertNotIn("no active AI provider", r.stdout + r.stderr)
+        self.assertIn("BLOCKED ·", r.stdout); self.assertIn("no active AI provider", r.stdout + r.stderr)
+        self.assertNotIn("REQUIRED_EVIDENCE_UNAVAILABLE", r.stdout + r.stderr)
+        self.assertTrue(self.marker.exists())                                   # T0 diagnostics still ran without a provider
 
     def test_zero_provider_calls_for_planning_discovery_and_audits(self):
         root = self.frontend()
@@ -191,34 +197,38 @@ class EvidenceSources(Base):
         for cls in ("GENERATED_OUTPUT", "THIRD_PARTY", "IDE_FALSE_POSITIVE", "SPELLING", "LOW_VALUE_WARNING", "CONFIGURATION_NOISE"):
             self.assertIn(cls, out)
         self.assertEqual((root / "dist-dev/assets/index.css").read_text(), ".b{-webkit-box:1}\n")   # generated output protected
-        self.assertEqual(rc, 1)
-        self.assertIn("NOT DONE ·", out); self.assertIn("Verify:      PENDING_EVIDENCE", out)       # static evidence: re-read to verify
-        self.assertIn("--evidence JETBRAINS_INSPECTION=<new report>", out)
+        self.assertEqual(rc, 0, out)                                            # a static report can't be re-read: a warning, never a veto
+        self.assertIn("DONE ·", out); self.assertIn("Verify:      PASS_WITH_WARNINGS", out)
+        self.assertIn("addressed — not re-verified", out)
 
     def test_unknown_source_is_never_fabricated(self):
         root = self.frontend()
+        self.stub()
         rc, out, p = self.run_task(root, "fix all Sonar issues")
-        self.assertEqual(rc, 1)
-        self.assertIn("REQUIRED_EVIDENCE_UNAVAILABLE: SONAR", out); self.assertNotIn("DONE ·", out)
-        self.assertFalse(self.marker.exists())                                  # tsc/eslint results were not used as a substitute
+        self.assertTrue(self.calls, out)
+        self.assertEqual(rc, 0, out); self.assertNotIn("BLOCKED ·", out)
+        self.assertIn("SONAR not verified", out)                                # inspected, never fabricated as clean
         report = Path(tempfile.mkdtemp()) / "sonar.json"
         report.write_text(json.dumps({"diagnostics": []}))
         rc, out, _ = self.run_task(root, "fix all Sonar issues", {"SONAR": [str(report)]})
         self.assertEqual(rc, 0, out); self.assertIn("DONE ·", out)
 
-    def test_unreadable_evidence_blocks(self):
+    def test_unreadable_evidence_warns_and_uses_model(self):
         root = self.frontend()
         bad = Path(tempfile.mkdtemp()) / "notes.txt"
         bad.write_text("everything looks fine to me\n")
+        self.stub()
         rc, out, _ = self.run_task(root, "Audit WebStorm inspection results", {"JETBRAINS_INSPECTION": [str(bad)]})
-        self.assertEqual(rc, 1); self.assertIn("supplied evidence unreadable", out)
+        self.assertTrue(self.calls, out); self.assertNotIn("BLOCKED ·", out)
+        self.assertIn("supplied evidence unreadable", out)
 
     def test_ci_sources(self):
         deploy_only = git_repo({".gitlab-ci.yml": "build:\n  script:\n    - docker build --push -t x .\ndeploy:\n  script:\n  - git push\n",
                                 ".ai/repo-map.json": {"commands": {"typecheck": "true"}}})
+        self.stub()
         rc, out, _ = self.run_task(deploy_only, "Fix all CI validation failures")
-        self.assertEqual(rc, 1); self.assertIn("REQUIRED_EVIDENCE_UNAVAILABLE: CI_DIAGNOSTICS", out)
-        self.assertIn("remote pipeline results are not readable", out); self.assertIn("--evidence CI_DIAGNOSTICS=", out)
+        self.assertTrue(self.calls, out); self.assertNotIn("BLOCKED ·", out); self.assertEqual(rc, 0, out)
+        self.assertIn("remote pipeline results are not readable", out)
         gh = git_repo({"package.json": {"scripts": {"lint": "eslint . --fix", "deploy": "vercel --prod"}},
                        ".github/workflows/ci.yml": "jobs:\n  ci:\n    steps:\n      - run: npm ci\n      - run: npm run lint\n      - run: |\n          npm run deploy\n"})
         row = m.plan("Fix all CI validation failures", "balanced", None, gh)["diagnostics"][0]

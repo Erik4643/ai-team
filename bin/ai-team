@@ -430,8 +430,18 @@ def relevant_docs(task, rmap):
 DISABLED = set(x for x in os.environ.get("AI_TEAM_DISABLE", "").split(",") if x)
 BROKEN = set()
 COOLDOWN_FILE = KIT / "state" / "cooldown.json"
-LIMIT_RE = re.compile(r"usage limit|rate limit|quota|too many requests|\b429\b|credit balance", re.I)
 _AVAIL = {}
+# Provider failure classes (after claude-code-router's route-failure classifier: 429 → rate limit; 408/5xx/network → retryable;
+# 401/403 → client error). A rate limit cools the provider down until its reported reset, a transient error is retried once
+# with backoff, an auth/CLI error disables the provider for this run, and a budget/turn limit only skips it for the current
+# call. In every case the next capable provider takes over.
+FAILURES = (("rate_limit", R(r"usage limit|rate[ _-]?limit|quota|too many requests|\b429\b|credit balance|limit reached|hit your .{0,20}limit")),
+            ("auth", R(r"not logged in|please (run )?/?log ?in|invalid (api )?key|unauthori[sz]ed|\b40[13]\b|forbidden|authenticat\w*|"
+                       r"expired (token|session|credentials)")),
+            ("budget", R(r"max[_ ]?(budget|turns)|budget exceeded|context (length|window)|prompt is too long|too many tokens")),
+            ("transient", R(r"timed? ?out|timeout|overloaded|\b(500|502|503|504|529)\b|internal server error|bad gateway|service unavailable|"
+                            r"connection (reset|refused|error|closed)|econn\w+|network|stream (error|disconnected)|temporar\w+|try again")))
+SLEEP = time.sleep  # tests replace it
 
 
 def cooldowns():
@@ -451,6 +461,38 @@ def set_cooldown(provider, minutes=60):
     _AVAIL.clear()
 
 
+def failure_kind(text):
+    """Provider CLI failure → rate_limit | auth | budget | transient | fatal (first matching class)."""
+    return next((k for k, rx in FAILURES if rx.search(text or "")), "fatal")
+
+
+def retry_delay(text, attempt):
+    """Seconds before retrying a transient failure: the provider's own hint when it gives one, else 1, 2, 4 … (max 30 s)."""
+    m = re.search(r"(?:retry|try again)\D{0,20}?(\d+(?:\.\d+)?)\s*(ms|s|sec|secs|seconds?)\b", text or "", re.I)
+    delay = (float(m.group(1)) / (1000 if m.group(2).lower() == "ms" else 1)) if m else 2 ** (attempt - 1)
+    return max(0.0, min(30.0, delay))
+
+
+def cooldown_minutes(text, now=None):
+    """How long a rate-limited provider stays out: the reset its CLI reports (an epoch after "|", "in 2 hours 5 minutes",
+    "resets 3pm"), else 60 minutes; clamped to 5 minutes … 7 days."""
+    now, t = now or datetime.datetime.now(), text or ""
+    epoch = re.search(r"\|(\d{10})\b", t)
+    span = re.search(r"\bin\s+((?:\d+\s*(?:days?|d|hours?|hrs?|h|minutes?|mins?|m)\b[\s,]*(?:and\s+)?)+)", t, re.I)
+    clock = re.search(r"(?:resets?|try again)\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m\b", t, re.I)
+    if epoch:
+        mins = (int(epoch.group(1)) - now.timestamp()) / 60
+    elif span:
+        mins = sum(int(n) * {"d": 1440, "h": 60, "m": 1}[u[0].lower()] for n, u in re.findall(r"(\d+)\s*([a-z]+)", span.group(1), re.I))
+    elif clock:
+        at = now.replace(hour=int(clock.group(1)) % 12 + (12 if clock.group(3).lower() == "p" else 0), minute=int(clock.group(2) or 0),
+                         second=0, microsecond=0)
+        mins = ((at if at > now else at + datetime.timedelta(days=1)) - now).total_seconds() / 60
+    else:
+        mins = 60
+    return int(max(5, min(7 * 1440, mins)))
+
+
 def available():
     """Installed, not disabled, not broken this run, not cooling down. Cached for 30 s within a process."""
     key = (os.environ.get("AI_TEAM_PROVIDERS", ""), tuple(sorted(BROKEN)), int(time.time() // 30))
@@ -461,14 +503,6 @@ def available():
         _AVAIL[key] = [n for n, p in CFG["providers"].items()
                        if (not only or n in only) and n not in DISABLED and n not in BROKEN and n not in cool and shutil.which(p["bin"])]
     return list(_AVAIL[key])
-
-
-def pick_provider(role, avoid=None):
-    """Runtime fallback only (a provider failed). Normal selection is choose()."""
-    prefs = [p for p in CFG["role_providers"][role] if p in available()]
-    if avoid and any(p != avoid for p in prefs):
-        prefs = [p for p in prefs if p != avoid]
-    return prefs[0] if prefs else None
 
 
 _CODEX_FLAGS = None
@@ -511,6 +545,17 @@ def codex_lean_flags():
 
 class ProviderError(Exception):
     pass
+
+
+class NoProvider(Exception):
+    """No capable provider can take a call (none installed, all rate-limited or failing): the task truly cannot continue."""
+
+
+def no_provider(role, tried=()):
+    """→ NoProvider with a reason the user can act on."""
+    if not tried and not available():
+        return NoProvider("no active AI provider CLI found (codex or claude) — install or log in to one, then rerun")
+    return NoProvider(f"no working provider for {role}" + (f" (tried {', '.join(tried)})" if tried else ""))
 
 
 def ro_bash(extra=()):
@@ -900,8 +945,8 @@ def compare_checks(base_ok, base_out, after_ok, after_out):
             "new_lines": [araw[k] for k in new][:15]}
 
 
-STATUS_RANK = {"PASS": 0, "PASS_WITH_WARNINGS": 1, "PASS_WITH_BASELINE_FAILURES": 2, "PENDING_EVIDENCE": 3,
-               "FAIL": 4, "FAIL_NEW_ERRORS": 5, "FAIL_REGRESSION": 6, "BLOCKED": 7}
+STATUS_RANK = {"PASS": 0, "PASS_WITH_WARNINGS": 1, "PASS_WITH_BASELINE_FAILURES": 2,
+               "FAIL": 3, "FAIL_NEW_ERRORS": 4, "FAIL_REGRESSION": 5, "BLOCKED": 6}
 
 
 def verify_status(res):
@@ -919,8 +964,6 @@ def describe_check(r):
         return f"{r['cmd']} ⚠ " + (r.get("note") or "passed with warnings")
     if st == "BLOCKED":
         return f"{r['cmd']} BLOCKED: " + (r.get("note") or "check unavailable or misconfigured")
-    if st == "PENDING_EVIDENCE":
-        return f"{r['cmd']} … {r.get('note') or 'fresh evidence needed to verify'}"
     if st in ("FAIL_NEW_ERRORS", "FAIL_REGRESSION"):
         return f"{r['cmd']} ✗ {st}: {r['new']} new" + (f", {r['pre']} pre-existing" if r.get("pre") else "")
     return f"{r['cmd']} ✗"
@@ -996,7 +1039,8 @@ def diag_plan(task, root, rmap, evidence=None):
 
 
 def required_gaps(rows):
-    """REQUIRED sources that cannot be read: the task can never be DONE, so it BLOCKS before any check or model call."""
+    """REQUIRED sources ai-team cannot read here. They never stop a task: the model inspects them itself and they are
+    reported as not verified."""
     return [r for r in rows or [] if r.get("need", "required") == "required" and r["state"] == "unavailable"]
 
 
@@ -1011,7 +1055,7 @@ def parse_evidence(specs):
 
 
 def render_plan(rows):
-    """Evidence plan before anything runs, with the unblock steps for every REQUIRED source that cannot be read."""
+    """Evidence plan before anything runs; REQUIRED sources that cannot be read are flagged with an optional way to verify them."""
     lines = []
     for d in rows:
         what = d.get("cmd") or (", ".join(Path(e).name for e in d["evidence"]) if d.get("evidence") else "")
@@ -1019,10 +1063,12 @@ def render_plan(rows):
                      + (f"   ({d['note']})" if d.get("note") else ""))
     gaps = required_gaps(rows)
     if gaps:
-        lines.append("  ■ BLOCKED before any check or model call — REQUIRED_EVIDENCE_UNAVAILABLE: " + ", ".join(g["source"] for g in gaps))
+        lines.append("  ⚠ not readable here: " + ", ".join(g["source"] for g in gaps)
+                     + " — the model inspects source/configuration itself; reported as not verified")
         for g in gaps:
             steps = (g.get("unblock") or "").splitlines()
-            lines += [f"     unblock {g['source']}: {steps[0]}"] + [f"       {s}" for s in steps[1:]] if steps else []
+            if steps:
+                lines.append(f"     optional, to verify {g['source']}: {steps[0]}")
     return "\n".join(lines)
 
 
@@ -1157,7 +1203,8 @@ def restatus(r):
 
 
 def overall_state(results):
-    """DIRTY: a source has actionable findings. INCOMPLETE: a REQUIRED source could not be read (or nothing could).
+    """DIRTY: a source has actionable findings. INCOMPLETE: nothing actionable, but a REQUIRED source could not be read (or
+    nothing could) — the model then inspects the project itself; it is never a reason to stop.
     CLEAN_WITH_WARNINGS: all that ran is clean, but an OPTIONAL source was unavailable/misconfigured or only noise was
     found. CLEAN: every selected source was read and is clean."""
     if any(r.get("status") == "FAIL" for r in results):
@@ -1175,23 +1222,27 @@ def group_key(r, f):
     return f"{r.get('source') or r['cat'].upper()} {f.get('code') or ''} {tmpl}".strip()
 
 
+def unreadable(r):
+    """A selected diagnostic source ai-team could not read here (unavailable, or the check itself is misconfigured)."""
+    return r["state"] == "unavailable" or r.get("status") == "BROKEN"
+
+
 def diag_vres(results, addressed=frozenset()):
-    """Evidence results → verification rows that agree with overall_state: a REQUIRED gap is BLOCKED, an OPTIONAL gap or
-    noise-only source is a warning, static evidence whose findings were all addressed is PENDING_EVIDENCE (it can only be
-    re-verified by fresh evidence) — so "NOT DONE" never sits next to "PASS" and "DONE" never next to "BLOCKED"."""
+    """Evidence results → verification rows. Only actionable findings fail. A source that could not be read, a noise-only
+    source and a supplied report whose findings were all addressed are warnings (not verified): diagnostics support the
+    task and never veto finished work, and "DONE" never sits next to a failing row."""
     out = []
     for r in results:
-        need, label = r.get("need", "required"), r.get("source") or r["cat"]
-        if r["state"] == "unavailable" or r.get("status") == "BROKEN":
-            what = "UNAVAILABLE" if r["state"] == "unavailable" else "misconfigured"
-            out.append({"cmd": r.get("cmd") or label, "ok": need != "required", "s": r.get("s", 0), "tail": r.get("note", ""),
-                        "status": "BLOCKED" if need == "required" else "PASS_WITH_WARNINGS",
-                        "note": f"{label} {what} ({need}): {r.get('note') or 'no readable evidence'}"})
+        label = r.get("source") or r["cat"]
+        if unreadable(r):
+            what = "not readable here" if r["state"] == "unavailable" else "check misconfigured"
+            out.append({"cmd": r.get("cmd") or label, "ok": True, "s": r.get("s", 0), "tail": r.get("note", ""), "status": "PASS_WITH_WARNINGS",
+                        "note": f"{label} not verified ({r.get('need', 'required')}, {what})" + (f": {r['note']}" if r.get("note") else "")})
         elif r.get("status") in NOISE_STATUSES:
             out.append({"cmd": r.get("cmd") or label, "ok": True, "s": r.get("s", 0), "tail": "", "status": "PASS_WITH_WARNINGS", "note": r["note"]})
         elif r.get("status") == "FAIL" and r.get("static") and {group_key(r, f) for f in r.get("findings") or [] if f.get("actionable")} <= set(addressed):
-            out.append({"cmd": label, "ok": False, "s": 0, "tail": "", "status": "PENDING_EVIDENCE",
-                        "note": f"{r['errors']} finding(s) from static {label} evidence addressed; only fresh {label} evidence can verify them"})
+            out.append({"cmd": label, "ok": True, "s": 0, "tail": "", "status": "PASS_WITH_WARNINGS",
+                        "note": f"{r['errors']} finding(s) from the supplied {label} report addressed — not re-verified (a fresh report would confirm)"})
         elif r.get("status"):
             out.append({"cmd": r.get("cmd") or label, "ok": r["status"] == "PASS", "s": r.get("s", 0), "tail": "",
                         "status": "PASS" if r["status"] == "PASS" else "FAIL", "pre": r["errors"], "new": 0, "fixed": 0})
@@ -1231,7 +1282,8 @@ def render_diags(results):
         if r["state"] == "not configured":
             lines.append(head + "skipped — not configured" + (f" ({r['note']})" if r.get("note") else ""))
         elif r["state"] == "unavailable":
-            lines.append(head + f"UNAVAILABLE — {r['note']}" + (" → blocks" if need == "REQUIRED" else " → warning, does not block"))
+            lines.append(head + f"UNAVAILABLE — {r['note']}" + (" → not verified; the model inspects it directly" if need == "REQUIRED"
+                                                                else " → warning, does not block"))
         elif r.get("status") is None:
             lines.append(head + (f"deferred until static checks are clean ({what})" if r["state"] == "deferred" else f"planned: {what}"))
         elif r["status"] == "BROKEN":
@@ -1422,18 +1474,20 @@ def plan(task, budget, forced=None, root=None, apply=False, evidence=None):
             "cross_review": rank(cx) >= rank(b["cross_review_from"]), "evidence": evidence or None}
     ctx = DIAG.Context(root, load_map(root), task, evidence) if root is not None and intent not in ("META", "INSPECTION", "TOOL") else None
     if ctx is not None and intent in ("REVIEW", "QUESTION", "UNKNOWN") and (sig.get("audit") or evidence):
-        # read-only evidence audit: T0, 0 model calls; BLOCKED when a named source cannot be read
-        return dict(base, local=True, evidence_audit=True, diagnostics=DIAG.plan_rows(task, ctx, supplied=evidence))
+        # Read-only question about named sources: read them locally (T0); a read-only explorer only if one can't be read.
+        base.update(evidence_audit=True, diagnostics=DIAG.plan_rows(task, ctx, supplied=evidence))
     if evidence and intent in CODE_INTENTS and sig.get("fix_only"):
         sig["aggregate"] = True
-    if intent == "REVIEW" and root is not None:
+    if intent == "REVIEW" and root is not None and not base.get("evidence_audit"):
         rt, rcls, rwhy = review_size(root)
         base.update(review_class=rcls, review_reason=rwhy)
         if rt == 0 and not (rcls == "DOCS" and budget == "quality"):
             return dict(base, local=True, complexity="TRIVIAL")
     if intent in ("META", "INSPECTION", "TOOL"):
         return dict(base, local=True)
-    if intent == "QUESTION":
+    if base.get("evidence_audit"):
+        pipe = {"explorer": 1}
+    elif intent == "QUESTION":
         pipe = {"explorer" if REPO_CUE.search(task) or sig["paths"] else "answer": 1}
     elif intent == "UNKNOWN":
         pipe = {"explorer": 1, "implementer": 1}
@@ -1467,7 +1521,7 @@ def plan(task, budget, forced=None, root=None, apply=False, evidence=None):
             pipe["researcher"] = 1
     if ctx is not None and intent in CODE_INTENTS and not sig.get("aggregate"):
         gate = [r for r in DIAG.plan_rows(task, ctx, supplied=evidence) if r["need"] == "required"]
-        if gate:  # the task depends on named evidence: it is read (T0) before DONE; unreadable → BLOCKED before any model call
+        if gate:  # Check named sources after work; unavailable sources limit verification, not execution.
             base["evidence_gate"] = gate
     rmap = ctx.rmap if ctx is not None else {}
     impl_provider, g = None, CFG["gates"]["architect"]
@@ -1487,6 +1541,9 @@ def plan(task, budget, forced=None, root=None, apply=False, evidence=None):
         step = {"role": role, "tier": tier, "provider": best["provider"], "model": spec["model"], "effort": spec.get("effort"),
                 "est": round(best["E"]), "ctx": ctx, "ctx_parts": {k: v for k, v in sizes.items() if not k.startswith("_")},
                 "why": explain(ranked, implementer=impl_provider if role == "reviewer" else None), "stage": "required", "trigger": "", "likely": True}
+        if role == "explorer" and base.get("evidence_audit"):
+            step.update(stage="conditional", trigger="only if a named source can't be read locally (then it inspects the project read-only)",
+                        likely=bool(required_gaps(base["diagnostics"])))
         if role == "architect" and intent in ("IMPLEMENTATION", "DEBUG") and cx != "CRITICAL" and "explorer" in pipe:
             thr = g["min_confidence_high_risk"] if sig.get("high_risk") else g["min_confidence"]
             step.update(stage="conditional", trigger="if " + ARCH_TRIGGER.format(c=thr, s=g["max_subsystems"], f=g["max_files"]),
@@ -1500,7 +1557,7 @@ def plan(task, budget, forced=None, root=None, apply=False, evidence=None):
             elif sig["analysis_first"]:
                 step.update(stage="conditional", trigger="if the diagnosis finds a required change", likely=True)
             elif sig["maintenance"]:
-                step["trigger"] = "after T0 aggregate diagnostics; skipped only if ALL required checks are clean"
+                step["trigger"] = "after T0 diagnostics: fixes their findings, or inspects directly if a source can't be read; skipped if all is clean"
         if role == "reviewer" and intent == "REVIEW" and base.get("review_reason"):
             step["why"] = f"{base['review_class']} review: {base['review_reason']}; " + step["why"]
         if role == "reviewer" and intent != "REVIEW":
@@ -1521,8 +1578,7 @@ def print_plan(p, root, rmap, task):
     if p["signals"].get("note"):
         print(f"Note:   {p['signals']['note']}")
     if p.get("evidence_audit"):
-        print("  T0 evidence audit (read-only; 0 model calls; a REQUIRED source that cannot be read → BLOCKED):\n" + render_plan(p["diagnostics"]))
-        return
+        print("  T0 evidence audit (read-only; readable sources are read locally with 0 model calls):\n" + render_plan(p["diagnostics"]))
     if p.get("local"):
         what = {"META": f"local answer ({p['signals'].get('meta', 'status')})", "INSPECTION": "git status / diff --stat",
                 "REVIEW": p.get("review_reason", "nothing to review"),
@@ -1530,15 +1586,12 @@ def print_plan(p, root, rmap, task):
         print(f"  T0 {what} — 0 model calls, 0 tokens; verify skipped")
         return
     llm = [s for s in p["steps"] if s["provider"]]
-    if p.get("diagnostics") is not None:
-        print("  T0 evidence plan (read-only; REQUIRED sources must be read and clean before DONE · OPTIONAL unavailable → warning):")
+    if p.get("diagnostics") is not None and not p.get("evidence_audit"):
+        print("  T0 diagnostics (read-only; they guide the model and never stop it):")
         print(render_plan(p["diagnostics"]))
     if p.get("evidence_gate"):
-        print("  T0 evidence gate (REQUIRED sources read before DONE; unreadable → BLOCKED before any model call):")
+        print("  Post-work checks (sources the task names; unreadable ones are reported as not verified):")
         print(render_plan(p["evidence_gate"]))
-    if required_gaps(p.get("diagnostics") or p.get("evidence_gate")):
-        print("Cost:   0 model calls — BLOCKED until the REQUIRED evidence above can be read")
-        return
     for s in p["steps"]:
         if not s["provider"]:
             print(f"  T{s['tier']} {s['role']:<11} SKIPPED — {s['note']}")
@@ -1689,13 +1742,14 @@ ROUTING_HELP = """How ai-team routes (every decision is local, 0 tokens):
   COMPLEX/CRITICAL → explorer → [architect if evidence] → editor → verify → [review if risk]
   "fix all errors" → T0 diagnostics first, grouped by file, then a bounded fix
   failures → retry once with the error, then one tier up with a reason code; T3 at most once
+  provider down → rate limit: cooldown + other provider · transient: 1 retry with backoff · auth/CLI error: other provider
 See any task's routing:  ai-team --plan "<task>"   ·   its context:  ai-team --context-plan "<task>\""""
 
 
-def record(root, p, log, ok, review, vres, vreason, tdir, dur, escalations, pruned=()):
+def record(root, p, log, ok, review, vres, vreason, tdir, dur, escalations, pruned=(), fallbacks=0):
     rec = {"ts": datetime.datetime.now().isoformat(timespec="seconds"), "repo": root.name, "intent": p["intent"],
            "complexity": p["complexity"], "budget": p["budget"], "steps": log, "escalations": escalations, "ok": ok,
-           "review": review, "verify": [r["ok"] for r in vres], "verify_status": verify_status(vres) if vres else None, "verify_reason": vreason, "s": dur, "pruned": list(pruned),
+           "review": review, "verify": [r["ok"] for r in vres], "verify_status": verify_status(vres) if vres else None, "verify_reason": vreason, "s": dur, "pruned": list(pruned), "fallbacks": fallbacks,
            "state": str(tdir.relative_to(root)) if tdir else None}
     mp = KIT / "state" / "metrics.jsonl"
     mp.parent.mkdir(exist_ok=True)
@@ -1771,51 +1825,108 @@ class Run:
         self.last, self.pruned, self.fingerprints = {}, [], {}
         self.cmds = check_commands(root, rmap)  # never a mutating script as a check (e.g. `lint` = eslint --fix)
         self.diag_cmd, self._ctx, self.gen_edits, self.gate_done, self.strict_cmds = None, None, [], False, set()
+        self.trace, self.passed = [], set()  # provider attempts (route trace) · check commands known to pass on the current tree
         self.before, self.pre, self.base_cache = None, {}, {}
         (self.dir / "plan.json").write_text(redact(json.dumps({**p, "task": task}, indent=1, default=str)))
 
     def say(self, msg):
         print(msg, flush=True)
 
+    def allow_cmds(self):
+        """Project checks a Claude writer may run itself (never dev servers: they do not exit)."""
+        return [c for k, c in self.cmds.items() if k in ("typecheck", "lint", "test", "build", "format")]
+
     def agent(self, role, tier, handoff, provider=None, write=False, label=None, avoid=None, extra="", attempt=1):
+        """Delegate one turn to a native agent CLI. As with ACP agents, the agent owns its model, tools and execution; ai-team
+        sets the role's sandbox, sends one prompt and reads the result and usage. Fallback chain (as in claude-code-router):
+        the chosen provider, then the other providers in role order. An agent that cannot complete the role hands over to
+        the next one; if none can, the last answer is returned. No provider left at all → NoProvider (the task is BLOCKED)."""
         label = label or role
-        tried = []
+        gdirs = sorted(self.gen().dirs) if write else []
+        if gdirs:
+            handoff += f"\nNever edit generated output ({', '.join(d + '/' for d in gdirs)}); fix the source that produces it."
         prompt, sizes = build_prompt(role, handoff, self.root, self.rmap, self.p["complexity"], extra, files_known=bool(self.st["files"]))
         ctx = sum(v for k, v in sizes.items() if not k.startswith("_"))
         (self.dir / f"input-{label}.md").write_text(redact(prompt))
         if sizes.get("_trimmed"):
             self.say(f"  ! {label}: over the {self.p['complexity']} context budget — trimmed (repo map, project, docs, then diff)")
+        tried, last, note = [], None, ""
         while True:
-            prov = provider if provider and provider in available() and provider not in tried else pick_provider(role, avoid=avoid)
-            if prov in tried:
-                prov = next((x for x in CFG["role_providers"][role] if x in available() and x not in tried), None)
-            if not prov:
-                raise SystemExit(f"ai-team: no working provider for {role} (tried {tried or 'none'})")
+            cands = [x for x in dict.fromkeys(([provider] if provider else []) + CFG["role_providers"][role]) if x in available() and x not in tried]
+            if avoid and any(x != avoid for x in cands):
+                cands = [x for x in cands if x != avoid]  # cross-provider review is a preference, never a reason to stop
+            if not cands:
+                if last is not None:
+                    return last
+                raise no_provider(role, tried)
+            prov = cands[0]
             tried.append(prov)
-            t0 = time.time()
-            self.say(f"  … {label:<16} {prov} T{tier}")
-            try:
-                text, usage, model = run_provider(prov, tier, prompt, write, role, self.dir, label, list(self.cmds.values()), cwd=self.root)
-            except (ProviderError, subprocess.TimeoutExpired) as e:
-                msg = str(e).strip().splitlines()[-1][:160] if str(e).strip() else "timeout"
-                if LIMIT_RE.search(str(e)):
-                    set_cooldown(prov); msg = "usage/rate limit — excluded for 60 min"
-                self.say(f"  ! {label}: {prov} failed ({msg}) — falling back")
-                BROKEN.add(prov); provider = None
+            out = self.call(prov, role, tier, prompt + note, write, label, attempt, ctx, sizes, gdirs)
+            if out is None:  # provider failure: classified and handled in call(); the next provider takes over
                 continue
+            gave_up = out.get("status") in ("blocked", "failed") and not (out.get("_unstructured") and not write)
+            if gave_up and any(x in available() and x not in tried for x in CFG["role_providers"][role]):
+                why = "; ".join(str(q) for q in (out.get("open_questions") or out.get("unresolved_questions") or []))[:300]
+                note = (f"\n\nNOTE: a previous {prov} attempt ended {out.get('status')}" + (f" ({why})" if why else "")
+                        + (". Check `git status` / `git diff` for its partial edits before continuing." if write else "."))
+                self.say(f"  ! {label}: {prov} could not complete the role — handing over to the next provider")
+                last = out
+                continue
+            return out
+
+    def call(self, prov, role, tier, prompt, write, label, attempt, ctx, sizes, gdirs):
+        """One provider turn. A transient failure is retried with backoff; a rate limit cools the provider down until its
+        reported reset; an auth or CLI error disables it for this run; a budget/turn limit or timeout skips it for this call.
+        Edits to generated output are reverted after every attempt. → parsed output, or None if this provider failed."""
+        retries = LIM.get("provider_retries", 1)
+        for n in range(retries + 1):
+            t0 = time.time()
+            self.say(f"  … {label:<16} {prov} T{tier}" + (f" (retry {n})" if n else ""))
+            gsnap = gen_snapshot(self.root, gdirs) if gdirs else {}
+            try:
+                text, usage, model = run_provider(prov, tier, prompt, write, role, self.dir, label, self.allow_cmds(), cwd=self.root)
+            except (ProviderError, subprocess.TimeoutExpired, OSError) as e:
+                timeout = isinstance(e, subprocess.TimeoutExpired)
+                err = "timeout" if timeout else str(e).strip()
+                kind = "budget" if timeout else failure_kind(err)
+                msg = (err.splitlines() or [kind])[-1][:160]
+                self.trace.append({"label": label, "provider": prov, "tier": tier, "result": kind, "s": round(time.time() - t0)})
+                if kind == "transient" and n < retries:
+                    delay = retry_delay(err, n + 1)
+                    self.say(f"  ! {label}: {prov} transient failure ({msg}) — retry in {delay:.0f}s")
+                    SLEEP(delay)
+                    continue
+                if kind == "rate_limit":
+                    mins = cooldown_minutes(err)
+                    set_cooldown(prov, mins)
+                    msg = f"usage/rate limit — cooling down {mins} min"
+                elif kind in ("auth", "fatal"):
+                    BROKEN.add(prov)
+                self.say(f"  ! {label}: {prov} failed [{kind}] ({msg}) — falling back")
+                return None
+            finally:
+                if gdirs:
+                    restored, lost = gen_restore(self.root, gdirs, gsnap)
+                    if restored or lost:
+                        self.gen_edits += restored + lost
+                        self.say(f"  ! {role} edited generated output ({', '.join((restored + lost)[:3])}); restored"
+                                 + (f", {len(lost)} not restorable — rebuild them" if lost else "") + "; only source is fixed")
             out = parse_output(text, role)
             out.update({"_provider": prov, "_model": model, "_tier": tier, "_usage": usage, "_s": round(time.time() - t0)})
             (self.dir / f"{label}.json").write_text(redact(json.dumps(out, indent=1, ensure_ascii=False)))
             parts = {k: v for k, v in sizes.items() if not k.startswith("_")}
+            ok = out.get("status") in ("done", "no_change", "needs_change")
             self.log.append({"role": role, "provider": prov, "model": model, "tier": tier, "status": out.get("status"), "attempt": attempt,
                              "in": usage["in"], "cached": usage["cached"], "out": usage["out"], "usd": usage["usd"], "s": out["_s"],
-                             "ctx": ctx, "ctx_parts": parts, "ok": out.get("status") in ("done", "no_change", "needs_change")})
-            self.say(f"  {'✓' if out.get('status') in ('done', 'no_change', 'needs_change') else '✗'} {label:<16} {prov}/{model} T{tier}"
+                             "ctx": ctx, "ctx_parts": parts, "ok": ok})
+            self.trace.append({"label": label, "provider": prov, "tier": tier, "result": out.get("status") or "done", "s": out["_s"]})
+            self.say(f"  {'✓' if ok else '✗'} {label:<16} {prov}/{model} T{tier}"
                      f"  fresh {usage['in'] / 1000:.1f}k · cached {usage['cached'] / 1000:.1f}k · out {usage['out'] / 1000:.1f}k"
                      + (f" · ${usage['usd']:.3f}" if usage["usd"] else "") + f" · {out['_s']}s")
             self.say(f"      ours ~{ctx / 1000:.1f}k (" + " · ".join(f"{k} {v / 1000:.1f}k" for k, v in parts.items())
                      + f") · provider baseline + tool turns ~{max(0, usage['in'] + usage['cached'] - ctx) / 1000:.1f}k")
             return out
+        return None
 
     def absorb(self, out):
         self.st["findings"] += [str(x) for x in out.get("findings", [])][:10]
@@ -1894,84 +2005,100 @@ class Run:
         (self.dir / "diagnostics-baseline.json").write_text(json.dumps(rows, indent=1, default=str))
 
     def diag_reason(self, results, ok, text):
-        gap = lambda r: r["state"] == "unavailable" or r.get("status") == "BROKEN"  # noqa: E731
         label = lambda r: r.get("source") or r["cat"]  # noqa: E731
         if not ok:
-            text += " (NOT clean: " + ", ".join(label(r) for r in results if r.get("status") == "FAIL"
-                                                 or (gap(r) and r.get("need", "required") == "required")) + ")"
-        warn = [f"{label(r)} unavailable (optional)" for r in results if gap(r) and r.get("need", "required") == "optional"]
+            text += " (NOT clean: " + ", ".join(label(r) for r in results if r.get("status") == "FAIL") + ")"
+        warn = [f"{label(r)} not verified" if r.get("need", "required") == "required" else f"{label(r)} unavailable (optional)"
+                for r in results if unreadable(r)]
         warn += [f"{label(r)}: {r['note']}" for r in results if r.get("status") in NOISE_STATUSES]
         return (text + (" · warnings: " + "; ".join(warn) if warn else "")
                 + (f" · {len(self.gen_edits)} generated-file edit(s) reverted" if self.gen_edits else ""))
 
-    def block(self, rows, gaps):
-        """REQUIRED_EVIDENCE_UNAVAILABLE: stop before any check or model call and say exactly what would unblock the task."""
-        self.say("  T0 evidence plan:\n" + render_plan(rows))
-        ids = ", ".join(g["source"] for g in gaps)
-        vres = [{"cmd": g["source"], "ok": False, "s": 0, "tail": g.get("note", ""), "status": "BLOCKED",
-                 "note": f"REQUIRED_EVIDENCE_UNAVAILABLE — {g.get('note') or 'no readable evidence'}"} for g in gaps]
-        hint = "\n".join(f"{g['source']}: {g['unblock']}" for g in gaps if g.get("unblock"))
-        return self.finish(False, [], "skipped", vres, f"REQUIRED_EVIDENCE_UNAVAILABLE: {ids}", header="BLOCKED", hint=hint)
+    def limit_note(self, results):
+        """Tell the model which sources ai-team could not read, so it inspects them itself and never claims them verified."""
+        names = ", ".join(dict.fromkeys(r.get("source") or r["cat"] for r in results if unreadable(r) and r.get("need", "required") == "required"))
+        if names:
+            self.st["findings"].append(f"Not readable by ai-team here: {names}. Inspect the relevant source and configuration yourself; "
+                                       f"do not report {names} as verified.")
+        return names
+
+    def direct_inspection(self, steps, cons, rows, results):
+        """Nothing actionable was found, but a source the task needs could not be read here (WebStorm keeps its inspection
+        results inside the IDE, a lint script only has a --fix form, a CI log was not supplied …). Diagnostics support the
+        task, they never gate it: the implementer inspects source and configuration with its own tools and attempts the task.
+        Readable checks verify the result afterwards; the unreadable ones are reported as not verified."""
+        names = self.limit_note(results) or "no diagnostic source could be read"
+        if names.startswith("no "):
+            self.st["findings"].append("No diagnostic source could be read here: inspect the project yourself.")
+        self.say(f"  → direct inspection ({names}): the model inspects the project itself; checks run afterwards")
+        self.p["evidence_gate"] = [r for r in rows if r.get("need", "required") == "required"]
+        self.strict_cmds |= {r["cmd"] for r in self.p["evidence_gate"] if r["state"] in RUN_STATES and r.get("cmd")
+                             and not (r.get("cmds") or r.get("output") or r.get("evidence"))}
+        impl = steps.get("implementer")
+        if not impl or not impl.get("provider"):
+            raise no_provider("implementer")
+        work = [{"files": sorted(self.st["files"]), "action": "Inspect the relevant source and configuration yourself and fix the real issues this task is about."}]
+        return self.implement(impl, work, steps, self.before, cons)
 
     def evidence_audit(self):
-        """Read-only evidence audit (T0, 0 model calls): read every selected source, classify, group by root cause, report."""
+        """Read-only question about named sources ("audit the WebStorm results", "what are the Sonar issues?"). Readable
+        sources are read here (T0, 0 model calls) and reported grouped by root cause. If a named source cannot be read, a
+        read-only explorer inspects the source and configuration instead and says what it could not verify."""
         rows = self.evidence_rows()
-        gaps = required_gaps(rows)
-        if gaps:
-            return self.block(rows, gaps)
         results = self.run_diagnostics(rows)
         state = overall_state(results)
         self.save_baseline(results)
         notes = generated_notes(self.root, self.gen(), (self.p.get("signals") or {}).get("paths", []))
-        self.say("  T0 evidence audit (read-only, 0 model calls):\n" + render_diags(results) + "".join("\n" + x for x in notes) + f"\n  Overall: {state}")
-        for g in group_diags(results, is_gen=self.gen()):
+        self.say("  T0 evidence audit (read-only):\n" + render_diags(results) + "".join("\n" + x for x in notes) + f"\n  Overall: {state}")
+        groups = group_diags(results, is_gen=self.gen())
+        for g in groups:
             self.say(f"  group ×{g['count']:<4} {g['key'][:90]}  ({len(g['files'])} file(s))  e.g. {g['example'][:120]}")
+        names = self.limit_note(results)
+        if names or state == "INCOMPLETE":
+            self.st["findings"] += ([("ai-team read: " + ", ".join(f"{r.get('source') or r['cat']} {r['status']}" for r in results if r.get("status")))]
+                                    + [f"{g['key']} ×{g['count']} (e.g. {g['example'][:100]})" for g in groups[:8]])
+            step = next((s for s in self.p["steps"] if s["role"] == "explorer" and s.get("provider")), {"tier": 1, "provider": None})
+            out = self.agent("explorer", step["tier"], make_handoff(self.task, self.st, "Answer the task read-only from the project itself; "
+                                                                    "say what you could not verify."), provider=step["provider"])
+            return self.answer_only(out, "direct inspection" + (f"; not verified: {names}" if names else ""))
         ok = state in CLEAN_STATES
-        header = "DONE" if ok else "FINDINGS" if state == "DIRTY" else "BLOCKED"
-        return self.finish(ok, [], "skipped", diag_vres(results), self.diag_reason(results, ok, "evidence audit"), header=header,
-                           hint="to fix them, ask for a fix with the same sources/evidence, e.g. ai-team \"fix <source> findings\"" if state == "DIRTY" else "")
+        return self.finish(ok, [], "skipped", diag_vres(results), self.diag_reason(results, ok, "evidence audit"),
+                           header="DONE" if ok else "FINDINGS", hint="to fix them: ai-team \"fix <source> findings\"" if state == "DIRTY" else "")
 
     def evidence_gate(self, ok, vres, vreason):
-        """Early-exit rule, at the one place every DONE passes: each REQUIRED evidence source of this task must have been read
-        clean. Evidence-driven paths (repair, audit) already did that; other paths read the sources now (T0).
+        """Post-work checks for the sources this task names, at the one place every DONE passes. Readable sources not already
+        verified in this run are re-read: real failures make the task NOT DONE. A source that cannot be read here, or a
+        supplied report that cannot be re-read, is reported as not verified; it never vetoes finished work.
         → (ok, vres, vreason, header, hint)"""
-        gate = [r for r in self.p.get("evidence_gate") or [] if r.get("need") == "required"]
+        gate = [r for r in self.p.get("evidence_gate") or [] if r.get("need") == "required"
+                and not (r.get("cmd") in self.passed and not (r.get("cmds") or r.get("output") or r.get("evidence")))]
         if not ok or not gate or self.gate_done:
             return ok, vres, vreason, None, ""
         self.gate_done = True
-        gaps = required_gaps(gate)
-        if gaps:
-            return (False, vres + [{"cmd": g["source"], "ok": False, "status": "BLOCKED", "note": "REQUIRED_EVIDENCE_UNAVAILABLE — " + g.get("note", "")}
-                                   for g in gaps], vreason + " · REQUIRED_EVIDENCE_UNAVAILABLE", "BLOCKED",
-                    "\n".join(f"{g['source']}: {g['unblock']}" for g in gaps if g.get("unblock")))
         results = self.run_diagnostics(gate)
-        self.say("  T0 evidence gate (required before DONE):\n" + render_diags(results))
-        state = overall_state(results)
+        self.say("  Post-work checks:\n" + render_diags(results))
         static = {group_key(r, f) for r in results if r.get("static") for f in r.get("findings") or [] if f.get("actionable")}
         extra = diag_vres(results, static)
-        if state in CLEAN_STATES:
-            return True, vres + extra, vreason + " · required evidence clean", None, ""
-        pending = [r["source"] for r in results if r.get("static") and r.get("status") == "FAIL"]
-        return (False, vres + extra, self.diag_reason(results, False, vreason + " · required evidence"), None,
-                ("fresh evidence needed: ai-team --evidence " + pending[0] + "=<new report> \"<task>\"") if pending else "")
+        if all(v["ok"] for v in extra):
+            limited = [r.get("source") or r["cat"] for r in results if unreadable(r) or (r.get("static") and r.get("status") == "FAIL")]
+            return True, vres + extra, vreason + (f" · not verified: {', '.join(limited)}" if limited else " · named sources clean"), None, ""
+        return False, vres + extra, self.diag_reason(results, False, vreason + " · named sources"), None, ""
 
     def aggregate_repair(self, steps, cons, runner=None):
-        """Evidence-driven repair. Plan the task's sources → BLOCK (0 checks, 0 model calls) if a REQUIRED source cannot be
-        read → read everything (T0) → group ACTIONABLE findings by root cause → fix a few groups per bounded batch → re-read
-        while progress is made. DONE only when no required source has actionable findings; findings from static (supplied)
-        evidence end as PENDING_EVIDENCE until fresh evidence confirms them. Generated output is never a target and never edited."""
+        """Evidence-driven repair: read the task's diagnostic sources (T0, read-only) → group ACTIONABLE findings by root cause
+        → fix a few groups per bounded batch → re-read while progress is made. Everything readable clean and nothing named
+        missing → DONE without a model call. A source that cannot be read never stops the task: with nothing actionable the
+        model inspects the project directly (direct_inspection), otherwise it is told what could not be read; either way that
+        source is reported as not verified. Generated output is never a target and never edited."""
         rows = self.evidence_rows()
-        gaps = required_gaps(rows)
-        if gaps:
-            return self.block(rows, gaps)
         is_gen = self.gen()
-        gdirs = sorted(is_gen.dirs)
         self.st["files"] = {f for f in self.st["files"] if not is_gen(f)}  # IDE_ONLY paths named in the task are not targets
         results = self.run_diagnostics(rows, runner)
         state = overall_state(results)
         self.save_baseline(results)
         notes = generated_notes(self.root, is_gen, self.p["signals"].get("paths", []))
         self.say("  T0 evidence baseline:\n" + render_diags(results) + "".join("\n" + x for x in notes) + f"\n  Overall: {state}")
+        self.passed = {r["cmd"] for r in results if r.get("status") in ("PASS",) + NOISE_STATUSES and r.get("cmd")}
         active = [dict(r, evidence=None) if r.get("evidence") and r.get("cmd") else r for r in rows]  # supplied baseline, then re-run
         if state in CLEAN_STATES:
             deferred = [r for r in rows if r["state"] == "deferred" and r["cmd"]]
@@ -1982,20 +2109,15 @@ class Run:
                 results = [r for r in results if r["state"] != "deferred"] + extra
                 state = overall_state(results)
             if state in CLEAN_STATES:
-                return self.finish(True, [], "skipped", diag_vres(results), self.diag_reason(results, True, "all required evidence clean"))
-        if state == "INCOMPLETE":
-            gaps = ", ".join(f"{r.get('source') or r['cat']} ({r.get('need', 'required')}{', misconfigured' if r.get('status') == 'BROKEN' else ''})"
-                             for r in results if r["state"] == "unavailable" or r.get("status") == "BROKEN")
-            self.say(f"  no failures in the sources that could be read; NOT reporting clean — not readable: {gaps}")
-            vres = diag_vres(results)
-            if all(v["ok"] for v in vres):  # only optional gaps, but nothing at all could be read
-                vres.append({"cmd": "evidence", "ok": False, "status": "BLOCKED", "tail": "", "note": "no selected source could be read"})
-            return self.finish(False, [], "skipped", vres, f"BLOCKED: {gaps} not readable", header="BLOCKED")
+                return self.finish(True, [], "skipped", diag_vres(results), self.diag_reason(results, True, "all readable diagnostics clean"))
+        if state == "INCOMPLETE":  # nothing actionable, but a required source could not be read: the model looks for itself
+            return self.direct_inspection(steps, cons, rows, results)
+        self.limit_note(results)
         base = {r["cmd"]: r for r in results if r.get("status") and r.get("cmd")}
         self.aggregate_base = {c: (r["ok"], r["out"]) for c, r in base.items()}
         impl = steps.get("implementer")
         if not impl or not impl.get("provider"):
-            raise SystemExit("ai-team: no implementer provider installed")
+            raise no_provider("implementer")
         prov, tier = impl["provider"], impl["tier"]
         total0 = sum(r["errors"] for r in results if r.get("status") and not r.get("static"))
         prev_total, stalls, escalated, batch_no, outs, done_keys, addressed = total0, 0, False, 0, [], set(), set()
@@ -2019,29 +2141,23 @@ class Run:
             summary = "\n".join(f"GROUP {i + 1} [{g['key']}] ×{g['count']} — files: {', '.join(sorted(g['files'])[:6])}"
                                 + (f" (+{len(g['files']) - 6})" if len(g["files"]) > 6 else "") + f"\n  e.g. {g['example']}" for i, g in enumerate(batch))
             st = dict(self.st, files={f for f in files if not f.startswith("(")},
-                      findings=[f"Baseline: {total0} actionable finding(s) in re-runnable sources; {prev_total} remaining",
-                                "Fix these root-cause groups (same cause → one consistent fix):\n" + summary])
+                      findings=[f for f in self.st["findings"] if f.startswith("Not readable by ai-team")]
+                      + [f"Baseline: {total0} actionable finding(s) in re-runnable sources; {prev_total} remaining",
+                         "Fix these root-cause groups (same cause → one consistent fix):\n" + summary])
             action = ("Fix the root cause of each GROUP below with the smallest correct change. Do not suppress diagnostics "
                       "(no ts-ignore / eslint-disable / any) unless there is no real fix. Don't touch unrelated files."
-                      + (f" Never edit generated output ({', '.join(d + '/' for d in gdirs)}); fix the source that produces it." if gdirs else "")
                       + (" Some groups come from supplied evidence that cannot be re-checked here: fix each at its reported location."
                          if any(g["static"] for g in batch) else ""))
             batch_snapshot = snapshot(self.root)
             batch_saved = {f: ((self.root / f).read_bytes() if (self.root / f).is_file() else None) for f in (batch_snapshot or {})}
             batch_base = {r["cmd"]: (r["ok"], r["out"]) for r in results if r.get("status") and r.get("cmd") and not r.get("static")}
-            gsnap = gen_snapshot(self.root, gdirs) if gdirs else {}  # generated files are git-ignored: git status can't see edits
             out = self.agent("implementer", tier, make_handoff(self.task, st, action, cons), provider=prov, write=True,
                              label=f"implementer-g{batch_no}-t{tier}", attempt=batch_no)
             outs = [out]
-            if gdirs:
-                restored, lost = gen_restore(self.root, gdirs, gsnap)
-                if restored or lost:
-                    self.gen_edits += restored + lost
-                    self.say(f"  ! implementer edited generated output ({', '.join((restored + lost)[:3])}); restored"
-                             + (f", {len(lost)} not restorable — rebuild them" if lost else "") + "; only source is fixed")
             addressed |= {g["key"] for g in batch if g["static"]}
             done_keys |= {g["key"] for g in batch if g["static"]}
             results = self.run_diagnostics(active, runner)
+            self.passed = {r["cmd"] for r in results if r.get("status") in ("PASS",) + NOISE_STATUSES and r.get("cmd")}
             new_lines, new_count = [], 0
             for r in results:
                 if r.get("status") not in (None,) + NOISE_STATUSES and not r.get("static") and r.get("cmd") in batch_base and not r["ok"]:
@@ -2088,22 +2204,16 @@ class Run:
                 extra = self.run_diagnostics([dict(r, state="run") for r in deferred], runner)
                 self.say(render_diags(extra))
                 results = [r for r in results if r["state"] != "deferred"] + extra
-                state = overall_state(results)
         files = changed(self.root, before)
-        vres, ok = diag_vres(results, addressed), state in CLEAN_STATES
-        pending = [v["cmd"] for v in vres if v["status"] == "PENDING_EVIDENCE"]
-        if not ok and all(v["ok"] for v in vres):  # e.g. a required check stopped running: never "NOT DONE" beside a passing verify
-            vres.append({"cmd": "evidence", "ok": False, "status": "BLOCKED", "tail": "", "note": f"overall {state}"})
+        vres = diag_vres(results, addressed)
+        ok = all(v["ok"] for v in vres)  # only real failures fail; unreadable sources and re-read-only reports are warnings
         review_state = "skipped"
-        if files and "reviewer" in steps:
+        if ok and files and "reviewer" in steps:
             run_rev, why = review_gate(self.root, files, self.p, outs, vres, [], had_stall)  # initial failures are the task, not a repair
-            if run_rev and (ok or (pending and all(v["ok"] or v["status"] == "PENDING_EVIDENCE" for v in vres))):
+            if run_rev:
                 self.say(f"  → reviewer: {why}")
-                review_state, ok_after, vres = self.review(steps["reviewer"], files, prov, tier, before, outs, True, vres)
-                ok = ok and ok_after
-        return self.finish(ok, files, review_state, vres, self.diag_reason(results, ok, f"evidence {total0} → {prev_total if not ok else 0}"),
-                           hint=(f"re-read {', '.join(pending)} and pass the fresh report: ai-team --evidence {pending[0]}=<new report> \"{self.task}\""
-                                 if pending else ""))
+                review_state, ok, vres = self.review(steps["reviewer"], files, prov, tier, before, outs, ok, vres)
+        return self.finish(ok, files, review_state, vres, self.diag_reason(results, ok, f"evidence {total0} → {prev_total if not ok else 0}"))
 
     def pre_content(self, f):
         if f in self.pre:
@@ -2173,14 +2283,26 @@ class Run:
         self.say("\n" + ("\n".join(str(x) for x in out.get("findings", []) if x) or "(no answer)"))
         if out.get("files") or out.get("relevant_files"):
             self.say("Files: " + ", ".join(map(str, out.get("files") or out.get("relevant_files"))))
-        return self.finish(True, [], "skipped", [], f"read-only ({label})")
+        qs = "; ".join(str(x) for x in (out.get("open_questions") or out.get("unresolved_questions") or []) if x)[:400]
+        needs = out.get("status") == "blocked" and bool(qs) and not out.get("_unstructured")
+        return self.finish(out.get("status") not in ("blocked", "failed"), [], "skipped", [], f"read-only ({label})",
+                           header="BLOCKED" if needs else None, hint=f"needs information: {qs}" if needs else "")
 
     def execute(self):
+        """Run the plan. BLOCKED only when the task truly cannot continue: no provider can take a call, or the agents need
+        information only the user has."""
+        try:
+            return self._execute()
+        except NoProvider as e:
+            cool = cooldowns()
+            hint = ("rate-limited: " + ", ".join(f"{k} until {v[11:16]}" for k, v in sorted(cool.items())) + " — rerun after that"
+                    if cool else "check `ai-team --providers` and each CLI's login")
+            return self.finish(False, changed(self.root, self.before), "skipped", [], str(e), header="BLOCKED", hint=hint)
+
+    def _execute(self):
         p, cons = self.p, "Stay within FILES unless the change requires otherwise."
         steps = {s["role"]: s for s in p["steps"] if s["provider"]}
         gate = p.get("evidence_gate") or []
-        if required_gaps(gate):  # required evidence can never be read → no DONE is possible: stop before any model call
-            return self.block(gate, required_gaps(gate))
         self.strict_cmds = {r["cmd"] for r in gate if r["state"] in RUN_STATES and r.get("cmd") and not (r.get("cmds") or r.get("output") or r.get("evidence"))}
         before = snapshot(self.root)
         self.before = before
@@ -2189,6 +2311,8 @@ class Run:
             self.pre[f] = fp.read_bytes() if fp.is_file() else None
         if before:
             self.say(f"  note: {len(before)} file(s) already modified; excluded from change detection unless touched")
+        if p.get("evidence_audit"):
+            return self.evidence_audit()
         if "answer" in steps:
             return self.answer_only(self.agent("answer", 1, self.task, provider=steps["answer"]["provider"]), "answer")
         if p["intent"] == "REVIEW":
@@ -2201,9 +2325,10 @@ class Run:
                             provider=s["provider"], extra=diff_for(self.root, files))
             for i in rv.get("issues", []):
                 self.say(f"  [{i.get('severity')}] {i.get('file')}:{i.get('line')} {i.get('problem')} → {i.get('fix')}")
-            return self.finish(True, [], f"{len(rv.get('issues', []))} issue(s)", [], "review only")
+            return self.finish(rv.get("status") not in ("blocked", "failed"), [], f"{len(rv.get('issues', []))} issue(s)", [], "review only")
         if p["signals"].get("aggregate"):
             return self.aggregate_repair(steps, cons)
+
         if False:
             c, ok0, groups = diagnose(self.root, self.task, self.cmds)
             if ok0:
@@ -2305,12 +2430,12 @@ class Run:
                 workstreams = [{"files": sorted(self.st["files"]), "action": str(out["next_action"])}]
         impl = steps.get("implementer")
         if not impl or not impl.get("provider"):
-            raise SystemExit("ai-team: no implementer provider installed")
+            raise no_provider("implementer")
         return self.implement(impl, workstreams, steps, before, cons)
 
     def implement(self, impl, workstreams, steps, before, cons):
         tier, at_tier, evidence, ok, vres, vreason = impl["tier"], 0, "", True, [], "no files changed"
-        prov, files, outs, repaired, attempt = impl["provider"], [], [], False, 0
+        prov, files, outs, repaired, attempt, needs = impl["provider"], [], [], False, 0, ""
         while True:
             attempt += 1
 
@@ -2335,7 +2460,8 @@ class Run:
                 q = "; ".join(str(x) for o in outs for x in o.get("open_questions", []))[:500]
                 new = self.escalate(tier, "LOW_CONFIDENCE" if q else f"FAILED_T{tier}", f"implementer blocked/low confidence ({q or 'no reason given'})")
                 if new == tier:
-                    ok = False; break
+                    ok, needs = False, (q if any(o.get("status") == "blocked" for o in outs) else "")
+                    break
                 tier, at_tier, evidence = new, 0, q
                 continue
             cmds, vreason, jfiles = select_checks(files, self.p["complexity"], self.task, self.cmds, self.root)
@@ -2345,9 +2471,10 @@ class Run:
                 cmds += [c for c in sorted(self.strict_cmds) if c not in cmds]
             if not cmds and not jfiles:
                 self.say(f"  ✓ verify           skipped — {vreason}, no check applies")
-                ok, vres = True, []
+                ok, vres, self.passed = True, [], set()
                 break
             ok, vres = verify(self.root, cmds, jfiles, self.dir, self.baseline)
+            self.passed = {r["cmd"] for r in vres if r["ok"]}
             vst = verify_status(vres)
             self.say("  " + {"PASS": "✓", "PASS_WITH_BASELINE_FAILURES": "⚠"}.get(vst, "✗") + f" verify           ({vreason}) {vst}: "
                      + "  ".join(describe_check(r) for r in vres))
@@ -2382,7 +2509,8 @@ class Run:
                 self.pruned.append("reviewer")
                 self.say(f"  ⤼ skip reviewer: {why}")
                 review_state = f"skipped ({why})"
-        return self.finish(ok, changed(self.root, before), review_state, vres, vreason)
+        return self.finish(ok, changed(self.root, before), review_state, vres, vreason,
+                           header="BLOCKED" if needs else None, hint=f"the agents need information: {needs}" if needs else "")
 
     def review(self, s, files, prov, tier, before, outs, ok, vres):
         rounds = 0
@@ -2391,6 +2519,8 @@ class Run:
             rv = self.agent("reviewer", s["tier"], make_handoff(self.task, dict(self.st, files=set(files)), f"Review the diff below. Checks: {vsum}."),
                             provider=s["provider"], label=f"reviewer-r{rounds + 1}", avoid=prov if self.p["cross_review"] else None,
                             extra=diff_for(self.root, files))
+            if rv.get("status") in ("blocked", "failed"):
+                return "not reviewed (no reviewer could complete)", ok, vres  # verified work stays verified
             blocking = [i for i in rv.get("issues", []) if str(i.get("severity", "")).lower() in ("critical", "high")]
             if not blocking:
                 return f"passed ({len(rv.get('issues', []))} non-blocking)", ok, vres
@@ -2402,12 +2532,16 @@ class Run:
                                     f"Reviewer issues: {json.dumps(blocking, ensure_ascii=False)[:2500]}\n"
                                     f"Implementer position: {json.dumps([o.get('findings') for o in outs], ensure_ascii=False)[:1200]}"),
                                     label="judge", extra=diff_for(self.root, files)[:12000])
+                    if jd.get("status") in ("blocked", "failed"):
+                        return "judge could not complete", False, vres
                     jb = [i for i in jd.get("issues", []) if str(i.get("severity", "")).lower() in ("critical", "high")]
                     return ("judge: blocking issues remain" if jb else "judge: resolved, no blocking issues"), ok and not jb, vres
                 return f"{len(blocking)} blocking issue(s) unresolved", False, vres
             rounds += 1
             fix = "Fix these review issues only:\n" + "\n".join(f"- [{i.get('severity')}] {i.get('file')}:{i.get('line')} {i.get('problem')} → {i.get('fix')}" for i in blocking)
             outs = [self.agent("implementer", tier, make_handoff(self.task, self.st, fix), provider=prov, write=True, label=f"implementer-fix{rounds}")]
+            if any(o.get("status") in ("blocked", "failed") for o in outs):
+                return "review fix could not complete", False, vres
             files = changed(self.root, before)
             cmds, _, jfiles = select_checks(files, self.p["complexity"], self.task, self.cmds, self.root)
             ok, vres = verify(self.root, cmds, jfiles, self.dir, self.baseline)
@@ -2427,6 +2561,11 @@ class Run:
         print(f"Verify:      {verify_status(vres) + ' · ' + '; '.join(describe_check(r) for r in vres) if vres else 'skipped'} ({vreason})")
         print(f"Review:      {review_state}")
         print(f"Escalations: {'; '.join(self.escalations) or 'none'}")
+        hops = [f"{t['label']} {t['provider']} T{t['tier']} {t['result']}" for t in self.trace if t["result"] not in ("done", "no_change", "needs_change")]
+        if hops:
+            print(f"Fallbacks:   {'; '.join(hops)}")
+        if self.trace:
+            (self.dir / "route.json").write_text(json.dumps(self.trace, indent=1))
         if self.pruned:
             print(f"Pruned:      {', '.join(self.pruned)} (evidence was sufficient; call not paid)")
         print(f"Model calls: {len(self.log)} · fresh {tin / 1000:.1f}k · cached {tc / 1000:.1f}k · out {tout / 1000:.1f}k"
@@ -2436,7 +2575,7 @@ class Run:
             print("Next:        " + hint.replace("\n", "\n             "))
         elif not ok:
             print("Next:        read the last *.json / verification.json there, or rerun with --budget quality")
-        record(self.root, self.p, self.log, ok, review_state, vres, vreason, self.dir, dur, self.escalations, self.pruned)
+        record(self.root, self.p, self.log, ok, review_state, vres, vreason, self.dir, dur, self.escalations, self.pruned, len(hops))
         return 0 if ok else 1
 
 
@@ -2546,7 +2685,7 @@ CATEGORY = {"Eval": "Routing scenarios", "ZeroToken": "Zero-token paths", "Conte
             "ReviewGate": "Review gate", "Maintenance": "Diagnostics-first",
             "EvidenceGuard": "History sample guard", "ReviewerWording": "Reviewer wording", "ReviewSizing": "Review sizing", "BaselineVerification": "Baseline-aware verify", "AggregateDiagnostics": "Aggregate diagnostics",
             "EvidenceRouting": "Evidence routing", "EvidenceSources": "Evidence sources", "EvidenceRegistry": "Adapter registry",
-            "CustomChecks": "Custom checks", "Classification": "Finding classes",
+            "CustomChecks": "Custom checks", "Classification": "Finding classes", "ProviderFailover": "Provider fallback",
             "ReadOnlyDerivation": "Read-only derivation", "GeneratedOutput": "Generated output", "RequiredOptional": "Required vs optional"}
 
 
@@ -2640,10 +2779,6 @@ def main():
         rmap, p = load_map(root), plan(task, "balanced", None, root, evidence=evidence)
         r = Run(task, p, root, rmap)
         rows = p.get("diagnostics") or p.get("evidence_gate") or DIAG.plan_rows(task, r.ctx(), maintenance=True, broad=True, supplied=evidence)
-        if required_gaps(rows):
-            print(f"Diagnostics (read-only, 0 model calls) for: {task}\n" + render_plan(rows))
-            shutil.rmtree(r.dir, ignore_errors=True)
-            return 1
         snap = snapshot(root)
         r.before, r.pre = snap, {f: ((root / f).read_bytes() if (root / f).is_file() else None) for f in (snap or {})}
         res = r.run_diagnostics(rows)
@@ -2706,7 +2841,7 @@ def main():
     print()
     if p.get("local"):
         return local(p, root, rmap, task)
-    if not available() and not required_gaps(p.get("diagnostics") or p.get("evidence_gate")):  # BLOCKED needs no model
+    if not available() and not (p.get("evidence_audit") or p["signals"].get("aggregate")):  # T0 diagnostics need no model
         sys.exit("ai-team: no active AI provider CLI found (codex or claude). Install one and rerun `ai-team doctor`.")
     return Run(task, p, root, rmap).execute()
 

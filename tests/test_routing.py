@@ -28,6 +28,7 @@ REAL_RUN_PROVIDER = m.run_provider
 REAL_VERIFY = m.verify
 REAL_DIAGNOSE = m.diagnose
 m.run_provider = forbid
+m.SLEEP = lambda s: None  # retry backoff never really sleeps in tests
 
 
 def git_repo(files):
@@ -655,7 +656,7 @@ class AggregateDiagnostics(Base):
         self.assertEqual([c[0] for c in calls], ["implementer"])    # not "nothing to fix"
         self.assertEqual(rc, 0)                                      # all required categories clean afterwards
 
-    def test_8b_required_unavailable_blocks_before_any_model_call(self):
+    def test_8b_unavailable_diagnostic_allows_model_repair(self):
         d = self.repo({"typecheck": "tsc --noEmit", "lint": "eslint . --fix && prettier --write ."})   # no safe read-only lint form
         def impl(tier):
             (d / "fixed").write_text("y\n")
@@ -669,11 +670,9 @@ class AggregateDiagnostics(Base):
         with contextlib.redirect_stdout(buf):
             rc = r.aggregate_repair({x["role"]: x for x in r.p["steps"] if x["provider"]}, "", runner=runner)
         out = buf.getvalue()
-        self.assertEqual(rc, 1)
-        self.assertIn("BLOCKED ·", out); self.assertNotIn("DONE ·", out)
-        self.assertIn("Verify:      BLOCKED", out)                   # never "NOT DONE"/"DONE" next to "Verify: PASS"
-        self.assertIn("REQUIRED_EVIDENCE_UNAVAILABLE: LINT", out)
-        self.assertFalse((d / "fixed").exists())                      # no implementer call: a required source can't be read
+        self.assertEqual(rc, 0, out); self.assertIn("DONE ·", out)
+        self.assertIn("LINT not verified", out)                      # reported, never claimed clean
+        self.assertTrue((d / "fixed").exists())                      # model can inspect and repair without lint evidence
 
     def test_misconfigured_check_is_not_a_code_error_and_not_clean(self):
         d = self.repo({"typecheck": "true", "prettier": "prettier --check \"{src,store}/**/*.js\""})
@@ -881,16 +880,101 @@ class RequiredOptional(Base):
         self.assertIn("DONE", out); self.assertNotIn("NOT DONE", out)
         self.assertIn("Verify:      PASS_WITH_WARNINGS", out); self.assertIn("FORMAT unavailable (optional)", out)
 
-    def test_required_unavailable_diagnostic_blocks(self):
+    def test_required_unavailable_diagnostic_starts_model(self):
         root = self.repo({"lint": "mylinter --fix src", "format": "prettier --check ."})
+        calls = stub({})
         rc, out = run_aggregate(root, "fix all existing errors and warnings in this project", lambda c: (True, ""))
-        self.assertEqual(rc, 1)
-        self.assertIn("BLOCKED ·", out); self.assertIn("Verify:      BLOCKED", out); self.assertIn("REQUIRED_EVIDENCE_UNAVAILABLE: LINT", out)
+        self.assertTrue(calls, out); self.assertEqual(rc, 0, out)
+        self.assertNotIn("BLOCKED ·", out); self.assertIn("LINT not verified", out)
 
-    def test_nothing_runnable_is_never_done(self):
+    def test_nothing_runnable_starts_model_without_claiming_verified(self):
         root = self.repo({"format": "mytool --write ."})                                # only an optional gap, nothing ran
+        calls = stub({})
         rc, out = run_aggregate(root, "fix all existing errors and warnings in this project", lambda c: (True, ""))
-        self.assertEqual(rc, 1); self.assertIn("Verify:      BLOCKED", out)
+        self.assertTrue(calls, out); self.assertNotIn("BLOCKED ·", out)
+        self.assertNotIn("Verify:      PASS\n", out)
+
+
+class ProviderFailover(Base):
+    """Native agent CLIs behind a claude-code-router-style fallback chain: classify the failure, then retry, cool down or
+    disable the provider, and hand the call to the next capable one."""
+
+    def setUp(self):
+        super().setUp()
+        self.sleeps = []
+        m.SLEEP = self.sleeps.append
+        self.addCleanup(setattr, m, "SLEEP", lambda s: None)
+
+    def run_with(self, script, task="add loading state to submit button"):
+        """script: {provider: [outcome, …]} consumed per call; a str outcome is a CLI failure message, a dict an agent answer."""
+        calls, queue = [], {k: list(v) for k, v in script.items()}
+
+        def run(provider, tier, prompt, write, role, *a, **k):
+            calls.append((role, provider, tier, prompt))
+            nxt = queue[provider].pop(0) if queue.get(provider) else {"status": "no_change"}
+            if isinstance(nxt, str):
+                raise m.ProviderError(nxt)
+            return json.dumps(nxt), {"in": 1, "cached": 0, "out": 1, "usd": None}, "stub"
+        m.run_provider = run
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = m.Run(task, plan(task), NO_AUTH, {"commands": {}}).execute()
+        return rc, calls, buf.getvalue()
+
+    def test_failure_classes(self):
+        for text, kind in (("You've hit your usage limit. Try again in 2 hours.", "rate_limit"), ("HTTP 429 Too Many Requests", "rate_limit"),
+                           ("Claude AI usage limit reached|1759999999", "rate_limit"), ("Invalid API key · Please run /login", "auth"),
+                           ("unexpected status 401 Unauthorized", "auth"), ("error_max_budget_usd", "budget"), ("error_max_turns", "budget"),
+                           ("API Error: 529 overloaded_error", "transient"), ("stream disconnected before completion", "transient"),
+                           ("503 Service Unavailable", "transient"), ("model not found", "fatal")):
+            with self.subTest(text=text):
+                self.assertEqual(m.failure_kind(text), kind)
+
+    def test_cooldown_and_backoff_follow_the_provider(self):
+        now = m.datetime.datetime(2026, 9, 30, 10, 0)
+        self.assertEqual(m.cooldown_minutes("try again in 1 day 3 hours 32 minutes", now), 1652)
+        self.assertEqual(m.cooldown_minutes("5-hour limit reached · resets 3pm", now), 300)
+        self.assertEqual(m.cooldown_minutes(f"usage limit reached|{int(now.timestamp()) + 5400}", now), 90)
+        self.assertEqual(m.cooldown_minutes("quota exceeded", now), 60)
+        self.assertEqual((m.retry_delay("please retry after 3 seconds", 1), m.retry_delay("503", 1), m.retry_delay("503", 9)), (3, 1, 30))
+
+    def test_transient_failure_is_retried_on_the_same_provider(self):
+        rc, calls, out = self.run_with({"codex": ["503 Service Unavailable", {"status": "no_change"}]})
+        self.assertEqual([c[1] for c in calls], ["codex", "codex"]); self.assertEqual(self.sleeps, [1])
+        self.assertEqual(rc, 0, out); self.assertNotIn("codex", m.BROKEN)
+
+    def test_rate_limit_cools_down_and_falls_back(self):
+        rc, calls, out = self.run_with({"codex": ["You've hit your usage limit. Try again in 2 hours."]})
+        self.assertEqual([c[1] for c in calls], ["codex", "claude"]); self.assertEqual(rc, 0, out)
+        until = m.datetime.datetime.fromisoformat(json.loads(m.COOLDOWN_FILE.read_text())["codex"])
+        self.assertAlmostEqual((until - m.datetime.datetime.now()).total_seconds() / 60, 120, delta=2)
+        self.assertIn("Fallbacks:   implementer-t1a1 codex T1 rate_limit", out)
+        rc, calls, out = self.run_with({})                                       # the next task skips the provider in cooldown
+        self.assertEqual({c[1] for c in calls}, {"claude"})
+
+    def test_auth_error_disables_the_provider_but_a_budget_limit_only_skips_the_call(self):
+        rc, calls, out = self.run_with({"codex": ["Invalid API key · Please run /login"]})
+        self.assertEqual(([c[1] for c in calls], rc), (["codex", "claude"], 0)); self.assertIn("codex", m.BROKEN)
+        m.BROKEN.clear(); m._AVAIL.clear()
+        rc, calls, out = self.run_with({"codex": ["context window exceeded: prompt is too long"]})
+        self.assertEqual(([c[1] for c in calls], rc), (["codex", "claude"], 0))
+        self.assertNotIn("codex", m.BROKEN); self.assertIn("codex", m.available())
+
+    def test_agent_that_gives_up_hands_over_to_the_next_provider(self):
+        rc, calls, out = self.run_with({"codex": [{"status": "blocked", "open_questions": ["which API version?"]}]})
+        self.assertEqual([c[1] for c in calls], ["codex", "claude"]); self.assertEqual(rc, 0, out)
+        self.assertIn("a previous codex attempt ended blocked (which API version?)", calls[1][3])
+
+    def test_blocked_only_when_no_provider_can_continue(self):
+        rc, calls, out = self.run_with({"codex": ["usage limit reached"], "claude": ["usage limit reached"]})
+        self.assertEqual(rc, 1); self.assertIn("BLOCKED ·", out)
+        self.assertIn("no working provider for implementer (tried codex, claude)", out); self.assertIn("rate-limited: claude until", out)
+
+    def test_blocked_when_the_agents_need_information(self):
+        q = {"status": "blocked", "confidence": 0.3, "open_questions": ["Which payment provider should be used?"]}
+        rc, calls, out = self.run_with({"codex": [q, q], "claude": [q, q]})
+        self.assertEqual((rc, len(calls)), (1, 4))                               # both providers at T1, then both at T2
+        self.assertIn("BLOCKED ·", out); self.assertIn("the agents need information: Which payment provider", out)
 
 
 class Security(Base):
