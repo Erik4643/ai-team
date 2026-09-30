@@ -1,5 +1,5 @@
 {
-  "_doc": "Routing data for ai-team. Edit model names here only; roles and pipelines never name models.",
+  "_doc": "Routing data for ai-team, a router: ONE native agent (Codex or Claude Code) per task at the cheapest capable tier. Edit model names here only.",
   "providers": {
     "codex": {
       "bin": "codex",
@@ -61,8 +61,7 @@
     "researcher": 800,
     "architect": 1200,
     "implementer": 900,
-    "reviewer": 700,
-    "judge": 800
+    "reviewer": 700
   },
   "effort_mult": {
     "low": 1.0,
@@ -122,36 +121,7 @@
     "reviewer": [
       "claude",
       "codex"
-    ],
-    "judge": [
-      "claude",
-      "codex"
     ]
-  },
-  "pipelines": {
-    "MICRO": {
-      "implementer": 1
-    },
-    "SMALL": {
-      "implementer": 1
-    },
-    "MEDIUM": {
-      "explorer": 1,
-      "implementer": 2,
-      "reviewer": 2
-    },
-    "COMPLEX": {
-      "explorer": 1,
-      "architect": 2,
-      "implementer": 2,
-      "reviewer": 2
-    },
-    "CRITICAL": {
-      "explorer": 1,
-      "architect": 2,
-      "implementer": 2,
-      "reviewer": 2
-    }
   },
   "escalation_cap": {
     "MICRO": 2,
@@ -163,48 +133,19 @@
   "budgets": {
     "economy": {
       "max_tier": 2,
-      "tier_delta": {
-        "COMPLEX.reviewer": -1
-      },
-      "drop": {
-        "MEDIUM": [
-          "reviewer"
-        ]
-      },
-      "review": "critical-only",
-      "judge": false,
-      "max_parallel": 1,
-      "cross_review_from": "CRITICAL"
+      "tier_delta": -1,
+      "review": "never"
     },
     "balanced": {
       "max_tier": 3,
-      "tier_delta": {},
-      "review": "justified",
-      "judge": true,
-      "max_parallel": 2,
-      "cross_review_from": "COMPLEX"
+      "tier_delta": 0,
+      "review": "risk"
     },
     "quality": {
       "max_tier": 3,
-      "tier_delta": {},
-      "add": {
-        "SMALL": {
-          "reviewer": 2
-        }
-      },
-      "review": "always",
-      "judge": true,
-      "max_parallel": 3,
-      "cross_review_from": "MEDIUM"
+      "tier_delta": 0,
+      "review": "always"
     }
-  },
-  "context_budget": {
-    "TRIVIAL": 0,
-    "MICRO": 1500,
-    "SMALL": 2000,
-    "MEDIUM": 8000,
-    "COMPLEX": 16000,
-    "CRITICAL": 16000
   },
   "codex_disable_features": [
     "plugins",
@@ -224,36 +165,18 @@
   "limits": {
     "max_attempts_per_tier": 2,
     "provider_retries": 1,
-    "max_review_rounds": 1,
-    "handoff_chars": 4000,
-    "diff_chars": 24000,
     "verify_timeout_s": 900,
     "max_attempts_t3": 1,
     "retain_tasks": 30,
     "retain_days": 14,
     "metrics_max_lines": 1000,
-    "diagnostic_errors": 40
+    "long_context_tokens": 100000
   },
   "_role_providers_doc": "Tie-break order only; the cost model picks the provider.",
   "capability_margin": {
     "edit": 0.1,
     "default": 0.25
   },
-  "gates": {
-    "architect": {
-      "min_confidence": 0.8,
-      "min_confidence_high_risk": 0.9,
-      "max_files": 3,
-      "max_subsystems": 1,
-      "t3_below_confidence": 0.6,
-      "high_risk_areas": "auth, authorization, security, payments, migrations, destructive ops, concurrency"
-    },
-    "review": {
-      "max_lines": 60,
-      "min_implementer_confidence": 0.7
-    }
-  },
-  "_gates_doc": "Stage pruning thresholds. High-risk = auth/security/payment/data keywords in the task (stricter even without repo evidence). CRITICAL always keeps architect and review.",
   "duration_seed": {
     "codex": 20,
     "claude": 12
@@ -263,6 +186,13 @@
     "success_samples": 8,
     "intent_group_min": 5
   },
-  "_pipelines_doc": "Plan-time tiers never include T3; T3 is reached only by evidence-based escalation with a reason code.",
-  "_context_budget_doc": "Orchestrator-supplied tokens per call (provider-native baseline excluded). Over budget \u2192 trimmed before sending."
+  "start_tier": {
+    "MICRO": 1,
+    "SMALL": 1,
+    "MEDIUM": 2,
+    "COMPLEX": 2,
+    "CRITICAL": 2
+  },
+  "_start_tier_doc": "Tier an editing agent starts at, by complexity (long context \u2265 limits.long_context_tokens \u2192 at least T2). Read-only roles start at T1 (architecture on COMPLEX+ at T2). T3 is reached only by escalation.",
+  "_budgets_doc": "review: never | risk (CRITICAL tasks or auth/security/payment/migration changes) | always (code changes)."
 }

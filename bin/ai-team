@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""ai-team — give one task; the cheapest valid execution path does it.
+"""ai-team — a router, not a problem solver. It classifies a task (T0: no tokens), picks the cheapest capable Codex or
+Claude Code model, hands the original task to that native agent CLI — which investigates and solves it with its own
+tools — and only retries, switches provider or escalates the tier when the agent fails.
 
   ai-team "<task>" [--budget economy|balanced|quality] [--complexity CLASS] [--apply]
-  ai-team --plan "<task>"           routing: what / why / how much / what is conditional   (0 tokens)
-  ai-team --context-plan "<task>"   what each call WOULD receive, by source                 (0 tokens)
-  ai-team --status | --providers | --models | --last | --cost | --routing | --help        (0 tokens)
-  ai-team --self-test [--live]      routing/context/security regression suite (--live: 2 cheap real calls)
-  ai-team map | doctor [--probe] | stats | install
-  ai-team role <role> [--tier N] [--provider P] [--write] "<handoff>|@file"
+  ai-team --plan "<task>"           routing decision: type · complexity · context · model · why    (0 tokens)
+  ai-team --context-plan "<task>"   the exact prompt the agent would receive                        (0 tokens)
+  ai-team --status | --providers | --models | --last | --cost | --routing | --help                 (0 tokens)
+  ai-team --self-test [--live]      routing / fallback / safety regression suite (--live: real calls)
+  ai-team init [--clean] | update | map | doctor [--probe] | stats | install
+  ai-team role <role> [--tier N] [--provider P] [--write] "<prompt>|@file"
 
-Decisions are local (T0): intent → fast path? → complexity (MICRO..CRITICAL) → conditional stages → provider by
-expected cost to success (capability first). Policy: ~/.ai-kit/POLICY.md · data: ~/.ai-kit/routing.json
+Policy: ~/.ai-kit/POLICY.md · routing data: ~/.ai-kit/routing.json
 """
-import argparse, datetime, hashlib, importlib.util, json, os, re, shutil, subprocess, sys, time
+import argparse, datetime, hashlib, json, os, re, shutil, subprocess, sys, time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 KIT = Path(os.environ.get("AI_KIT", str(Path(__file__).resolve().parents[1]))).expanduser().resolve()
@@ -26,30 +26,6 @@ RANK = {"TRIVIAL": 0, "MICRO": 1, "SMALL": 2, "MEDIUM": 3, "COMPLEX": 4, "CRITIC
 DEMAND = {"TRIVIAL": 0, "MICRO": 1, "SMALL": 1, "MEDIUM": 2, "COMPLEX": 3, "CRITICAL": 3}
 CODE_INTENTS = {"IMPLEMENTATION", "DEBUG", "ARCHITECTURE"}
 MODEL_CALLS = [0]  # real provider invocations in this process (self-test asserts 0)
-
-
-def load_diagnostics(kit):
-    """The diagnostic evidence package ships inside the kit; load it by path under a kit-specific name (no clash with an
-    installed package, and two kits in one process stay separate)."""
-    name = "ai_team_diagnostics_" + hashlib.sha1(str(kit).encode()).hexdigest()[:10]
-    if name not in sys.modules:
-        spec = importlib.util.spec_from_file_location(name, kit / "diagnostics" / "__init__.py", submodule_search_locations=[str(kit / "diagnostics")])
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[name] = mod
-        try:
-            spec.loader.exec_module(mod)
-        except BaseException:
-            sys.modules.pop(name, None)
-            raise
-    return sys.modules[name]
-
-
-DIAG = load_diagnostics(KIT)
-# Shared evidence primitives stay importable from this module (tests, bootstrap and older callers use them).
-for _name in ("MUTATING", "READ_ONLY_FORMS", "cmd_tokens", "resolve_command", "read_only_args", "read_only_form", "package_scripts",
-              "tracked_css", "OUTPUT_DIR", "generated_dirs", "generated_classifier", "ANSI_RE", "DIAG_RE", "ESLINT_ROW", "FILE_LINE",
-              "NOISE_RE", "BROKEN_CHECK_RE", "norm_msg", "diagnostics"):
-    globals()[_name] = getattr(DIAG.core, _name)
 
 
 def tok(s):
@@ -91,7 +67,6 @@ STYLE_KW = R(r"\b(colou?r|border[- ]?radius|radius|padding|margin|font[- ]?size|
 MICRO_KW = R(r"\b(rename|typo|spelling|colou?r|border[- ]?radius|radius|padding|margin|font[- ]?size|spacing|opacity|z-index|label|wording|copy|comment|unused imports?|bump|placeholder|tooltip|icon size)\b"
              r"|переимен|опечат|цвет|радиус|отступ|шрифт|надпис|формулировк")
 DOCS_KW = R(r"\b(readme|docs?|documentation|changelog|\.md|markdown|wording|typo)\b|документац|ридми")
-FIX_LIKE = R(r"^(fix|make|remove|исправ|почин|убери|удали)$")  # change verbs that only mean "make the findings go away"
 MAINT = R(r"\b(fix|resolve|repair|clean ?up|eliminate|address|get rid of)\b.{0,60}\b(all|every|existing|current|remaining|global|outstanding)\b.{0,80}\b(errors?|warnings?|problems?|issues?|failures?|diagnostics?)\b"
           r"|\bmake\b.{0,50}\b(checks?|diagnostics|lint|typecheck|type-?check|build|ci|tests?)\b.{0,30}\b(pass|passing|green|clean)\b"
           r"|\bmake\b.{0,40}\b(pass|green|clean)\b.{0,20}\b(all )?(checks?|diagnostics|lint|typecheck|ci|tests?)\b"
@@ -154,7 +129,8 @@ def critical_with_evidence(task, root):
 
 
 def classify(task, root=None, forced=None):
-    """→ (intent, complexity, confidence, signals). Regex + at most one git grep; no tokens."""
+    """→ (intent, complexity, confidence, signals). Regex + at most one git grep; no tokens. The intent decides the
+    agent's permissions (read-only or edits), the complexity its starting tier."""
     paths = sorted(set(PATH_RE.findall(task)))
     sig = {"paths": paths, "keywords": []}
     if META.search(task):
@@ -180,23 +156,18 @@ def classify(task, root=None, forced=None):
     elif question:
         intent = "QUESTION"
     else:
-        intent = "UNKNOWN"  # cheap T1 probe decides
-    sig["analysis_first"] = intent == "DEBUG" and not change  # diagnose first; implement only if a change is required
+        intent = "UNKNOWN"  # no verb: the agent gets edit access and decides whether anything needs changing
+    sig["analysis_first"] = intent == "DEBUG" and not change  # "find why X": diagnose read-only; a fix verb allows edits
     sig["docs"] = bool(DOCS_KW.search(task)) and not re.search(r"\.(tsx?|jsx?|py|go|rs|css|scss)\b", task)
-    sig["maintenance"] = bool(MAINT.search(task))  # aggregate diagnostics: every relevant check before "clean"
-    sig["broad"] = sig["maintenance"] and bool(DIAG.BROAD.search(task))
-    sig["fix_only"] = all(FIX_LIKE.match(m.group(0)) for m in CHANGE.finditer(task))
-    sig["evidence"] = DIAG.requested_ids(task, DIAG.Context(root, repo_map_file(root)) if root is not None else None)  # T0, regex only
+    sig["research"] = bool(RESEARCH.search(task))  # current external facts: the agent gets web tools
+    sig["maintenance"] = bool(MAINT.search(task))  # "fix all errors": repo-wide, and the project's checks must pass outright
     if sig["maintenance"] and intent == "UNKNOWN":
-        intent = "IMPLEMENTATION"  # "clean up the codebase": diagnostics first, then a bounded fix
-    if intent in CODE_INTENTS:  # evidence-driven repair: broad maintenance, or a fix-only task that names its evidence
-        sig["aggregate"] = sig["maintenance"] or (bool(sig["evidence"]) and sig["fix_only"])
-    else:  # questions, reviews and plans stay read-only: named evidence is audited (T0), never repaired
-        sig["maintenance"] = sig["broad"] = sig["aggregate"] = False
-        sig["audit"] = bool(sig["evidence"]) and intent in ("REVIEW", "QUESTION", "UNKNOWN")
+        intent = "IMPLEMENTATION"
+    elif intent not in CODE_INTENTS:
+        sig["maintenance"] = False  # questions and plans stay read-only
     hit = {k: bool(rx.search(task)) for k, rx in KW.items()}
     sig["risk_keyword"] = hit["CRITICAL"]
-    sig["high_risk"] = hit["CRITICAL"] or bool(CONCURRENCY_KW.search(task))  # stricter gates, never looser
+    sig["high_risk"] = hit["CRITICAL"] or bool(CONCURRENCY_KW.search(task))
     if hit["CRITICAL"]:
         hit["CRITICAL"], note = critical_with_evidence(task, root)
         if note:
@@ -207,8 +178,8 @@ def classify(task, root=None, forced=None):
     if intent not in CODE_INTENTS:
         return intent, ("MEDIUM" if intent == "PLAN" and (hit["COMPLEX"] or hit["CRITICAL"]) else "SMALL"), "high", sig
     words = len(task.split())
-    if sig["aggregate"]:
-        c = "MEDIUM"  # sized after deterministic diagnostics
+    if sig["maintenance"]:
+        c = "MEDIUM"
     elif hit["CRITICAL"]:
         c = "CRITICAL"
     elif hit["COMPLEX"] or intent == "ARCHITECTURE":
@@ -220,19 +191,11 @@ def classify(task, root=None, forced=None):
         c = "MICRO"
     else:
         c = "SMALL"
-    conf = "high" if sig["keywords"] or c == "MICRO" else "low → start at T1, escalate on evidence"
+    conf = "high" if sig["keywords"] or c == "MICRO" else "low → start cheap, escalate on failure"
     return intent, c, conf, sig
 
 
-# ── repository index ───────────────────────────────────────────────────────────
-def repo_map_file(root):
-    """The project's own .ai/repo-map.json (commands, custom checks) without detection — cheap enough for T0 triage."""
-    try:
-        return json.loads((Path(root) / ".ai" / "repo-map.json").read_text())
-    except (OSError, ValueError):
-        return {}
-
-
+# ── repository index (ai-team init; never read into prompts) ───────────────────
 def repo_root():
     rc, out = sh(["git", "rev-parse", "--show-toplevel"])
     return Path(out.strip()) if rc == 0 else Path.cwd()
@@ -355,26 +318,6 @@ def load_map(root):
     return json.loads(p.read_text()) if p.exists() else detect_map(root)
 
 
-def context_sections(root):
-    for p in (root / ".ai" / "CONTEXT.md", root / "AGENTS.md"):
-        if p.exists():
-            t = p.read_text()
-            parts = re.split(r"(?m)^## ", t)
-            return {x.split("\n", 1)[0].strip().lower(): "## " + x.strip() for x in parts[1:]}
-    return {}
-
-
-def project_context(root, role, complexity):
-    """Level-4 disclosure: Rules always; facts only where the role needs orientation; tool guidance only for explorers."""
-    sec = context_sections(root)
-    want = ["rules"]
-    if role in ("explorer", "architect") or (role == "implementer" and rank(complexity) >= RANK["MEDIUM"]):
-        want.insert(0, "project facts")
-    if role in ("explorer", "architect") and graph_ready(root):
-        want.append("graphify")
-    return "\n\n".join(sec[k] for k in want if k in sec)
-
-
 def graph_ready(root):
     """Local, bounded validation only. Never install, build, update or query a graph."""
     if os.environ.get("AI_TEAM_GRAPHIFY", "").lower() in {"off", "0", "false"} or not shutil.which("graphify"):
@@ -399,31 +342,89 @@ def graph_ready(root):
         return False
 
 
-def capability_guidance(role, task, root):
-    """Read only selected canonical guidance; catalogs and vendor folders are never searched."""
-    parts = []
-    for c in CAPABILITIES["capabilities"]:
-        if role not in c.get("roles", []) or not c.get("task_pattern"):
-            continue
-        if re.search(c["task_pattern"], task, re.I):
-            parts.append(("workflow:" + c["id"], (KIT / c["sources"][0]).read_text()))
-        if len(parts) >= CAPABILITIES["max_conditional_workflows"]:
-            break
-    if role in ("explorer", "architect") and graph_ready(root):
-        parts.append(("optional:graphify", (KIT / "skills/graphify/SKILL.md").read_text().split("---", 2)[-1].strip()))
-    return parts
+ROLES = ("orchestrator", "explorer", "architect", "implementer", "reviewer")
 
 
 def role_instructions(role, task, root):
-    if role not in {"orchestrator", "explorer", "implementer", "architect", "reviewer", "researcher", "judge"}:
+    """Canonical role text for the interactive entrypoints (`ai-team instructions <role>`), plus the optional graph
+    guidance when the CLI and a valid local graph exist. Routed worker runs never use these: they get the original task."""
+    if role not in ROLES:
         raise ValueError("unknown canonical role: " + role)
-    return "\n\n".join([(KIT / "roles" / (role + ".md")).read_text()]
-                       + [body for _, body in capability_guidance(role, task, root)])
+    parts = [(KIT / "roles" / (role + ".md")).read_text()]
+    if role in ("explorer", "architect") and graph_ready(root):
+        parts.append((KIT / "skills/graphify/SKILL.md").read_text().split("---", 2)[-1].strip())
+    return "\n\n".join(parts)
 
 
-def relevant_docs(task, rmap):
-    """Doc paths (never contents) whose `when` pattern matches the task — the agent opens them only if needed."""
-    return [d["path"] for d in rmap.get("docs", []) if d.get("when") and re.search(d["when"], task, re.I)]
+# ── generated output: never edited by an agent (snapshot before each writing call, restore after) ──
+OUTPUT_DIR = re.compile(r"^(dist|build|out|output|coverage|storybook-static|target|\.next|\.nuxt|\.output|\.svelte-kit|\.turbo|\.vite)([-_.][\w.-]+)?$")
+OUTPUT_KEY = re.compile(r"out-?dir|outputpath|output|dest\b|distdir|builddir|--out\b|\s-o\s", re.I)
+
+
+def generated_dirs(root):
+    """Top-level build/test output dirs. Name pattern AND evidence (git-ignored, or named as an output in package.json /
+    build config) — a tracked source dir that merely looks like `build/` is not generated. → {dir: evidence}"""
+    root = Path(root)
+    try:
+        cands = sorted(p.name for p in root.iterdir() if p.is_dir() and not p.is_symlink() and OUTPUT_DIR.match(p.name))
+    except OSError:
+        return {}
+    if not cands:
+        return {}
+    _, ign = sh(["git", "check-ignore", "--"] + [c + "/" for c in cands], cwd=root)
+    ignored = {x.strip().rstrip("/") for x in ign.splitlines()}
+    cfg = []
+    for p in [root / "package.json", root / "angular.json"] + sorted(root.glob("*.config.*")) + sorted(root.glob("tsconfig*.json")):
+        try:
+            if p.is_file() and p.stat().st_size < 200_000:
+                cfg += [(p.name, line) for line in p.read_text(errors="replace").splitlines() if OUTPUT_KEY.search(line)]
+        except OSError:
+            continue
+    out = {}
+    for c in cands:
+        # A path literal, not a bare word (`build: {` is a config key): "dist" / './dist/x', `dist-${mode}`, --outDir dist
+        pre = re.match(r"^([a-z]+[-_.])\w", c)  # `dist-${mode}` names dist-dev, dist-master, …
+        lit = re.compile(r"[\"'`](?:\./)?" + re.escape(c) + r"(?=[/\"'`])|(?:--out-?dir|--outDir|--output(?:-path)?|--dest|\s-o)[= ](?:\./)?"
+                         + re.escape(c) + r"(?![\w-])" + (r"|[\"'`](?:\./)?" + re.escape(pre.group(1)) + r"\$\{" if pre else ""))
+        ev = (["git-ignored"] if c in ignored else []) + sorted({f"output in {name}" for name, line in cfg if lit.search(line)})
+        if ev:
+            out[c] = ", ".join(ev)
+    return out
+
+
+def gen_snapshot(root, dirs, cap=64 << 20):
+    """Stat (and, within the cap, content) of every file under generated dirs so an agent edit there can be undone."""
+    snap, used = {}, 0
+    for d in dirs:
+        for cur, subdirs, names in os.walk(root / d):
+            subdirs[:] = [s for s in subdirs if not (Path(cur) / s).is_symlink()]
+            for n in names:
+                p = Path(cur) / n
+                try:
+                    st = p.lstat()
+                    data = p.read_bytes() if not p.is_symlink() and used + st.st_size <= cap else None
+                except OSError:
+                    continue
+                used += len(data or b"")
+                snap[str(p.relative_to(root))] = (st.st_mtime_ns, st.st_size, data)
+    return snap
+
+
+def gen_restore(root, dirs, before):
+    """Undo changes under generated dirs since `before`. → (restored, unrestorable)."""
+    now = {k: v[:2] for k, v in gen_snapshot(root, dirs, cap=0).items()}
+    restored, lost = [], []
+    for rel in sorted(set(before) | set(now)):
+        if before.get(rel, (None, None))[:2] == now.get(rel):
+            continue
+        p = root / rel
+        if rel not in before:
+            p.unlink(missing_ok=True); restored.append(rel)
+        elif before[rel][2] is not None:
+            p.parent.mkdir(parents=True, exist_ok=True); p.write_bytes(before[rel][2]); restored.append(rel)
+        else:
+            lost.append(rel)
+    return restored, lost
 
 
 # ── providers ──────────────────────────────────────────────────────────────────
@@ -505,12 +506,12 @@ def available():
     return list(_AVAIL[key])
 
 
-_CODEX_FLAGS = None
+_CODEX_FLAGS, _CODEX_KNOWN = None, set()
 
 
 def codex_lean_flags():
     """Disable optional Codex tool surfaces present in this version (−1.2k tokens/call). Feature list cached 24 h per binary."""
-    global _CODEX_FLAGS
+    global _CODEX_FLAGS, _CODEX_KNOWN
     if _CODEX_FLAGS is None:
         binp = Path(shutil.which("codex") or "codex").resolve()
         cache = KIT / "state" / "codex-features.json"
@@ -538,8 +539,7 @@ def codex_lean_flags():
         if cfg.exists():
             for name in re.findall(r"^\[mcp_servers\.([A-Za-z0-9_-]+)\]\s*$", cfg.read_text(), re.M):
                 flags += ["-c", f"mcp_servers.{name}.enabled=false"]
-        flags += ["-c", "project_doc_max_bytes=0"]  # ai-team sends the targeted project context itself
-        _CODEX_FLAGS = flags
+        _CODEX_FLAGS, _CODEX_KNOWN = flags, known
     return _CODEX_FLAGS
 
 
@@ -566,8 +566,26 @@ ENV_DENY = ["Read(./.env)", "Read(./.env.*)", "Read(**/.env)", "Read(**/.env.*)"
 ANSWER_SYSTEM = "You are ai-team's quick assistant. Answer briefly and precisely. No tools are available."
 
 
-def run_provider(provider, tier, prompt, write, role, tdir, label, allow_cmds, cwd=None):
-    """cwd = repo root: agents must work in the repository even when ai-team is started from a subdirectory."""
+def codex_research_flags():
+    """Codex web search, for tasks that need current external facts — only if this Codex version has the feature."""
+    codex_lean_flags()
+    return ["--enable", "web_search_request"] if "web_search_request" in _CODEX_KNOWN else []
+
+
+READ_TOOLS = ["Read", "Grep", "Glob", "Bash"]
+WRITE_TOOLS = ["Read", "Grep", "Glob", "Bash", "Edit", "Write", "NotebookEdit", "TodoWrite"]
+WEB_TOOLS = ["WebSearch", "WebFetch"]
+# Claude Code's own Bash sandbox (writes limited to the project, no network), like Codex's workspace-write sandbox:
+# a writer runs whatever commands it needs, without an allowlist kept by ai-team.
+CLAUDE_SANDBOX = json.dumps({"sandbox": {"enabled": True, "autoAllowBashIfSandboxed": True, "allowUnsandboxedCommands": False}})
+
+
+def run_provider(provider, tier, prompt, write, role, tdir, label, cwd=None, research=False):
+    """One native agent turn. As with ACP agents, the CLI owns its model, tools and execution; ai-team only picks the role's
+    permissions from each CLI's own safety model — Codex's sandbox (read-only / workspace-write), Claude Code's Bash
+    sandbox with edits accepted — and reads back the final message and usage. Agents load the project's own instructions
+    (AGENTS.md / CLAUDE.md → .ai/CONTEXT.md) natively, but not the user's global plugins, skills or MCP servers (token
+    cost). cwd = repo root: agents work in the repository even when ai-team starts in a subdirectory. → (text, usage, model)"""
     MODEL_CALLS[0] += 1
     spec = CFG["providers"][provider]["tiers"][str(tier)]
     model, effort = spec["model"], spec.get("effort")
@@ -576,8 +594,8 @@ def run_provider(provider, tier, prompt, write, role, tdir, label, allow_cmds, c
         out = tdir / f"{label}.codex.out"
         cmd = (["codex", "exec", "-m", model] + (["-c", f"model_reasoning_effort={effort}"] if effort else [])
                + ["-s", "workspace-write" if write else "read-only", "--skip-git-repo-check", "--ephemeral", "--json"]
-               + (["-C", str(cwd)] if cwd else [])
-               + codex_lean_flags() + ["-o", str(out), "-"])
+               + (["-C", str(cwd)] if cwd else []) + codex_lean_flags() + (codex_research_flags() if research else [])
+               + ["-o", str(out), "-"])
         r = subprocess.run(cmd, input=prompt, text=True, capture_output=True, timeout=3600, cwd=cwd)
         raw = r.stdout + r.stderr
         log.write_text(redact(raw[-20000:]))
@@ -589,21 +607,20 @@ def run_provider(provider, tier, prompt, write, role, tdir, label, allow_cmds, c
         cached = usage.get("cached_input_tokens", 0)  # codex counts cached tokens inside input_tokens
         return text, {"in": usage.get("input_tokens", 0) - cached, "cached": cached, "out": usage.get("output_tokens", 0), "usd": None}, model
     if provider == "claude":
-        # --setting-sources "": no CLAUDE.md / memory / hooks / plugins — ai-team already sends the targeted context (−2.2k measured).
         base = ["claude", "-p", "--model", model, "--output-format", "json", "--strict-mcp-config", "--disable-slash-commands",
-                "--setting-sources", "", "--max-budget-usd", str(spec.get("max_usd", 2))]
+                "--max-budget-usd", str(spec.get("max_usd", 2))]
         if effort and tier > 1:
             base += ["--effort", effort]
-        if role == "answer":  # no tools + tiny system prompt: measured ~1.1k input
-            cmd = base + ["--tools", "", "--system-prompt", ANSWER_SYSTEM]
+        web = WEB_TOOLS if research else []
+        if role == "answer":  # a general question: no tools, no project files, tiny system prompt (~1.1k input measured)
+            cmd = base + ["--setting-sources", "", "--tools", "", "--system-prompt", ANSWER_SYSTEM]
+        elif write:
+            cmd = base + ["--setting-sources", "project,local", "--permission-mode", "acceptEdits", "--settings", CLAUDE_SANDBOX,
+                          "--tools", *(WRITE_TOOLS + web), "--allowedTools", *[t for t in WRITE_TOOLS + web if t != "Bash"],
+                          "--disallowedTools", *ENV_DENY, "Bash(git push:*)"]
         else:
-            tools, allowed = ["Read", "Grep", "Glob", "Bash"], ["Read", "Grep", "Glob"] + ro_bash()
-            if write:
-                tools += ["Edit", "Write"]; allowed += ["Edit", "Write"] + [f"Bash({c}:*)" for c in allow_cmds]
-            if role == "researcher":
-                tools += ["WebSearch", "WebFetch"]; allowed += ["WebSearch", "WebFetch"]
-            cmd = base + ["--permission-mode", "acceptEdits" if write else "dontAsk", "--tools", *tools, "--allowedTools", *allowed,
-                          "--disallowedTools", *ENV_DENY]
+            cmd = base + ["--setting-sources", "project,local", "--permission-mode", "dontAsk", "--tools", *(READ_TOOLS + web),
+                          "--allowedTools", "Read", "Grep", "Glob", *ro_bash(), *web, "--disallowedTools", *ENV_DENY]
         r = subprocess.run(cmd, input=prompt, text=True, capture_output=True, timeout=3600, cwd=cwd)
         log.write_text(redact(r.stdout[-20000:] + "\n--stderr--\n" + r.stderr[-4000:]))
         try:
@@ -616,40 +633,39 @@ def run_provider(provider, tier, prompt, write, role, tdir, label, allow_cmds, c
         return j.get("result", ""), {"in": u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0),
                                      "cached": u.get("cache_read_input_tokens", 0), "out": u.get("output_tokens", 0),
                                      "usd": j.get("total_cost_usd")}, model
-    if provider == "gemini":  # headless gemini-cli flags; verified only when gemini is installed
-        cmd = ["gemini", "-m", model, "--output-format", "json"] + (["--approval-mode", "auto_edit"] if write else []) + ["-p", prompt]
-        r = subprocess.run(cmd, text=True, capture_output=True, timeout=3600, cwd=cwd)
-        log.write_text(redact(r.stdout[-20000:] + "\n--stderr--\n" + r.stderr[-4000:]))
-        try:
-            j = json.loads(r.stdout); text = j.get("response", "")
-        except ValueError:
-            text = r.stdout
-        if r.returncode != 0 or not text.strip():
-            raise ProviderError((r.stderr or r.stdout)[-600:])
-        return text, {"in": 0, "cached": 0, "out": 0, "usd": None}, model
     raise ProviderError(f"unknown provider {provider}")
 
 
-def parse_output(text, role):
+def parse_status(text, role):
+    """The agent's final message → dict: its trailing JSON status line (status, summary, files, questions or issues) plus
+    `answer`, the message above it. No status line → done: an answer stands, and for edits the checks decide."""
+    s = (text or "").strip()
     if role == "answer":
-        return {"role": role, "status": "done", "findings": [text.strip()]}
-    s = text.strip()
-    for cand in reversed(re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", s, re.S)):
-        try:
-            return json.loads(cand)
-        except ValueError:
-            pass
-    end = s.rfind("}")
-    for i, ch in enumerate(s):
-        if ch == "{" and end > i:
+        return {"status": "done", "answer": s}
+    lines = s.splitlines()
+    for i in range(len(lines) - 1, max(-1, len(lines) - 8), -1):  # the status line is one of the last few lines
+        line = lines[i].strip().strip("`").strip()
+        if line.startswith("{") and line.endswith("}"):
             try:
-                return json.loads(s[i:end + 1])
+                data = json.loads(line)
             except ValueError:
                 continue
-    if "NO_CHANGE_REQUIRED" in s:
-        return {"role": role, "status": "no_change", "findings": [s[:800]]}
-    return {"role": role, "status": "blocked", "confidence": 0.0, "findings": [s[:1500]],
-            "open_questions": ["Provider returned no valid structured result; completion is unverified."], "_unstructured": True}
+            if isinstance(data, dict):
+                return dict(data, answer=re.sub(r"```(json)?\s*$", "", "\n".join(lines[:i])).strip())
+    m = re.search(r"\{[\s\S]*\}\s*(```)?\s*$", s)  # a multi-line JSON object at the end
+    if m:
+        try:
+            data = json.loads(m.group(0).strip().rstrip("`").strip())
+            if isinstance(data, dict):
+                return dict(data, answer=re.sub(r"```(json)?\s*$", "", s[:m.start()]).strip())
+        except ValueError:
+            pass
+    return {"status": "done", "answer": s, "_unstructured": True}
+
+
+def questions(out):
+    """What the agent says only the user can answer (blocked tasks)."""
+    return [str(q) for q in (out.get("questions") or out.get("open_questions") or out.get("unresolved_questions") or []) if q]
 
 
 # ── cost-aware provider selection (T0 arithmetic over config + local history) ──
@@ -706,7 +722,7 @@ def role_dim(role, intent=None, docs=False):
         return "docs" if docs else "edit"
     if role == "architect":
         return "debug" if intent == "DEBUG" else "architecture"
-    return {"answer": "analysis", "explorer": "explore", "reviewer": "review", "researcher": "research", "judge": "architecture"}.get(role, "analysis")
+    return {"answer": "analysis", "explorer": "explore", "reviewer": "review", "researcher": "research"}.get(role, "analysis")
 
 
 def score(role, provider, tier, complexity, ctx, intent=None, docs=False):
@@ -752,7 +768,7 @@ def explain(ranked, avoided=None, implementer=None):
     b = ranked[0]
     need = {"edit": "edits repo", "docs": "edits docs", "research": "external research"}.get(b["dim"], "read-only")
     if len(ranked) == 1:
-        why = f"{need}; only available provider"
+        why = f"{need}; " + ("the other provider" if implementer and b["provider"] != implementer else "only available provider")
     else:
         o = ranked[1]
         if not o["eligible"]:
@@ -764,76 +780,33 @@ def explain(ranked, avoided=None, implementer=None):
     return why + (f"; n={b['n']} ({evidence_label(b['n'])})" if b["n"] else "")
 
 
-# ── targeted prompt packages ───────────────────────────────────────────────────
-SCHEMA = {
-    "explorer":    '{"status":"done|needs_change|no_change","confidence":0.0,"relevant_files":["path:line"],"relevant_symbols":[],"root_cause_candidate":"","root_causes":["only if several"],"affected_subsystems":[],"architecture_decision_required":false,"external_research_required":false,"risk":"low|medium|high","unresolved_questions":[],"recommended_next_stage":"implementer|architect|researcher|none","complexity":"MICRO|SMALL|MEDIUM|COMPLEX","findings":["fact or direct answer"],"next_action":"exact change if needed"}',
-    "implementer": '{"status":"done|no_change|blocked","confidence":0.0,"files":["changed paths"],"findings":["what changed"],"open_questions":[],"risks":[]}',
-    "reviewer":    '{"status":"done","issues":[{"severity":"critical|high|medium|low","file":"","line":0,"problem":"","fix":""}]}',
-    "architect":   '{"status":"done","confidence":0.0,"change_required":true,"decision":"","files":[],"risks":[],"workstreams":[{"files":[],"action":""}],"next_action":""}',
-    "researcher":  '{"status":"done","findings":["fact (source URL)"],"next_action":""}',
-    "judge":       '{"status":"done","decision":"","findings":["deciding evidence"],"issues":[{"severity":"","file":"","line":0,"problem":"","fix":""}]}',
-}
-NEEDS_PROJECT = {"explorer", "architect", "implementer", "reviewer", "judge"}
-NEEDS_MAP = {"explorer", "architect"}
-TRIM_ORDER = ("repo-map", "project", "docs")
+# ── the prompt: the original task plus a few router lines ───────────────────────
+WRITE_STATUS = ('End your final message with ONE line of JSON: {"status":"done|no_change|blocked|failed","summary":"one line",'
+                '"files":["changed paths"],"questions":["only what only the user can answer"]}')
+READ_STATUS = 'End your final message with ONE line of JSON: {"status":"done|blocked|failed","summary":"one line"}'
+REVIEW_STATUS = ('End with ONE line of JSON: {"status":"done","issues":[{"severity":"critical|high|medium|low","file":"","line":0,'
+                 '"problem":"","fix":""}]} (no real defects → "issues":[]).')
 
 
-def build_prompt(role, handoff, root, rmap, complexity="SMALL", extra="", files_known=True):
-    """Stable prefix (role → schema → project → map) then volatile (handoff → diff). No timestamps or ids. → (prompt, sizes)."""
+def task_prompt(role, task, root=None, write=False, extra="", gdirs=()):
+    """What the agent receives: the user's task, untouched, plus a few router lines (permissions, output contract). No
+    project dump, role essay or workflow text — the agent loads its own project instructions and reads files itself."""
     if role == "answer":
-        parts = [("task", handoff)]
+        return task
+    lines = [task, "", "---", "ai-team: non-interactive run — solve this yourself with your own tools, then stop."]
+    if role == "reviewer":
+        lines.append("Read-only review of the uncommitted changes (`git status`, `git diff`): report real defects only.")
+    elif not write:
+        lines.append("Read-only: do not modify files.")
     else:
-        parts = [("role", (KIT / "roles" / f"{role}.md").read_text()),
-                 ("schema", f"End with ONE JSON object, nothing after it (omit empty fields): {SCHEMA[role]}")]
-        # Match only the task, not findings/diffs that happen to contain keywords.
-        task = handoff.splitlines()[0].removeprefix("TASK:").strip() if handoff else ""
-        parts.extend(capability_guidance(role, task, root))
-        if role in NEEDS_PROJECT:
-            parts.append(("project", project_context(root, role, complexity)))
-        if role in NEEDS_MAP or (role == "implementer" and not files_known):
-            compact = {k: rmap.get(k) for k in ("stacks", "package_manager", "dirs", "entry_points", "boundaries") if rmap.get(k)}
-            parts.append(("repo-map", "# Repo map (index — open files yourself)\n" + json.dumps(compact, separators=(",", ":"), ensure_ascii=False)))
-        parts.append(("handoff", "# Handoff\n" + handoff))
-        if extra:
-            parts.append(("diff", extra))
-    budget = CFG["context_budget"].get(complexity, 8000)
-    sizes = {k: tok(v) for k, v in parts}
-    if budget and sum(sizes.values()) > budget:  # drop least valuable first, then trim the diff to what is left
-        for drop in tuple(k for k, _ in parts if k.startswith(("workflow:", "optional:"))) + TRIM_ORDER:
-            parts = [(k, v) for k, v in parts if k != drop]
-            if sum(tok(v) for _, v in parts) <= budget:
-                break
-        room = max(0, budget - sum(tok(v) for k, v in parts if k != "diff")) * 4
-        parts = [(k, (v[:room] + "\n…(diff truncated to fit the context budget; run `git diff -- <file>` for the rest)") if k == "diff" and len(v) > room else v)
-                 for k, v in parts]
-        sizes = {k: tok(v) for k, v in parts}
-        sizes["_trimmed"] = True
-    return "\n\n".join(v for _, v in parts if v), sizes
-
-
-def make_handoff(task, st, next_action, constraints=""):
-    """TASK / RESULT / CONFIDENCE / FILES / EVIDENCE / RISKS / OPEN QUESTIONS / NEXT ACTION — non-empty sections only, paths not contents."""
-    out = [f"TASK: {task}"]
-    if st.get("result"):
-        out.append(f"RESULT: {st['result']}")
-    if st.get("confidence") is not None:
-        out.append(f"CONFIDENCE: {st['confidence']:.2f}")
-    if st["files"]:
-        out.append("FILES (open them yourself):\n" + "\n".join(f"- {x}" for x in sorted(st["files"])[:25]))
-    if st.get("docs"):
-        out.append("DOCS (open only if needed): " + ", ".join(st["docs"]))
-    if st["findings"]:
-        out.append("EVIDENCE:\n" + "\n".join(f"- {x}" for x in st["findings"][:12]))
-    if st["decision"]:
-        out.append(f"DECISION: {st['decision']}")
-    if st.get("risks"):
-        out.append("RISKS: " + "; ".join(st["risks"][:5]))
-    if st["open"]:
-        out.append("OPEN QUESTIONS:\n" + "\n".join(f"- {x}" for x in st["open"][:6]))
-    out.append(f"NEXT ACTION: {next_action}")
-    if constraints:
-        out.append(f"CONSTRAINTS: {constraints}")
-    return "\n".join(out)[:LIM["handoff_chars"]]
+        lines.append("Do not commit or push." + (f" Never edit generated output ({', '.join(d + '/' for d in gdirs)}); fix its source."
+                                                 if gdirs else ""))
+    if root is not None and graph_ready(Path(root)):
+        lines.append("Optional: a code graph is available (`graphify query|path|explain`); confirm in source.")
+    if extra:
+        lines.append(extra)
+    lines.append(REVIEW_STATUS if role == "reviewer" else WRITE_STATUS if write else READ_STATUS)
+    return "\n".join(lines)
 
 
 # ── git change tracking ────────────────────────────────────────────────────────
@@ -856,20 +829,6 @@ def changed(root, before):
     if before is None or after is None:
         return []
     return sorted(p for p in set(before) | set(after) if before.get(p) != after.get(p))
-
-
-def diff_for(root, files):
-    if not files:
-        return "(no changes)"
-    _, stat = sh(["git", "diff", "--stat", "--"] + files, cwd=root)
-    _, body = sh(["git", "diff", "--"] + files, cwd=root)
-    _, untracked = sh(["git", "ls-files", "--others", "--exclude-standard", "--"] + files, cwd=root)
-    for p in untracked.split():
-        body += f"\n--- new file {p}\n" + (root / p).read_text(errors="replace")[:4000]
-    body = redact(body)
-    if len(body) > LIM["diff_chars"]:
-        body = body[:LIM["diff_chars"]] + "\n…(diff truncated; run `git diff -- <file>` for the rest)"
-    return f"# Diff\n{stat}\n{body}"
 
 
 # ── change-aware verification (T0) ────────────────────────────────────────────
@@ -929,6 +888,45 @@ def select_checks(files, complexity, task, cmds, root=None):
             want.append(key)  # explicitly requested
     out = [cmds[k] for k in ("typecheck", "lint", "test", "build") if k in want and k in cmds]
     return out, "+".join(sorted(kinds)) + " changed", json_files
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+DIAG_RE = re.compile(r"^(?P<file>[\w./@\[\]-]+\.\w{1,5})(?:[(:](?P<line>\d+)(?:[,:](?P<col>\d+))?\)?)?:?\s*-?\s*(?P<sev>error|warning)\s*"
+                     r"(?P<code>[A-Z]{1,6}\d+)?:?\s*(?P<msg>.*)$", re.I)
+ESLINT_ROW = re.compile(r"^\s+(?P<line>\d+):(?P<col>\d+)\s+(?P<sev>error|warning|✖|⚠)\s+(?P<msg>.*?)(?:\s{2,}(?P<code>[@\w/-]+))?$")
+FILE_LINE = re.compile(r"^(?:[\w./@\[\]-]+|/[^:]*?)\.\w{1,5}$")  # eslint/stylelint file header (relative or absolute)
+NOISE_RE = re.compile(r"^(found \d+ errors?|error command failed|info visit|done in|\$ |yarn run|npm err|✖ \d+ problems?|\d+ problems?|checking formatting|all matched files use|> )", re.I)
+
+
+def norm_msg(t):
+    t = ANSI_RE.sub("", t)
+    t = re.sub(r"(/private)?/(tmp|var/folders)/[^\s:'\"]+", "<tmp>", t)
+    t = re.sub(r"\b\d{1,2}:\d{2}(:\d{2})?(\.\d+)?\b|\b\d+(\.\d+)?\s?m?s\b", "", t)  # timestamps, durations
+    return re.sub(r"\s+", " ", t).strip().lower()
+
+
+def diagnostics(output):
+    """Tool text → Counter{fingerprint: n} and {fingerprint: raw line} for baseline comparison. Fingerprint = file|code|message;
+    line/column numbers and ordering are ignored (they shift with unrelated edits)."""
+    fps, raw, cur = Counter(), {}, None
+    for line in ANSI_RE.sub("", output or "").splitlines():
+        m = DIAG_RE.match(line.strip())
+        if m and not m.group("file").startswith(("node_modules", "_next")):
+            fp = f"{m.group('file')}|{(m.group('code') or '').upper()}|{norm_msg(m.group('msg'))}"
+        elif FILE_LINE.match(line.strip()):
+            cur = line.strip(); continue
+        elif cur and ESLINT_ROW.match(line):
+            e = ESLINT_ROW.match(line)
+            fp = f"{cur}|{e.group('code') or ''}|{norm_msg(e.group('msg'))}"
+        else:
+            continue
+        fps[fp] += 1; raw.setdefault(fp, line.strip()[:220])
+    if not fps:  # unparseable output: compare normalized non-noise lines, digits masked
+        for line in (output or "").splitlines():
+            t = re.sub(r"\d+", "#", norm_msg(line))
+            if t and not NOISE_RE.match(norm_msg(line)):
+                fps[t] += 1; raw.setdefault(t, line.strip()[:220])
+    return fps, raw
 
 
 def compare_checks(base_ok, base_out, after_ok, after_out):
@@ -1001,421 +999,38 @@ def verify(root, cmds, json_files, tdir, baseline=None):
     return all(r["ok"] for r in res), res
 
 
-RUN_STATES = ("run", "required")  # "required" = legacy spelling of "run now"
-CLEAN_STATES = ("CLEAN", "CLEAN_WITH_WARNINGS")
-NOISE_STATUSES = ("NOISE_ONLY", "GENERATED_ONLY")
+MUTATING = re.compile(r"(^|\s)(--fix\b|--fix-type\b|--write\b|-w\b|--update-?snapshots?\b|-u\b|--apply\b|--save\b)")
+SCRIPT_RUNNERS = ("npm", "pnpm", "yarn", "bun")
+
+
+def mutating(cmd, scripts, depth=0):
+    """Would running this check modify files? A fixer/writer flag, tsc without --noEmit, or a package script
+    (`npm run x`, `yarn x`) that does either."""
+    if MUTATING.search(cmd) or (re.search(r"(^|[\s/])tsc(\s|$)", cmd) and not re.search(r"--noEmit\b", cmd, re.I)):
+        return True
+    toks = cmd.split()
+    if len(toks) >= 2 and toks[0] in SCRIPT_RUNNERS and depth < 4:
+        name = toks[2] if toks[1] in ("run", "run-script") and len(toks) > 2 else toks[1]
+        return name in scripts and mutating(scripts[name], scripts, depth + 1)
+    return False
 
 
 def check_commands(root, rmap):
-    """Commands ai-team runs as checks: the map's, but a mutating one only in its allowlisted read-only form (else not at all).
-    Explicit user requests ("run lint") still run the project's own command."""
-    cmds, pkg = dict(rmap.get("commands", {})), package_scripts(root, rmap)
-    scripts, execp = (pkg[0], pkg[2]) if pkg else ({}, "")
-    for k in ("typecheck", "lint", "test", "build", "format"):
-        if cmds.get(k):
-            f = read_only_form(cmds[k], scripts, execp)
-            if f["confidence"] != "exact":
-                cmds[k] = f["cmd"]
-                if not f["cmd"]:
-                    cmds.pop(k)
-    return cmds
-
-
-def safe_diag_commands(root, rmap):
-    """→ {category: record} for the script-backed evidence sources, read-only forms only (pre-registry API)."""
-    ctx, out = DIAG.Context(root, rmap), {}
-    for a in DIAG.adapters().values():
-        if hasattr(a, "from_scripts"):
-            rec = a.from_scripts(ctx) or (a.derive(ctx, False) if a.derive else None)
-            if rec:
-                out[a.category] = rec
-    return out
-
-
-def diag_plan(task, root, rmap, evidence=None):
-    """Evidence plan for a maintenance task (pre-registry API; see diagnostics.plan_rows)."""
-    sig = classify(task, root)[3]
-    return DIAG.plan_rows(task, DIAG.Context(root, rmap, task, evidence), maintenance=True, broad=sig.get("broad", True), supplied=evidence)
-
-
-def required_gaps(rows):
-    """REQUIRED sources ai-team cannot read here. They never stop a task: the model inspects them itself and they are
-    reported as not verified."""
-    return [r for r in rows or [] if r.get("need", "required") == "required" and r["state"] == "unavailable"]
-
-
-def parse_evidence(specs):
-    """--evidence [SOURCE=]PATH (repeatable) → {SOURCE or "": [absolute paths]}; paths are relative to the current directory."""
-    out = {}
-    for spec in specs or []:
-        m = re.match(r"^([A-Za-z][\w:.-]*)=(.+)$", spec)
-        src, path = (m.group(1), m.group(2)) if m and not Path(spec).exists() else ("", spec)
-        out.setdefault(src, []).append(str(Path(path).expanduser().resolve()))
-    return out
-
-
-def render_plan(rows):
-    """Evidence plan before anything runs; REQUIRED sources that cannot be read are flagged with an optional way to verify them."""
-    lines = []
-    for d in rows:
-        what = d.get("cmd") or (", ".join(Path(e).name for e in d["evidence"]) if d.get("evidence") else "")
-        lines.append(f"     {d.get('source') or d['cat'].upper():<20} {d.get('need', 'required').upper():<9} {d['state']:<15} {what}"
-                     + (f"   ({d['note']})" if d.get("note") else ""))
-    gaps = required_gaps(rows)
-    if gaps:
-        lines.append("  ⚠ not readable here: " + ", ".join(g["source"] for g in gaps)
-                     + " — the model inspects source/configuration itself; reported as not verified")
-        for g in gaps:
-            steps = (g.get("unblock") or "").splitlines()
-            if steps:
-                lines.append(f"     optional, to verify {g['source']}: {steps[0]}")
-    return "\n".join(lines)
-
-
-def generated_notes(root, is_gen, task_paths=()):
-    """GENERATED / IDE_ONLY report lines. Never writes IDE settings; recommends exclusion only (JetBrains: .idea present)."""
-    lines, dirs = [], getattr(is_gen, "dirs", {})
-    if dirs:
-        lines.append("  GENERATED  " + ", ".join(f"{d}/ ({e})" for d, e in dirs.items())
-                     + " — build/test output: not source; excluded from fixes; never edited")
-        if (root / ".idea").is_dir():
-            tracked = sh(["git", "ls-files", "--", ".idea"], cwd=root)[1].strip()
-            lines.append("  IDE_ONLY   IDE inspections of generated files are not source failures. Recommended: mark "
-                         + ", ".join(d + "/" for d in dirs) + (" Excluded in the tracked JetBrains module (.iml) if the team agrees"
-                                                                if tracked else " as Excluded in the IDE (local setting; .idea is not tracked, nothing written)"))
-    ide = [p for p in task_paths if is_gen(p)]
-    if ide:
-        lines.append(f"  IDE_ONLY   {', '.join(ide[:5])}: generated output named in the task — classified GENERATED, not edited; fix its source")
-    return lines
-
-
-def gen_snapshot(root, dirs, cap=64 << 20):
-    """Stat (and, within the cap, content) of every file under generated dirs so an agent edit there can be undone."""
-    snap, used = {}, 0
-    for d in dirs:
-        for cur, subdirs, names in os.walk(root / d):
-            subdirs[:] = [s for s in subdirs if not (Path(cur) / s).is_symlink()]
-            for n in names:
-                p = Path(cur) / n
-                try:
-                    st = p.lstat()
-                    data = p.read_bytes() if not p.is_symlink() and used + st.st_size <= cap else None
-                except OSError:
-                    continue
-                used += len(data or b"")
-                snap[str(p.relative_to(root))] = (st.st_mtime_ns, st.st_size, data)
-    return snap
-
-
-def gen_restore(root, dirs, before):
-    """Undo changes under generated dirs since `before`. → (restored, unrestorable)."""
-    now = {k: v[:2] for k, v in gen_snapshot(root, dirs, cap=0).items()}
-    restored, lost = [], []
-    for rel in sorted(set(before) | set(now)):
-        if before.get(rel, (None, None))[:2] == now.get(rel):
-            continue
-        p = root / rel
-        if rel not in before:
-            p.unlink(missing_ok=True); restored.append(rel)
-        elif before[rel][2] is not None:
-            p.parent.mkdir(parents=True, exist_ok=True); p.write_bytes(before[rel][2]); restored.append(rel)
-        else:
-            lost.append(rel)
-    return restored, lost
-
-
-def run_diag(root, row, want_warnings, runner=None, is_gen=None, scope=(), spelling=False):
-    """Execute or read one evidence row (T0, read-only) → normalized, classified findings and a status (see restatus).
-    Supplied evidence is read, a command runs in its read-only form, a report a command writes is read fresh or the row is
-    BROKEN — a failing or unreadable source never reads as clean."""
-    t0, core = time.time(), DIAG.core
-    src = row.get("source") or row["cat"].upper()
-    adapter = DIAG.adapters().get(row.get("source") or "")
-    ok, out, found, broken = True, "", [], ""
-    if row.get("evidence"):
-        for p in row["evidence"]:
-            try:
-                found += core.load_evidence(p, src)[1]
-            except (OSError, ValueError) as e:
-                broken = f"evidence unreadable: {e}"
-    else:
-        report = root / row["output"] if row.get("output") else None
-        if report is not None:
-            report.unlink(missing_ok=True)  # a stale report is never read as fresh evidence
-        outs = []
-        for c in row.get("cmds") or [row["cmd"]]:
-            if runner:
-                c_ok, c_out = runner(c)
-            else:
-                try:
-                    r = subprocess.run(c, shell=True, cwd=root, capture_output=True, text=True, stdin=subprocess.DEVNULL,
-                                       timeout=row.get("timeout") or LIM["verify_timeout_s"])
-                    c_ok, c_out = r.returncode == 0, r.stdout + r.stderr
-                except subprocess.TimeoutExpired:
-                    c_ok, c_out = False, "timeout"
-            ok, outs = ok and c_ok, outs + [c_out]
-        out = "\n".join(outs)
-        if report is not None:
-            if report.is_file():
-                try:
-                    found = core.load_evidence(report, src)[1]
-                except (OSError, ValueError) as e:
-                    broken = f"report unreadable: {e}"
-            else:
-                broken = f"no report at {row['output']}: the command did not produce its evidence"
-        elif row.get("parser") not in (None, "text") and out.strip():
-            try:
-                found = core.parse_evidence_text(out, src)[1]
-            except ValueError:
-                found = core.parse_text(out, src, failed=not ok)
-        else:
-            found = adapter.parse(out, None, failed=not ok) if adapter else core.parse_text(out, src, failed=not ok)
-    for f in found:
-        core.classify(f, is_gen, root, scope)
-    return restatus(dict(row, ok=ok and not broken, out=redact(out[-60000:]), s=round(time.time() - t0), findings=found[:5000],
-                         want_warnings=want_warnings or (not ok and not row.get("evidence")), spelling=spelling, broken=broken))
-
-
-def restatus(r):
-    """Status from classified findings: PASS · FAIL (actionable source findings, or a failure nothing explains) ·
-    NOISE_ONLY (only generated / third-party / IDE-only / low-value findings) · BROKEN (misconfigured check, unreadable evidence).
-    Recomputed when an authority reclassifies findings."""
-    found = r.get("findings") or []
-    for f in found:
-        f["actionable"] = DIAG.core.actionable(f, r.get("want_warnings"), r.get("spelling"))
-    act = [f for f in found if f["actionable"]]
-    noise = Counter(f["class"] for f in found if not f["actionable"])
-    status, note = "PASS", r.get("note", "")
-    if r.get("broken"):
-        status, note = "BROKEN", r["broken"]
-    elif not r["ok"] and not any(not f.get("fallback") for f in found) and BROKEN_CHECK_RE.search(r.get("out", "")):
-        status, note = "BROKEN", "check misconfigured: " + BROKEN_CHECK_RE.search(r["out"]).group(0)
-    elif act or (not r["ok"] and not found):
-        status = "FAIL"
-    elif noise:
-        status, n = "NOISE_ONLY", sum(noise.values())
-        note = (f"{n} diagnostic(s) only in generated/vendor output — not source failures" if set(noise) <= {"GENERATED_OUTPUT", "THIRD_PARTY"}
-                else f"{n} non-actionable: " + ", ".join(f"{'source warnings (not requested)' if k == 'REAL_SOURCE_WARNING' else k} {v}"
-                                                        for k, v in noise.most_common()))
-    return dict(r, status=status, note=note, errors=len(act) or int(status == "FAIL"), actionable=len(act),
-                warnings=sum(1 for f in found if f["class"] == "REAL_SOURCE_WARNING"),
-                generated=noise["GENERATED_OUTPUT"] + noise["THIRD_PARTY"], classes=dict(Counter(f["class"] for f in found)))
-
-
-def overall_state(results):
-    """DIRTY: a source has actionable findings. INCOMPLETE: nothing actionable, but a REQUIRED source could not be read (or
-    nothing could) — the model then inspects the project itself; it is never a reason to stop.
-    CLEAN_WITH_WARNINGS: all that ran is clean, but an OPTIONAL source was unavailable/misconfigured or only noise was
-    found. CLEAN: every selected source was read and is clean."""
-    if any(r.get("status") == "FAIL" for r in results):
-        return "DIRTY"
-    gaps = [r for r in results if r["state"] == "unavailable" or r.get("status") == "BROKEN"
-            or (r["state"] in RUN_STATES and r.get("status") is None)]
-    ran = [r for r in results if r.get("status") in ("PASS",) + NOISE_STATUSES]
-    if any(r.get("need", "required") == "required" for r in gaps) or (gaps and not ran):
-        return "INCOMPLETE"
-    return "CLEAN_WITH_WARNINGS" if gaps or any(r.get("status") in NOISE_STATUSES for r in results) else "CLEAN"
-
-
-def group_key(r, f):
-    tmpl = re.sub(r"'[^']*'|\"[^\"]*\"|`[^`]*`|\d+", "X", norm_msg(f.get("message") or ""))[:90]
-    return f"{r.get('source') or r['cat'].upper()} {f.get('code') or ''} {tmpl}".strip()
-
-
-def unreadable(r):
-    """A selected diagnostic source ai-team could not read here (unavailable, or the check itself is misconfigured)."""
-    return r["state"] == "unavailable" or r.get("status") == "BROKEN"
-
-
-def diag_vres(results, addressed=frozenset()):
-    """Evidence results → verification rows. Only actionable findings fail. A source that could not be read, a noise-only
-    source and a supplied report whose findings were all addressed are warnings (not verified): diagnostics support the
-    task and never veto finished work, and "DONE" never sits next to a failing row."""
-    out = []
-    for r in results:
-        label = r.get("source") or r["cat"]
-        if unreadable(r):
-            what = "not readable here" if r["state"] == "unavailable" else "check misconfigured"
-            out.append({"cmd": r.get("cmd") or label, "ok": True, "s": r.get("s", 0), "tail": r.get("note", ""), "status": "PASS_WITH_WARNINGS",
-                        "note": f"{label} not verified ({r.get('need', 'required')}, {what})" + (f": {r['note']}" if r.get("note") else "")})
-        elif r.get("status") in NOISE_STATUSES:
-            out.append({"cmd": r.get("cmd") or label, "ok": True, "s": r.get("s", 0), "tail": "", "status": "PASS_WITH_WARNINGS", "note": r["note"]})
-        elif r.get("status") == "FAIL" and r.get("static") and {group_key(r, f) for f in r.get("findings") or [] if f.get("actionable")} <= set(addressed):
-            out.append({"cmd": label, "ok": True, "s": 0, "tail": "", "status": "PASS_WITH_WARNINGS",
-                        "note": f"{r['errors']} finding(s) from the supplied {label} report addressed — not re-verified (a fresh report would confirm)"})
-        elif r.get("status"):
-            out.append({"cmd": r.get("cmd") or label, "ok": r["status"] == "PASS", "s": r.get("s", 0), "tail": "",
-                        "status": "PASS" if r["status"] == "PASS" else "FAIL", "pre": r["errors"], "new": 0, "fixed": 0})
-    return out
-
-
-def group_diags(results, limit=12, is_gen=None):
-    """Deterministic root-cause groups over ACTIONABLE findings (same source + code + message template). Noise classes
-    never reach an implementer, and a few groups per batch keep thousands of IDE warnings out of any prompt.
-    → [{key, count, files, example, static}]"""
-    groups = {}
-    for r in results:
-        if r.get("status") != "FAIL":
-            continue
-        found = r.get("findings")
-        if found is None:  # a pre-registry row that carries raw output only
-            found = [DIAG.core.classify(f, is_gen) for f in DIAG.core.parse_text(r.get("out", ""), r["cat"], failed=not r.get("ok", False))]
-            for f in found:
-                f["actionable"] = f["class"] in ("REAL_SOURCE_ERROR", "REAL_SOURCE_WARNING")
-        for f in found:
-            if f.get("actionable"):
-                key = group_key(r, f)
-                g = groups.setdefault(key, {"key": key, "count": 0, "files": set(), "example": f.get("raw") or f.get("message", ""),
-                                            "static": bool(r.get("static"))})
-                g["count"] += 1
-                g["files"].add(f.get("file") or "(output)")
-    return sorted(groups.values(), key=lambda g: (-g["count"], len(g["files"])))[:limit]
-
-
-def render_diags(results):
-    lines = []
-    for r in results:
-        need = r.get("need", "required").upper()
-        head = f"  {r.get('source') or r['cat'].upper():<20} {need:<9} "
-        what = r.get("cmd") or ("evidence " + ", ".join(Path(e).name for e in r["evidence"]) if r.get("evidence") else "")
-        derived = f"   (derived from {r['configured_command']}: {r['derivation_reason']})" if r.get("derived_read_only_command") and r.get("configured_command") else ""
-        if r["state"] == "not configured":
-            lines.append(head + "skipped — not configured" + (f" ({r['note']})" if r.get("note") else ""))
-        elif r["state"] == "unavailable":
-            lines.append(head + f"UNAVAILABLE — {r['note']}" + (" → not verified; the model inspects it directly" if need == "REQUIRED"
-                                                                else " → warning, does not block"))
-        elif r.get("status") is None:
-            lines.append(head + (f"deferred until static checks are clean ({what})" if r["state"] == "deferred" else f"planned: {what}"))
-        elif r["status"] == "BROKEN":
-            lines.append(head + f"⚠ {what} — {r['note']} (fix the script or evidence; not counted as code errors)")
-        elif r["status"] in NOISE_STATUSES:
-            lines.append(head + f"⚠ {what} — {r['note']}")
-        else:
-            detail = (f"{r['errors']} actionable" if r["status"] == "FAIL" else "") + (f"{' · ' if r['status'] == 'FAIL' else ''}{r['warnings']} warning(s)" if r["warnings"] else "")
-            lines.append(head + f"{'✓' if r['status'] == 'PASS' else '✗'} {what}" + (f" — {detail}" if detail else "") + derived)
-        if r.get("classes") and set(r["classes"]) - {"REAL_SOURCE_ERROR", "REAL_SOURCE_WARNING"}:
-            lines.append(" " * 33 + "classes: " + " · ".join(f"{k} {v}" for k, v in sorted(r["classes"].items(), key=lambda kv: -kv[1])))
-    return "\n".join(lines)
-
-
-ERR_LINE = re.compile(r"^(?P<file>[\w./@-]+\.\w{1,5})[(:](?P<line>\d+)")
-
-
-def diagnose(root, task, cmds):
-    """T0 diagnostics for 'fix all errors' tasks: run the check, group errors by file. → (cmd, ok, {file: [lines]})."""
-    key = "lint" if re.search(r"lint|eslint|линт", task, re.I) else "test" if re.search(r"\btests?\b|тест", task, re.I) else \
-          "build" if re.search(r"\bbuild\b|compile|сборк", task, re.I) else "typecheck"
-    c = cmds.get(key) or cmds.get("typecheck")
-    if not c:
-        return None, True, {}
+    """The project's check commands (repo map) that ai-team may run after an agent's edits — never a mutating one: running
+    fixers is the agent's job, not verification's."""
     try:
-        r = subprocess.run(c, shell=True, cwd=root, capture_output=True, text=True, timeout=LIM["verify_timeout_s"])
-    except subprocess.TimeoutExpired:
-        return c, False, {"(timeout)": ["check timed out"]}
-    groups, cur = {}, None
-    for line in (r.stdout + r.stderr).splitlines():
-        m = ERR_LINE.match(line.strip())
-        if m and not m.group("file").startswith(("node_modules", "_next")):
-            cur = m.group("file"); groups.setdefault(cur, []).append(redact(line.strip())[:200])
-        elif cur and re.match(r"^\s+\d+:\d+\s+(error|warning)", line):
-            groups[cur].append(redact(line.strip())[:200])
-    if r.returncode != 0 and not groups:
-        groups["(unparsed)"] = [redact(x)[:200] for x in (r.stdout + r.stderr).strip().splitlines()[-15:]]
-    return c, r.returncode == 0, groups
+        pkg = json.loads((Path(root) / "package.json").read_text())
+        scripts = (pkg.get("scripts") or {}) if isinstance(pkg, dict) else {}
+    except (OSError, ValueError):
+        scripts = {}
+    return {k: c for k, c in (rmap.get("commands") or {}).items()
+            if k in ("typecheck", "lint", "test", "build", "format") and c and not mutating(c, scripts)}
 
 
-# ── stage gates (T0) ───────────────────────────────────────────────────────────
-ARCH_TRIGGER = "confidence < {c:.2f} | architecture decision | >1 root cause | >{s} subsystem | >{f} files | open questions | risk"
-REVIEW_TRIGGER = "security/concurrency/public-API/config change, ≥{l} lines, several modules, low confidence, unverified, repaired failures, or off-plan files"
+# ── review gate (only where an independent look pays) ───────────────────────────
 SECURITY_CODE = re.compile(r"auth|session|token|password|crypt|permission|payment|stripe|checkout|migration|secret|credential", re.I)
 CONCURRENCY = re.compile(r"\b(async|await|Promise\.|mutex|lock\(|setTimeout|setInterval|useEffect|AbortController|Atomic|synchronized|goroutine|chan\b|thread|queue)", re.I)
 PUBLIC_API = re.compile(r"(^|/)(api|routes?|public|sdk)/|(^|/)index\.[jt]sx?$|\.d\.ts$|openapi|schema\.(graphql|json)")
-
-
-def architect_gate(out, p, planned):
-    """→ (run?, [reason codes], text). Planned architects are pruned when explorer evidence is sufficient;
-    unplanned ones are added only on strong evidence. CRITICAL / ARCHITECTURE / PLAN always keep the stage."""
-    g = CFG["gates"]["architect"]
-    cx, intent = p["complexity"], p["intent"]
-    if cx == "CRITICAL" or intent in ("ARCHITECTURE", "PLAN"):
-        return True, ["ARCHITECTURE_CHANGE" if intent == "ARCHITECTURE" else "SECURITY_RISK"], f"{intent}/{cx} keeps its reasoning stage"
-    thr = g["min_confidence_high_risk"] if p["signals"].get("high_risk") else g["min_confidence"]
-    conf = float(out.get("confidence", 0) or 0)
-    files = {str(f).split(":")[0] for f in (out.get("relevant_files") or out.get("affected_files") or out.get("files") or []) if f}
-    subs = [x for x in out.get("affected_subsystems", []) or [] if x]
-    causes = [x for x in out.get("root_causes", []) or [] if x]
-    unresolved = out.get("unresolved_questions") or out.get("open_questions") or []
-    strong, weak = [], []
-    if out.get("_unstructured"):
-        strong.append(("CONFLICTING_EVIDENCE", "explorer evidence unstructured"))
-    if out.get("architecture_decision_required"):
-        strong.append(("ARCHITECTURE_CHANGE", "architecture decision required"))
-    if str(out.get("risk", "")).lower() == "high" or out.get("risk_ambiguity"):
-        strong.append(("SECURITY_RISK", "high risk reported"))
-    if len(causes) > 1:
-        strong.append(("MULTIPLE_ROOT_CAUSES", f"{len(causes)} plausible root causes"))
-    if conf < 0.5:
-        strong.append(("LOW_CONFIDENCE", f"confidence {conf:.2f}"))
-    if conf < thr:
-        weak.append(("LOW_CONFIDENCE", f"confidence {conf:.2f} < {thr:.2f}" + (" (high-risk bar)" if p["signals"].get("high_risk") else "")))
-    if len(subs) > g["max_subsystems"]:
-        weak.append(("MULTIPLE_ROOT_CAUSES" if intent == "DEBUG" else "ARCHITECTURE_CHANGE", f"{len(subs)} subsystems"))
-    if len(files) > g["max_files"]:
-        weak.append(("ARCHITECTURE_CHANGE", f"{len(files)} files"))
-    if unresolved:
-        weak.append(("CONFLICTING_EVIDENCE", f"{len(unresolved)} unresolved question(s)"))
-    if intent == "DEBUG" and not out.get("root_cause_candidate"):
-        weak.append(("LOW_CONFIDENCE", "no localized root cause"))
-    if str(out.get("recommended_next_stage", "")).lower() == "architect":
-        weak.append(("ARCHITECTURE_CHANGE", "explorer recommends architect"))
-    if p["signals"].get("high_risk") and CONCURRENCY_KW.search(" ".join(map(str, causes + [out.get("root_cause_candidate", "")]))) and conf < 0.95:
-        weak.append(("CONCURRENCY_AMBIGUITY", "concurrency root cause below 0.95"))
-    reasons = strong + (weak if planned else [])
-    if reasons:
-        return True, sorted({c for c, _ in reasons}), "; ".join(t for _, t in reasons)
-    return False, [], f"localized: confidence {conf:.2f} ≥ {thr:.2f}, {len(files)} file(s), {len(subs) or 1} subsystem, no architecture decision"
-
-
-def review_gate(root, files, p, outs, vres, planned_files, repaired=False):
-    """→ (run?, reason) from the actual diff and verification — decided after deterministic checks."""
-    mode = p["review"]
-    if mode == "always":
-        return True, "quality budget reviews every code change"
-    if all(Path(f).suffix.lower() in DOC_EXT for f in files):
-        return False, "docs-only change"
-    _, num = sh(["git", "diff", "--numstat", "--"] + files, cwd=root)
-    lines = sum(int(a) + int(b) for a, b, *_ in (x.split("\t") for x in num.splitlines()) if a.isdigit() and b.isdigit())
-    _, diff = sh(["git", "diff", "-U0", "--"] + files, cwd=root)
-    touched = "\n".join(x for x in diff.splitlines() if x.startswith(("+", "-")) and not x.startswith(("+++", "---")))
-    code = [f for f in files if Path(f).suffix in CODE_EXT]
-    modules = {f.split("/")[0] if "/" in f else "." for f in code}
-    reasons = []
-    if p["complexity"] == "CRITICAL":
-        reasons.append("CRITICAL task")
-    if any(SECURITY_CODE.search(f) for f in files) or SECURITY_CODE.search(touched):
-        reasons.append("auth/security code changed")
-    if mode != "critical-only":
-        if lines >= CFG["gates"]["review"]["max_lines"]:
-            reasons.append(f"{lines} changed lines")
-        if len(modules) > 1:
-            reasons.append(f"{len(modules)} modules")
-        if any(CONFIG_RE.search(f) for f in files):
-            reasons.append("config/build files")
-        if any(PUBLIC_API.search(f) for f in files):
-            reasons.append("public API surface")
-        if CONCURRENCY.search(touched):
-            reasons.append("concurrency-related code")
-        if any(float(o.get("confidence", 1) or 0) < CFG["gates"]["review"]["min_implementer_confidence"] for o in outs):
-            reasons.append("low implementer confidence")
-        if code and not vres:
-            reasons.append("code changed but no check could run")
-        if repaired:
-            reasons.append("checks failed before they passed")
-        if planned_files and set(files) - set(planned_files):
-            reasons.append("files outside the plan: " + ", ".join(sorted(set(files) - set(planned_files))[:3]))
-    if reasons:
-        return True, "; ".join(reasons)
-    return False, f"small verified diff ({len(files)} file(s), {lines} lines)"
 
 
 LOGIC = re.compile(r"\b(if|else|switch|case|for|while|return|throw|try|catch|await)\b|&&|\|\||\?\?")
@@ -1465,109 +1080,89 @@ def review_size(root):
     return (1 if lines <= 60 and not logic else 2), "SMALL", f"{size}; {'no logic changes' if not logic else 'some logic changes'}"
 
 
-# ── planning ───────────────────────────────────────────────────────────────────
-def plan(task, budget, forced=None, root=None, apply=False, evidence=None):
+# ── planning: one native agent per task ─────────────────────────────────────────
+REPO_WIDE = R(r"\b(all|every|entire|whole|across|everywhere|codebase|project[- ]wide|repo(sitory)?[- ]wide)\b|все|всё|весь|везде")
+
+
+def estimate_context(task, sig, root):
+    """How much code the task is likely to touch (T0) → (scope, tokens): named files → their size; repo-wide wording or
+    broad maintenance → the tracked source size; otherwise a module-sized default."""
+    root = Path(root) if root is not None else None
+    if root is not None and sig.get("paths"):
+        return "files", 2000 + sum((root / p).stat().st_size for p in sig["paths"] if (root / p).is_file()) // 4
+    if root is not None and (sig.get("maintenance") or REPO_WIDE.search(task)):
+        _, out = sh(["git", "ls-files", "-z"], cwd=root)
+        total = 0
+        for f in out.split("\0")[:50000]:
+            if f and Path(f).suffix.lower() in CODE_EXT | STYLE_EXT and not any(x in GENERATED for x in Path(f).parts):
+                try:
+                    total += (root / f).stat().st_size
+                except OSError:
+                    pass
+        return "repo", max(20000, total // 4)
+    return "module", 20000
+
+
+def plan(task, budget, forced=None, root=None, apply=False):
+    """T0 routing decision → ONE native agent: its role (permissions, output contract, capability prior), the cheapest
+    capable tier (T3 only by escalation) and the cheapest capable provider at that tier (cost model + routing history)."""
     intent, cx, conf, sig = classify(task, root, forced)
     b = CFG["budgets"][budget]
     base = {"intent": intent, "complexity": cx, "confidence": conf, "signals": sig, "budget": budget, "steps": [], "apply": apply,
-            "max_tier": b["max_tier"], "max_parallel": b["max_parallel"], "judge": b["judge"], "review": b["review"],
-            "cross_review": rank(cx) >= rank(b["cross_review_from"]), "evidence": evidence or None}
-    ctx = DIAG.Context(root, load_map(root), task, evidence) if root is not None and intent not in ("META", "INSPECTION", "TOOL") else None
-    if ctx is not None and intent in ("REVIEW", "QUESTION", "UNKNOWN") and (sig.get("audit") or evidence):
-        # Read-only question about named sources: read them locally (T0); a read-only explorer only if one can't be read.
-        base.update(evidence_audit=True, diagnostics=DIAG.plan_rows(task, ctx, supplied=evidence))
-    if evidence and intent in CODE_INTENTS and sig.get("fix_only"):
-        sig["aggregate"] = True
-    if intent == "REVIEW" and root is not None and not base.get("evidence_audit"):
+            "max_tier": b["max_tier"], "review": b["review"]}
+    if intent in ("META", "INSPECTION", "TOOL"):
+        return dict(base, local=True)
+    tier = None
+    if intent == "REVIEW" and root is not None:
         rt, rcls, rwhy = review_size(root)
         base.update(review_class=rcls, review_reason=rwhy)
         if rt == 0 and not (rcls == "DOCS" and budget == "quality"):
             return dict(base, local=True, complexity="TRIVIAL")
-    if intent in ("META", "INSPECTION", "TOOL"):
-        return dict(base, local=True)
-    if base.get("evidence_audit"):
-        pipe = {"explorer": 1}
-    elif intent == "QUESTION":
-        pipe = {"explorer" if REPO_CUE.search(task) or sig["paths"] else "answer": 1}
-    elif intent == "UNKNOWN":
-        pipe = {"explorer": 1, "implementer": 1}
+        tier = 1 if budget == "economy" else max(1, rt)
+    if intent == "QUESTION":
+        role = "explorer" if REPO_CUE.search(task) or sig["paths"] else "answer"
     elif intent == "RESEARCH":
-        pipe = {"researcher": 1}
+        role = "researcher"
     elif intent == "REVIEW":
-        rt = {"DOCS": 1, "MICRO": 1, "SMALL": 1, "MEDIUM": 2, "HIGH": 2}.get(base.get("review_class"), 2)
-        if base.get("review_class") == "SMALL" and "some logic" in base.get("review_reason", ""):
-            rt = 2
-        pipe = {"reviewer": 1 if budget == "economy" else rt}
-    elif intent == "PLAN":
-        pipe = {"explorer": 1, "architect": 2} if cx != "SMALL" else {"explorer": 1}
+        role = "reviewer"
+    elif intent == "PLAN" or (intent == "ARCHITECTURE" and not apply):
+        role = "architect"  # a decision or plan, read-only; `--apply` lets the agent implement it
+    elif sig.get("analysis_first"):
+        role = "explorer"   # "find why X happens": diagnose read-only; ask for a fix to change files
     else:
-        pipe = dict(CFG["pipelines"][cx])
-        pipe.update(b.get("add", {}).get(cx, {}) if cx != "MICRO" else {})
-        for r in b.get("drop", {}).get(cx, []):
-            pipe.pop(r, None)
-        if sig["aggregate"]:
-            pipe = {"implementer": 2, "reviewer": 2}  # deterministic evidence replaces the explorer
-            if ctx is not None:
-                base["diagnostics"] = DIAG.plan_rows(task, ctx, maintenance=sig["maintenance"], broad=sig["broad"], supplied=evidence)
-        elif cx == "MEDIUM" and sig["paths"] and not sig["analysis_first"]:
-            pipe.pop("explorer", None)
-        if sig["analysis_first"]:
-            pipe.setdefault("explorer", 1)
-            if cx not in ("MICRO", "SMALL"):
-                pipe.setdefault("architect", 2)
-        if intent == "ARCHITECTURE":
-            pipe.setdefault("explorer", 1); pipe.setdefault("architect", 2)
-        if RESEARCH.search(task):
-            pipe["researcher"] = 1
-    if ctx is not None and intent in CODE_INTENTS and not sig.get("aggregate"):
-        gate = [r for r in DIAG.plan_rows(task, ctx, supplied=evidence) if r["need"] == "required"]
-        if gate:  # Check named sources after work; unavailable sources limit verification, not execution.
-            base["evidence_gate"] = gate
-    rmap = ctx.rmap if ctx is not None else {}
-    impl_provider, g = None, CFG["gates"]["architect"]
-    for role in ("answer", "explorer", "researcher", "architect", "implementer", "reviewer"):
-        if role not in pipe:
-            continue
-        tier = max(1, min(pipe[role] + b["tier_delta"].get(f"{cx}.{role}", 0), b["max_tier"], 2))  # T3 only via escalation
-        _, sizes = build_prompt(role, f"TASK: {task}\nNEXT ACTION: …", root or Path.cwd(), rmap, cx)
-        ctx = sum(v for k, v in sizes.items() if not k.startswith("_"))
-        avoid = impl_provider if role == "reviewer" and base["cross_review"] else None
-        ranked = choose(role, tier, cx, ctx, avoid, intent, docs=sig.get("docs") and role == "implementer")
-        if not ranked:
-            base["steps"].append({"role": role, "tier": tier, "provider": None, "model": None, "note": "no provider installed", "stage": "skipped"})
-            continue
-        best = ranked[0]
-        spec = CFG["providers"][best["provider"]]["tiers"][str(tier)]
-        step = {"role": role, "tier": tier, "provider": best["provider"], "model": spec["model"], "effort": spec.get("effort"),
-                "est": round(best["E"]), "ctx": ctx, "ctx_parts": {k: v for k, v in sizes.items() if not k.startswith("_")},
-                "why": explain(ranked, implementer=impl_provider if role == "reviewer" else None), "stage": "required", "trigger": "", "likely": True}
-        if role == "explorer" and base.get("evidence_audit"):
-            step.update(stage="conditional", trigger="only if a named source can't be read locally (then it inspects the project read-only)",
-                        likely=bool(required_gaps(base["diagnostics"])))
-        if role == "architect" and intent in ("IMPLEMENTATION", "DEBUG") and cx != "CRITICAL" and "explorer" in pipe:
-            thr = g["min_confidence_high_risk"] if sig.get("high_risk") else g["min_confidence"]
-            step.update(stage="conditional", trigger="if " + ARCH_TRIGGER.format(c=thr, s=g["max_subsystems"], f=g["max_files"]),
-                        likely=bool(sig.get("high_risk")))
-        if role == "implementer":
-            impl_provider = best["provider"]
-            if intent == "UNKNOWN":
-                step.update(stage="conditional", trigger="if the probe finds a required change", likely=False)
-            elif intent == "ARCHITECTURE" and not apply:
-                step.update(stage="approval", trigger="after approval: rerun with --apply", likely=False)
-            elif sig["analysis_first"]:
-                step.update(stage="conditional", trigger="if the diagnosis finds a required change", likely=True)
-            elif sig["maintenance"]:
-                step["trigger"] = "after T0 diagnostics: fixes their findings, or inspects directly if a source can't be read; skipped if all is clean"
-        if role == "reviewer" and intent == "REVIEW" and base.get("review_reason"):
-            step["why"] = f"{base['review_class']} review: {base['review_reason']}; " + step["why"]
-        if role == "reviewer" and intent != "REVIEW":
-            step.update(stage="required" if b["review"] == "always" else "conditional",
-                        trigger="" if b["review"] == "always" else "if " + ("CRITICAL or auth/security change" if b["review"] == "critical-only"
-                                                                            else REVIEW_TRIGGER.format(l=CFG["gates"]["review"]["max_lines"])),
-                        likely=b["review"] == "always" or rank(cx) >= RANK["COMPLEX"] or bool(sig.get("risk_keyword")))
-        if role == "researcher" and intent in CODE_INTENTS:
-            step["trigger"] = "task asks for current external knowledge"
-        base["steps"].append(step)
+        role = "implementer"
+    write = role == "implementer"
+    research = role == "researcher" or bool(sig.get("research"))
+    scope, est = estimate_context(task, sig, root) if role != "answer" else ("none", 0)
+    if tier is None:
+        tier = CFG["start_tier"].get(cx, 1) if write else (2 if role == "architect" and rank(cx) >= RANK["COMPLEX"] else 1)
+        tier += b.get("tier_delta", 0) if write else 0
+        if write and est > LIM["long_context_tokens"]:
+            tier = max(tier, 2)  # claude-code-router's long-context route: a large context is not a job for the cheapest tier
+            base["long_context"] = True
+    tier = max(1, min(tier, b["max_tier"], 2))  # plan-time tiers never include T3: it is reached only by escalation
+    ctx = tok(task_prompt(role, task, root, write))
+    base.update(role=role, write=write, research=research, scope=scope, context_estimate=est)
+    ranked = choose(role, tier, cx, ctx, None, intent, docs=bool(sig.get("docs")) and write)
+    if not ranked:
+        base["steps"].append({"role": role, "tier": tier, "provider": None, "model": None, "note": "no provider installed", "stage": "skipped"})
+        return base
+    best = ranked[0]
+    spec = CFG["providers"][best["provider"]]["tiers"][str(tier)]
+    base["steps"].append({"role": role, "tier": tier, "provider": best["provider"], "model": spec["model"], "effort": spec.get("effort"),
+                          "est": round(best["E"]), "ctx": ctx, "why": explain(ranked), "stage": "required", "trigger": "", "likely": True,
+                          "write": write, "research": research})
+    if write and b["review"] != "never":
+        rctx = tok(task_prompt("reviewer", task, root, extra="Review only these changed files: …"))
+        rv = choose("reviewer", 2, cx, rctx, best["provider"], intent)
+        if rv:
+            s = CFG["providers"][rv[0]["provider"]]["tiers"]["2"]
+            always = b["review"] == "always"
+            base["steps"].append({"role": "reviewer", "tier": 2, "provider": rv[0]["provider"], "model": s["model"], "effort": s.get("effort"),
+                                  "est": round(rv[0]["E"]), "ctx": rctx, "why": explain(rv, implementer=best["provider"]),
+                                  "stage": "required" if always else "conditional",
+                                  "trigger": "" if always else "only if the change touches auth/security/payments/migrations or the task is CRITICAL",
+                                  "likely": always or cx == "CRITICAL"})
     return base
 
 
@@ -1577,21 +1172,14 @@ def print_plan(p, root, rmap, task):
           f"Providers: {', '.join(available()) or 'none'}" + "".join(f" ({k} limited until {v[11:16]})" for k, v in cool.items()))
     if p["signals"].get("note"):
         print(f"Note:   {p['signals']['note']}")
-    if p.get("evidence_audit"):
-        print("  T0 evidence audit (read-only; readable sources are read locally with 0 model calls):\n" + render_plan(p["diagnostics"]))
     if p.get("local"):
         what = {"META": f"local answer ({p['signals'].get('meta', 'status')})", "INSPECTION": "git status / diff --stat",
-                "REVIEW": p.get("review_reason", "nothing to review"),
-                "TOOL": "project command from .ai/repo-map.json"}[p["intent"]]
-        print(f"  T0 {what} — 0 model calls, 0 tokens; verify skipped")
+                "REVIEW": p.get("review_reason", "nothing to review"), "TOOL": "project command from .ai/repo-map.json"}[p["intent"]]
+        print(f"  T0 {what} — 0 model calls, 0 tokens")
         return
-    llm = [s for s in p["steps"] if s["provider"]]
-    if p.get("diagnostics") is not None and not p.get("evidence_audit"):
-        print("  T0 diagnostics (read-only; they guide the model and never stop it):")
-        print(render_plan(p["diagnostics"]))
-    if p.get("evidence_gate"):
-        print("  Post-work checks (sources the task names; unreadable ones are reported as not verified):")
-        print(render_plan(p["evidence_gate"]))
+    needs = ["edits (the CLI's own sandbox)" if p.get("write") else "read-only"] + (["web research"] if p.get("research") else [])
+    print(f"Needs:  {' · '.join(needs)}" + (f"   Context: {p['scope']} ~{p['context_estimate'] / 1000:.0f}k tokens (the agent reads it itself)"
+                                            + (" → long context: T2+" if p.get("long_context") else "") if p.get("scope") not in (None, "none") else ""))
     for s in p["steps"]:
         if not s["provider"]:
             print(f"  T{s['tier']} {s['role']:<11} SKIPPED — {s['note']}")
@@ -1599,50 +1187,27 @@ def print_plan(p, root, rmap, task):
         print(f"  T{s['tier']} {s['role']:<11} {s['provider'] + '/' + s['model']:<21} {s['stage']:<11} ≈{s['est'] / 1000:>3.0f}k  {s['why']}")
         if s.get("trigger"):
             print(f"     {'':<11} {s['trigger']}")
-    writes = any(s["role"] == "implementer" and s["stage"] != "approval" for s in llm)
-    print("  T0 verify      " + ("local, only if files change; checks chosen by changed file types" if writes else "skipped (read-only)"))
-    if any(s["role"] == "explorer" for s in llm) and not any(s["role"] == "researcher" for s in llm):
-        print("     (+ researcher T1 only if the explorer reports external_research_required)")
-    req = [s for s in llm if s["stage"] == "required"]
-    likely = [s for s in llm if s["stage"] == "required" or (s["stage"] == "conditional" and s["likely"])]
-    exp = [s for s in llm if s["stage"] in ("required", "conditional")]
-
-    def path(xs):
-        return f"≈{sum(s['est'] for s in xs) / 1000:.0f}k ({' + '.join(s['role'] for s in xs) or 'none'})"
-    print(f"Cost:   minimum {path(req)} · likely {path(likely)} · expanded {path(exp)}" + ("  — units, not money" if req else ""))
-    if any(s["stage"] == "approval" for s in llm):
-        print("        approval stages are in no path until --apply")
-    print(f"T3:     {'only by escalation with a reason code' if p['max_tier'] >= 3 else 'not allowed in this budget'}")
+    if p.get("write"):
+        print("  T0 verify      after the agent: the project's checks for the changed files (baseline-aware, 0 tokens)")
+    print("On failure: transient → retry · limit/error/gave up → other provider · failed checks → retry, then one tier up"
+          + ("" if p["max_tier"] >= 3 else " (T3 not allowed in this budget)"))
 
 
 def print_context_plan(p, root, rmap, task):
-    """T0: what each call WOULD receive, by source. Provider-native baseline shown separately."""
+    """T0: the exact prompt the agent would receive from ai-team; everything else it loads or reads itself."""
     print(f"Intent: {p['intent']}   Complexity: {p['complexity']}   Budget: {p['budget']}")
     if p.get("local"):
         print("Context: none — T0 local path, no model call")
         return
-    ga = Path.home() / ".codex" / "AGENTS.md"
-    print("Provider-native (not built by ai-team): " + ", ".join(f"{n} ~{observed_baseline(n)[0] / 1000:.1f}k (n={observed_baseline(n)[1]})" for n in available()))
-    print(f"  auto-loaded instructions for workers: codex project AGENTS.md off (project_doc_max_bytes=0), global ~/.codex/AGENTS.md "
-          f"{tok(ga.read_text()) / 1000:.1f}k still loaded; claude CLAUDE.md/skills/plugins off (--setting-sources \"\")" if ga.exists() else "")
-    total, budget = 0, CFG["context_budget"].get(p["complexity"], 8000)
-    docs = relevant_docs(task, rmap)
-    for s in p["steps"]:
-        if not s["provider"]:
-            continue
-        parts = s.get("ctx_parts", {})
-        if s["stage"] == "required":
-            total += s["ctx"]
-        sec = [k for k in context_sections(root)] if s["role"] in NEEDS_PROJECT else []
-        print(f"  {s['role']:<11} {s['provider']}/{s['model']:<14} {s['stage']:<11} "
-              + " · ".join(f"{k} {v / 1000:.1f}k" for k, v in parts.items()) + f"  = {s['ctx'] / 1000:.1f}k  (budget {budget / 1000:.1f}k {'✓' if s['ctx'] <= budget else '✗'})")
-        selected = [k for k in parts if k.startswith(("workflow:", "optional:"))]
-        lazy = ["files: paths only, agent opens them", f"docs: {', '.join(docs) if docs else 'none matched'}",
-                "canonical guidance: " + (", ".join(selected) or "role only")]
-        if s["role"] == "reviewer":
-            lazy[0] = "diff: git diff of changed files only (added at run time)"
-        print(f"  {'':<11} lazy — {'; '.join(lazy)}" + (f"; project sections available: {', '.join(sec)}" if sec else ""))
-    print(f"Orchestration context on the minimum path: ~{total / 1000:.1f}k tokens (plus provider-native baseline per call)")
+    s = next((x for x in p["steps"] if x.get("provider")), None)
+    if s is None:
+        print("Context: no provider installed")
+        return
+    prompt = task_prompt(s["role"], task, root, s.get("write"), gdirs=sorted(generated_dirs(root)) if s.get("write") else ())
+    print(f"ai-team → {s['provider']} T{s['tier']} ({s['role']}): ~{tok(prompt)} tokens")
+    print("  " + prompt.replace("\n", "\n  "))
+    print("The agent itself loads its system prompt and tools" + ("." if s["role"] == "answer" else
+          ", the project's AGENTS.md / CLAUDE.md (→ .ai/CONTEXT.md) and whatever files it opens."))
 
 
 # ── local (T0) handlers ────────────────────────────────────────────────────────
@@ -1736,14 +1301,12 @@ def show_project(root):
 ROUTING_HELP = """How ai-team routes (every decision is local, 0 tokens):
   status / providers / models / cost / project commands → T0 local answer
   git status/diff, run lint/tests/build               → T0 command
-  question about the repo → T1 explorer (read-only) · general question → T1 answer (no tools)
-  MICRO edit (rename, typo, color, radius, label)      → one T1 editor → checks for the changed file types
-  SMALL change → one editor + targeted checks · MEDIUM → explorer + editor + review if the diff warrants it
-  COMPLEX/CRITICAL → explorer → [architect if evidence] → editor → verify → [review if risk]
-  "fix all errors" → T0 diagnostics first, grouped by file, then a bounded fix
-  failures → retry once with the error, then one tier up with a reason code; T3 at most once
-  provider down → rate limit: cooldown + other provider · transient: 1 retry with backoff · auth/CLI error: other provider
-See any task's routing:  ai-team --plan "<task>"   ·   its context:  ai-team --context-plan "<task>\""""
+  question about the repo → read-only agent · general question → answer, no tools · research → web tools
+  review → read-only reviewer (T1 small, T2 risky) · plan / architecture → read-only (edits only with --apply)
+  change or fix → ONE agent with edits (the CLI's own sandbox): MICRO/SMALL → T1 · MEDIUM+ or long context → T2
+  after edits → the project's checks for the changed files (0 tokens) · risky diffs → one independent review
+  agent fails → transient: retry · limit: cooldown + other provider · gave up: other provider · failed checks: retry, then tier up
+See any task's routing:  ai-team --plan "<task>"   ·   its prompt:  ai-team --context-plan "<task>\""""
 
 
 def record(root, p, log, ok, review, vres, vreason, tdir, dur, escalations, pruned=(), fallbacks=0):
@@ -1761,8 +1324,6 @@ def record(root, p, log, ok, review, vres, vreason, tdir, dur, escalations, prun
 
 
 def local(p, root, rmap, task):
-    if p.get("evidence_audit"):
-        return Run(task, p, root, rmap).evidence_audit()
     k = p["signals"].get("meta", "status") if p["intent"] == "META" else p["intent"]
     rc = 0
     if k == "providers":
@@ -1819,72 +1380,61 @@ class Run:
         self.id = datetime.datetime.now().strftime("T%Y%m%d-%H%M%S-") + slug
         self.dir = root / ".ai" / "state" / "tasks" / self.id
         self.dir.mkdir(parents=True, exist_ok=True)
-        self.st = {"findings": [], "files": set(p["signals"].get("paths", [])), "decision": "", "open": [], "risks": [],
-                   "docs": relevant_docs(task, rmap), "result": "", "confidence": None}
-        self.log, self.escalations, self.t0 = [], [], time.time()
-        self.last, self.pruned, self.fingerprints = {}, [], {}
+        self.log, self.escalations, self.trace, self.gen_edits, self.t0 = [], [], [], [], time.time()
+        self.fingerprints, self.base_cache, self.before, self.pre = {}, {}, None, {}
         self.cmds = check_commands(root, rmap)  # never a mutating script as a check (e.g. `lint` = eslint --fix)
-        self.diag_cmd, self._ctx, self.gen_edits, self.gate_done, self.strict_cmds = None, None, [], False, set()
-        self.trace, self.passed = [], set()  # provider attempts (route trace) · check commands known to pass on the current tree
-        self.before, self.pre, self.base_cache = None, {}, {}
+        named = {k for k, rx in (("typecheck", r"type ?script|\bts\b|\btypes?\b|typecheck|type-check|\btsc\b|типиз"),
+                                 ("lint", r"\blint|eslint|линт"), ("test", r"\btests?\b|тест"), ("build", r"\bbuild\b|compil|сборк"))
+                 if re.search(rx, task, re.I)}
+        maintenance = (p.get("signals") or {}).get("maintenance")
+        # A check the task is about (every check, for "fix all errors") must pass outright: no baseline tolerance.
+        self.strict = {c for k, c in self.cmds.items() if k in named or (maintenance and k != "format")}
+        self.gdirs = sorted(generated_dirs(root))
         (self.dir / "plan.json").write_text(redact(json.dumps({**p, "task": task}, indent=1, default=str)))
 
     def say(self, msg):
         print(msg, flush=True)
 
-    def allow_cmds(self):
-        """Project checks a Claude writer may run itself (never dev servers: they do not exit)."""
-        return [c for k, c in self.cmds.items() if k in ("typecheck", "lint", "test", "build", "format")]
-
-    def agent(self, role, tier, handoff, provider=None, write=False, label=None, avoid=None, extra="", attempt=1):
-        """Delegate one turn to a native agent CLI. As with ACP agents, the agent owns its model, tools and execution; ai-team
-        sets the role's sandbox, sends one prompt and reads the result and usage. Fallback chain (as in claude-code-router):
-        the chosen provider, then the other providers in role order. An agent that cannot complete the role hands over to
-        the next one; if none can, the last answer is returned. No provider left at all → NoProvider (the task is BLOCKED)."""
+    def agent(self, role, tier, prompt, provider=None, write=False, label=None, avoid=None, attempt=1, research=False):
+        """Delegate one turn to a native agent CLI. Fallback chain (as in claude-code-router): the chosen provider, then the
+        other providers in role order. An agent that gives up hands over to the next one; if none can, the last answer is
+        returned. No provider left at all → NoProvider (the task is BLOCKED)."""
         label = label or role
-        gdirs = sorted(self.gen().dirs) if write else []
-        if gdirs:
-            handoff += f"\nNever edit generated output ({', '.join(d + '/' for d in gdirs)}); fix the source that produces it."
-        prompt, sizes = build_prompt(role, handoff, self.root, self.rmap, self.p["complexity"], extra, files_known=bool(self.st["files"]))
-        ctx = sum(v for k, v in sizes.items() if not k.startswith("_"))
         (self.dir / f"input-{label}.md").write_text(redact(prompt))
-        if sizes.get("_trimmed"):
-            self.say(f"  ! {label}: over the {self.p['complexity']} context budget — trimmed (repo map, project, docs, then diff)")
         tried, last, note = [], None, ""
         while True:
             cands = [x for x in dict.fromkeys(([provider] if provider else []) + CFG["role_providers"][role]) if x in available() and x not in tried]
             if avoid and any(x != avoid for x in cands):
-                cands = [x for x in cands if x != avoid]  # cross-provider review is a preference, never a reason to stop
+                cands = [x for x in cands if x != avoid]  # an independent reviewer is a preference, never a reason to stop
             if not cands:
                 if last is not None:
                     return last
                 raise no_provider(role, tried)
             prov = cands[0]
             tried.append(prov)
-            out = self.call(prov, role, tier, prompt + note, write, label, attempt, ctx, sizes, gdirs)
+            out = self.call(prov, role, tier, prompt + note, write, label, attempt, research)
             if out is None:  # provider failure: classified and handled in call(); the next provider takes over
                 continue
-            gave_up = out.get("status") in ("blocked", "failed") and not (out.get("_unstructured") and not write)
-            if gave_up and any(x in available() and x not in tried for x in CFG["role_providers"][role]):
-                why = "; ".join(str(q) for q in (out.get("open_questions") or out.get("unresolved_questions") or []))[:300]
-                note = (f"\n\nNOTE: a previous {prov} attempt ended {out.get('status')}" + (f" ({why})" if why else "")
+            if out.get("status") in ("blocked", "failed") and any(x in available() and x not in tried for x in CFG["role_providers"][role]):
+                why = "; ".join(questions(out))[:300]
+                note = (f"\n\nNOTE: a previous {prov} attempt ended {out['status']}" + (f" ({why})" if why else "")
                         + (". Check `git status` / `git diff` for its partial edits before continuing." if write else "."))
-                self.say(f"  ! {label}: {prov} could not complete the role — handing over to the next provider")
+                self.say(f"  ! {label}: {prov} could not complete the task — handing over to the next provider")
                 last = out
                 continue
             return out
 
-    def call(self, prov, role, tier, prompt, write, label, attempt, ctx, sizes, gdirs):
+    def call(self, prov, role, tier, prompt, write, label, attempt, research=False):
         """One provider turn. A transient failure is retried with backoff; a rate limit cools the provider down until its
         reported reset; an auth or CLI error disables it for this run; a budget/turn limit or timeout skips it for this call.
-        Edits to generated output are reverted after every attempt. → parsed output, or None if this provider failed."""
-        retries = LIM.get("provider_retries", 1)
+        Edits to generated output are reverted after every writing attempt. → parsed output, or None if the provider failed."""
+        retries, gdirs = LIM.get("provider_retries", 1), (self.gdirs if write else [])
         for n in range(retries + 1):
             t0 = time.time()
             self.say(f"  … {label:<16} {prov} T{tier}" + (f" (retry {n})" if n else ""))
             gsnap = gen_snapshot(self.root, gdirs) if gdirs else {}
             try:
-                text, usage, model = run_provider(prov, tier, prompt, write, role, self.dir, label, self.allow_cmds(), cwd=self.root)
+                text, usage, model = run_provider(prov, tier, prompt, write, role, self.dir, label, cwd=self.root, research=research)
             except (ProviderError, subprocess.TimeoutExpired, OSError) as e:
                 timeout = isinstance(e, subprocess.TimeoutExpired)
                 err = "timeout" if timeout else str(e).strip()
@@ -1911,309 +1461,193 @@ class Run:
                         self.gen_edits += restored + lost
                         self.say(f"  ! {role} edited generated output ({', '.join((restored + lost)[:3])}); restored"
                                  + (f", {len(lost)} not restorable — rebuild them" if lost else "") + "; only source is fixed")
-            out = parse_output(text, role)
-            out.update({"_provider": prov, "_model": model, "_tier": tier, "_usage": usage, "_s": round(time.time() - t0)})
+            out = parse_status(text, role)
+            out.update(_provider=prov, _model=model, _tier=tier, _usage=usage, _s=round(time.time() - t0))
             (self.dir / f"{label}.json").write_text(redact(json.dumps(out, indent=1, ensure_ascii=False)))
-            parts = {k: v for k, v in sizes.items() if not k.startswith("_")}
-            ok = out.get("status") in ("done", "no_change", "needs_change")
+            ok = out.get("status") in ("done", "no_change")
             self.log.append({"role": role, "provider": prov, "model": model, "tier": tier, "status": out.get("status"), "attempt": attempt,
                              "in": usage["in"], "cached": usage["cached"], "out": usage["out"], "usd": usage["usd"], "s": out["_s"],
-                             "ctx": ctx, "ctx_parts": parts, "ok": ok})
+                             "ctx": tok(prompt), "ok": ok})
             self.trace.append({"label": label, "provider": prov, "tier": tier, "result": out.get("status") or "done", "s": out["_s"]})
-            self.say(f"  {'✓' if ok else '✗'} {label:<16} {prov}/{model} T{tier}"
-                     f"  fresh {usage['in'] / 1000:.1f}k · cached {usage['cached'] / 1000:.1f}k · out {usage['out'] / 1000:.1f}k"
-                     + (f" · ${usage['usd']:.3f}" if usage["usd"] else "") + f" · {out['_s']}s")
-            self.say(f"      ours ~{ctx / 1000:.1f}k (" + " · ".join(f"{k} {v / 1000:.1f}k" for k, v in parts.items())
-                     + f") · provider baseline + tool turns ~{max(0, usage['in'] + usage['cached'] - ctx) / 1000:.1f}k")
+            self.say(f"  {'✓' if ok else '✗'} {label:<16} {prov}/{model} T{tier}  in {usage['in'] / 1000:.1f}k · cached {usage['cached'] / 1000:.1f}k"
+                     f" · out {usage['out'] / 1000:.1f}k" + (f" · ${usage['usd']:.3f}" if usage["usd"] else "") + f" · {out['_s']}s")
             return out
         return None
 
-    def absorb(self, out):
-        self.st["findings"] += [str(x) for x in out.get("findings", [])][:10]
-        self.st["files"] |= {str(f).split(":")[0] for f in (out.get("files") or []) + (out.get("relevant_files") or []) + (out.get("affected_files") or []) if f}
-        self.st["open"] = [str(x) for x in (out.get("unresolved_questions") or out.get("open_questions") or [])]
-        self.st["risks"] = [str(x) for x in (out.get("risks") or [])] or ([f"risk: {out['risk']}"] if out.get("risk") not in (None, "", "low") else self.st["risks"])
-        if out.get("confidence") is not None:
-            try:
-                self.st["confidence"] = float(out["confidence"])
-            except (TypeError, ValueError):
-                pass
-        if out.get("root_cause_candidate"):
-            self.st["result"] = "Root cause: " + str(out["root_cause_candidate"])
-        if out.get("decision"):
-            self.st["decision"] = str(out["decision"])[:800]
+    def pick(self, role, tier):
+        """Cheapest capable provider at a new tier (cost model + routing history)."""
+        r = choose(role, tier, self.p["complexity"], 500, None, self.p.get("intent"),
+                   docs=bool((self.p.get("signals") or {}).get("docs")) and role == "implementer")
+        return r[0]["provider"] if r else None
 
-    def ctx(self):
-        """Per-run evidence context (lazy facts shared by adapters; supplied evidence attached)."""
-        if self._ctx is None:
-            self._ctx = DIAG.Context(self.root, self.rmap, self.task, self.p.get("evidence"))
-        return self._ctx
+    def execute(self):
+        """Run the plan. BLOCKED only when the task truly cannot continue: no provider can take a call, or the agent needs
+        information only the user has."""
+        try:
+            return self._execute()
+        except NoProvider as e:
+            cool = cooldowns()
+            hint = ("rate-limited: " + ", ".join(f"{k} until {v[11:16]}" for k, v in sorted(cool.items())) + " — rerun after that"
+                    if cool else "check `ai-team --providers` and each CLI's login")
+            return self.finish(False, changed(self.root, self.before), "skipped", [], str(e), header="BLOCKED", hint=hint)
 
-    def gen(self):
-        """Evidence-based generated-output classifier for this repository (computed once per run)."""
-        return self.ctx().is_gen
+    def _execute(self):
+        self.before = snapshot(self.root)
+        for f in (self.before or {}):  # the user's own uncommitted work: remembered exactly, never attributed to ai-team
+            fp = self.root / f
+            self.pre[f] = fp.read_bytes() if fp.is_file() else None
+        if self.before:
+            self.say(f"  note: {len(self.before)} file(s) already modified; excluded from change detection unless touched")
+        steps = self.p["steps"]
+        if not steps or not steps[0].get("provider"):
+            raise no_provider(self.p.get("role") or "agent")
+        s = steps[0]
+        if s["role"] == "implementer":
+            return self.implement(s)
+        out = self.ask(s)
+        if s["role"] == "reviewer":
+            issues = out.get("issues") or []
+            for i in issues:
+                self.say(f"  [{i.get('severity')}] {i.get('file')}:{i.get('line')} {i.get('problem')} → {i.get('fix')}")
+            if out.get("answer"):
+                self.say("\n" + out["answer"])
+            return self.finish(out.get("status") not in ("blocked", "failed"), [], f"{len(issues)} issue(s)", [], "review only", answer=out)
+        return self.show_answer(out, s["role"])
 
-    def evidence_rows(self):
-        """This task's evidence plan with the run's repo map (T0): required / optional sources and how each is read."""
-        sig = self.p.get("signals") or {}
-        return DIAG.plan_rows(self.task, self.ctx(), maintenance=sig.get("maintenance", True), broad=sig.get("broad", True),
-                              supplied=self.p.get("evidence"))
+    def ask(self, s):
+        """A read-only role (question, research, plan, diagnosis, review): one agent; if every provider gives up at this tier
+        without needing the user, one tier up."""
+        tier, prov = s["tier"], s["provider"]
+        while True:
+            out = self.agent(s["role"], tier, task_prompt(s["role"], self.task, self.root), provider=prov, label=f"{s['role']}-t{tier}",
+                             research=s.get("research", False))
+            if out.get("status") != "failed" and not (out.get("status") == "blocked" and not questions(out)):
+                return out
+            new = self.escalate(tier, f"FAILED_T{tier}", f"{s['role']} could not complete the task")
+            if new == tier:
+                return out
+            tier, prov = new, self.pick(s["role"], new)
 
-    def run_diagnostics(self, rows, runner=None):
-        """Read-only evidence; anything a check writes is restored immediately and reported (never silent). A source that
-        ran clean settles the IDE findings it is authoritative for (IDE_FALSE_POSITIVE)."""
-        want_warn = bool(re.search(r"warning|issue|problem|предупрежд|проблем", self.task, re.I))
-        # a source the task names is about all of its real findings, unless the task limits itself to errors
-        errors_only = bool(re.search(r"\berrors?\b|ошибк", self.task, re.I)) and not re.search(
-            r"warning|issue|problem|inspection|finding|result|предупрежд|проблем", self.task, re.I)
-        spelling = bool(re.search(r"spell|typo|grammar|опечат|орфограф", self.task, re.I))
-        is_gen = self.gen()
-        scope = [x for x in (self.p.get("signals") or {}).get("paths", []) if not is_gen(x)]
-        results = []
-        for row in rows:
-            if row["state"] not in RUN_STATES or not (row.get("cmd") or row.get("cmds") or row.get("evidence")):
-                results.append(dict(row, status=None))
-                continue
-            snap = snapshot(self.root)
-            saved = {f: ((self.root / f).read_bytes() if (self.root / f).is_file() else None) for f in (snap or {})}
-            r = run_diag(self.root, row, want_warn or bool(row.get("explicit") and not errors_only), runner, is_gen, scope, spelling)
-            touched = changed(self.root, snap) if snap is not None else []
-            if touched:
-                for f in touched:
-                    old = (self.root / f)
-                    prev = saved[f] if f in saved else self.pre_content(f)
-                    if prev is None:
-                        old.unlink(missing_ok=True)
-                    else:
-                        old.write_bytes(prev)
-                r["note"] = f"check modified {len(touched)} file(s) — restored; treat this command as mutating"
-                r["status"], r["ok"] = "BROKEN", False
-                self.say(f"  ! {row.get('cmd')} modified files during a read-only baseline ({', '.join(touched[:3])}); restored")
-            results.append(r)
-        clean = {r.get("source") for r in results if r.get("status") in ("PASS",) + NOISE_STATUSES}
-        for i, r in enumerate(results):
-            dup = {c for src, codes in (r.get("authorities") or {}).items() if src in clean for c in codes}
-            if dup and r.get("findings"):
-                for f in r["findings"]:
-                    if f["class"] in ("REAL_SOURCE_ERROR", "REAL_SOURCE_WARNING") and f.get("code") in dup:
-                        f["class"] = "IDE_FALSE_POSITIVE"
-                results[i] = restatus(r)
-        return results
+    def show_answer(self, out, label):
+        """Read-only result: the agent's own answer is the output."""
+        self.say("\n" + ((out.get("answer") or out.get("summary") or "").strip() or "(no answer)"))
+        qs = "; ".join(questions(out))[:400]
+        needs = out.get("status") == "blocked" and bool(qs)
+        return self.finish(out.get("status") not in ("blocked", "failed"), [], "skipped", [], f"read-only ({label})",
+                           header="BLOCKED" if needs else None, hint=f"needs information: {qs}" if needs else "")
 
-    def save_baseline(self, results):
-        rows = [{k: (v[:50] if k == "findings" else v) for k, v in r.items() if k != "out"} for r in results]
-        (self.dir / "diagnostics-baseline.json").write_text(json.dumps(rows, indent=1, default=str))
-
-    def diag_reason(self, results, ok, text):
-        label = lambda r: r.get("source") or r["cat"]  # noqa: E731
-        if not ok:
-            text += " (NOT clean: " + ", ".join(label(r) for r in results if r.get("status") == "FAIL") + ")"
-        warn = [f"{label(r)} not verified" if r.get("need", "required") == "required" else f"{label(r)} unavailable (optional)"
-                for r in results if unreadable(r)]
-        warn += [f"{label(r)}: {r['note']}" for r in results if r.get("status") in NOISE_STATUSES]
-        return (text + (" · warnings: " + "; ".join(warn) if warn else "")
-                + (f" · {len(self.gen_edits)} generated-file edit(s) reverted" if self.gen_edits else ""))
-
-    def limit_note(self, results):
-        """Tell the model which sources ai-team could not read, so it inspects them itself and never claims them verified."""
-        names = ", ".join(dict.fromkeys(r.get("source") or r["cat"] for r in results if unreadable(r) and r.get("need", "required") == "required"))
-        if names:
-            self.st["findings"].append(f"Not readable by ai-team here: {names}. Inspect the relevant source and configuration yourself; "
-                                       f"do not report {names} as verified.")
-        return names
-
-    def direct_inspection(self, steps, cons, rows, results):
-        """Nothing actionable was found, but a source the task needs could not be read here (WebStorm keeps its inspection
-        results inside the IDE, a lint script only has a --fix form, a CI log was not supplied …). Diagnostics support the
-        task, they never gate it: the implementer inspects source and configuration with its own tools and attempts the task.
-        Readable checks verify the result afterwards; the unreadable ones are reported as not verified."""
-        names = self.limit_note(results) or "no diagnostic source could be read"
-        if names.startswith("no "):
-            self.st["findings"].append("No diagnostic source could be read here: inspect the project yourself.")
-        self.say(f"  → direct inspection ({names}): the model inspects the project itself; checks run afterwards")
-        self.p["evidence_gate"] = [r for r in rows if r.get("need", "required") == "required"]
-        self.strict_cmds |= {r["cmd"] for r in self.p["evidence_gate"] if r["state"] in RUN_STATES and r.get("cmd")
-                             and not (r.get("cmds") or r.get("output") or r.get("evidence"))}
-        impl = steps.get("implementer")
-        if not impl or not impl.get("provider"):
-            raise no_provider("implementer")
-        work = [{"files": sorted(self.st["files"]), "action": "Inspect the relevant source and configuration yourself and fix the real issues this task is about."}]
-        return self.implement(impl, work, steps, self.before, cons)
-
-    def evidence_audit(self):
-        """Read-only question about named sources ("audit the WebStorm results", "what are the Sonar issues?"). Readable
-        sources are read here (T0, 0 model calls) and reported grouped by root cause. If a named source cannot be read, a
-        read-only explorer inspects the source and configuration instead and says what it could not verify."""
-        rows = self.evidence_rows()
-        results = self.run_diagnostics(rows)
-        state = overall_state(results)
-        self.save_baseline(results)
-        notes = generated_notes(self.root, self.gen(), (self.p.get("signals") or {}).get("paths", []))
-        self.say("  T0 evidence audit (read-only):\n" + render_diags(results) + "".join("\n" + x for x in notes) + f"\n  Overall: {state}")
-        groups = group_diags(results, is_gen=self.gen())
-        for g in groups:
-            self.say(f"  group ×{g['count']:<4} {g['key'][:90]}  ({len(g['files'])} file(s))  e.g. {g['example'][:120]}")
-        names = self.limit_note(results)
-        if names or state == "INCOMPLETE":
-            self.st["findings"] += ([("ai-team read: " + ", ".join(f"{r.get('source') or r['cat']} {r['status']}" for r in results if r.get("status")))]
-                                    + [f"{g['key']} ×{g['count']} (e.g. {g['example'][:100]})" for g in groups[:8]])
-            step = next((s for s in self.p["steps"] if s["role"] == "explorer" and s.get("provider")), {"tier": 1, "provider": None})
-            out = self.agent("explorer", step["tier"], make_handoff(self.task, self.st, "Answer the task read-only from the project itself; "
-                                                                    "say what you could not verify."), provider=step["provider"])
-            return self.answer_only(out, "direct inspection" + (f"; not verified: {names}" if names else ""))
-        ok = state in CLEAN_STATES
-        return self.finish(ok, [], "skipped", diag_vres(results), self.diag_reason(results, ok, "evidence audit"),
-                           header="DONE" if ok else "FINDINGS", hint="to fix them: ai-team \"fix <source> findings\"" if state == "DIRTY" else "")
-
-    def evidence_gate(self, ok, vres, vreason):
-        """Post-work checks for the sources this task names, at the one place every DONE passes. Readable sources not already
-        verified in this run are re-read: real failures make the task NOT DONE. A source that cannot be read here, or a
-        supplied report that cannot be re-read, is reported as not verified; it never vetoes finished work.
-        → (ok, vres, vreason, header, hint)"""
-        gate = [r for r in self.p.get("evidence_gate") or [] if r.get("need") == "required"
-                and not (r.get("cmd") in self.passed and not (r.get("cmds") or r.get("output") or r.get("evidence")))]
-        if not ok or not gate or self.gate_done:
-            return ok, vres, vreason, None, ""
-        self.gate_done = True
-        results = self.run_diagnostics(gate)
-        self.say("  Post-work checks:\n" + render_diags(results))
-        static = {group_key(r, f) for r in results if r.get("static") for f in r.get("findings") or [] if f.get("actionable")}
-        extra = diag_vres(results, static)
-        if all(v["ok"] for v in extra):
-            limited = [r.get("source") or r["cat"] for r in results if unreadable(r) or (r.get("static") and r.get("status") == "FAIL")]
-            return True, vres + extra, vreason + (f" · not verified: {', '.join(limited)}" if limited else " · named sources clean"), None, ""
-        return False, vres + extra, self.diag_reason(results, False, vreason + " · named sources"), None, ""
-
-    def aggregate_repair(self, steps, cons, runner=None):
-        """Evidence-driven repair: read the task's diagnostic sources (T0, read-only) → group ACTIONABLE findings by root cause
-        → fix a few groups per bounded batch → re-read while progress is made. Everything readable clean and nothing named
-        missing → DONE without a model call. A source that cannot be read never stops the task: with nothing actionable the
-        model inspects the project directly (direct_inspection), otherwise it is told what could not be read; either way that
-        source is reported as not verified. Generated output is never a target and never edited."""
-        rows = self.evidence_rows()
-        is_gen = self.gen()
-        self.st["files"] = {f for f in self.st["files"] if not is_gen(f)}  # IDE_ONLY paths named in the task are not targets
-        results = self.run_diagnostics(rows, runner)
-        state = overall_state(results)
-        self.save_baseline(results)
-        notes = generated_notes(self.root, is_gen, self.p["signals"].get("paths", []))
-        self.say("  T0 evidence baseline:\n" + render_diags(results) + "".join("\n" + x for x in notes) + f"\n  Overall: {state}")
-        self.passed = {r["cmd"] for r in results if r.get("status") in ("PASS",) + NOISE_STATUSES and r.get("cmd")}
-        active = [dict(r, evidence=None) if r.get("evidence") and r.get("cmd") else r for r in rows]  # supplied baseline, then re-run
-        if state in CLEAN_STATES:
-            deferred = [r for r in rows if r["state"] == "deferred" and r["cmd"]]
-            if deferred:  # static checks clean → run the deferred build once before calling the project clean
-                active = [dict(r, state="run") if r["state"] == "deferred" and r["cmd"] else r for r in active]
-                extra = self.run_diagnostics([dict(r, state="run") for r in deferred], runner)
-                self.say(render_diags(extra))
-                results = [r for r in results if r["state"] != "deferred"] + extra
-                state = overall_state(results)
-            if state in CLEAN_STATES:
-                return self.finish(True, [], "skipped", diag_vres(results), self.diag_reason(results, True, "all readable diagnostics clean"))
-        if state == "INCOMPLETE":  # nothing actionable, but a required source could not be read: the model looks for itself
-            return self.direct_inspection(steps, cons, rows, results)
-        self.limit_note(results)
-        base = {r["cmd"]: r for r in results if r.get("status") and r.get("cmd")}
-        self.aggregate_base = {c: (r["ok"], r["out"]) for c, r in base.items()}
-        impl = steps.get("implementer")
-        if not impl or not impl.get("provider"):
-            raise no_provider("implementer")
-        prov, tier = impl["provider"], impl["tier"]
-        total0 = sum(r["errors"] for r in results if r.get("status") and not r.get("static"))
-        prev_total, stalls, escalated, batch_no, outs, done_keys, addressed = total0, 0, False, 0, [], set(), set()
-        had_stall = False
-        before = self.before
-        while batch_no < 8:
-            groups = group_diags(results, is_gen=is_gen)
-            groups = [g for g in groups if g["key"] not in done_keys] or [g for g in groups if not g["static"]]
-            if not groups:
-                break
-            batch, files = [], set()
-            for g in groups:  # a few root-cause groups per call, bounded by files touched
-                if batch and (len(batch) >= 3 or len(files | g["files"]) > 8):
+    def implement(self, s):
+        """ONE native agent does the whole task with its own tools. Then T0 checks verify the changed files (baseline-aware;
+        a check the task is about must pass outright). A failed check goes back to the agent with its output — once more at
+        the same tier, then one tier up (T3 only by escalation). A risky change gets one independent review."""
+        tier, prov, at_tier, attempt, evidence = s["tier"], s["provider"], 0, 0, ""
+        ok, vres, vreason, files, out, needs = True, [], "no files changed", [], {}, ""
+        while True:
+            attempt += 1
+            extra = f"PREVIOUS ATTEMPT FAILED — fix this root cause, do not repeat the same approach:\n{evidence}" if evidence else ""
+            out = self.agent("implementer", tier, task_prompt("implementer", self.task, self.root, True, extra, self.gdirs), provider=prov,
+                             write=True, label=f"implementer-t{tier}a{at_tier + 1}", attempt=attempt, research=s.get("research", False))
+            at_tier += 1
+            files = changed(self.root, self.before)
+            if out.get("status") in ("blocked", "failed"):
+                q = "; ".join(questions(out))[:400]
+                if out["status"] == "blocked" and q:  # information only the user has: stop here, a bigger model won't know it either
+                    ok, needs = False, q
                     break
-                batch.append(g); files |= g["files"]
-            batch_no += 1
-            n_batch = sum(g["count"] for g in batch)
-            if batch_no == 1:
-                tier = 1 if (n_batch <= 5 and len(files) <= 2) else max(tier, 2)
-                self.p["complexity"] = "SMALL" if tier == 1 else "MEDIUM"
-            summary = "\n".join(f"GROUP {i + 1} [{g['key']}] ×{g['count']} — files: {', '.join(sorted(g['files'])[:6])}"
-                                + (f" (+{len(g['files']) - 6})" if len(g["files"]) > 6 else "") + f"\n  e.g. {g['example']}" for i, g in enumerate(batch))
-            st = dict(self.st, files={f for f in files if not f.startswith("(")},
-                      findings=[f for f in self.st["findings"] if f.startswith("Not readable by ai-team")]
-                      + [f"Baseline: {total0} actionable finding(s) in re-runnable sources; {prev_total} remaining",
-                         "Fix these root-cause groups (same cause → one consistent fix):\n" + summary])
-            action = ("Fix the root cause of each GROUP below with the smallest correct change. Do not suppress diagnostics "
-                      "(no ts-ignore / eslint-disable / any) unless there is no real fix. Don't touch unrelated files."
-                      + (" Some groups come from supplied evidence that cannot be re-checked here: fix each at its reported location."
-                         if any(g["static"] for g in batch) else ""))
-            batch_snapshot = snapshot(self.root)
-            batch_saved = {f: ((self.root / f).read_bytes() if (self.root / f).is_file() else None) for f in (batch_snapshot or {})}
-            batch_base = {r["cmd"]: (r["ok"], r["out"]) for r in results if r.get("status") and r.get("cmd") and not r.get("static")}
-            out = self.agent("implementer", tier, make_handoff(self.task, st, action, cons), provider=prov, write=True,
-                             label=f"implementer-g{batch_no}-t{tier}", attempt=batch_no)
-            outs = [out]
-            addressed |= {g["key"] for g in batch if g["static"]}
-            done_keys |= {g["key"] for g in batch if g["static"]}
-            results = self.run_diagnostics(active, runner)
-            self.passed = {r["cmd"] for r in results if r.get("status") in ("PASS",) + NOISE_STATUSES and r.get("cmd")}
-            new_lines, new_count = [], 0
-            for r in results:
-                if r.get("status") not in (None,) + NOISE_STATUSES and not r.get("static") and r.get("cmd") in batch_base and not r["ok"]:
-                    b_ok, b_out = batch_base[r["cmd"]]
-                    cmpr = compare_checks(b_ok, b_out, r["ok"], r["out"])
-                    new_lines += cmpr["new_lines"] if cmpr["status"] in ("FAIL_NEW_ERRORS", "FAIL_REGRESSION") else []
-                    new_count += cmpr["new"]
-            total = sum(r["errors"] for r in results if r.get("status") and not r.get("static"))
-            state = overall_state(results)
-            self.say(f"  evidence after batch {batch_no}: {prev_total} → {total}" + (f" · {len(new_lines)} NEW" if new_lines else "") + f" · {state}")
-            if new_lines:
-                # Restore this batch only; preserve earlier progress and pre-existing dirty files.
-                for f in changed(self.root, batch_snapshot):
-                    path = self.root / f
-                    data = batch_saved[f] if f in batch_saved else self.pre_content(f)
-                    if data is None:
-                        path.unlink(missing_ok=True)
-                    else:
-                        path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(data)
-                self.say("  FAIL_REGRESSION: batch restored; stop for a different approach, no automatic T3 escalation")
-                vres = [{"cmd": "aggregate diagnostics", "ok": False, "status": "FAIL_REGRESSION",
-                         "pre": prev_total, "new": new_count, "fixed": 0, "new_lines": new_lines[:10]}]
-                return self.finish(False, changed(self.root, before), "skipped", vres,
-                                   f"FAIL_REGRESSION: {prev_total} → {total}; batch restored")
-            if state in CLEAN_STATES:
-                break
-            if total < prev_total or all(g["static"] for g in batch):  # static groups are sent once; progress = re-runnable sources
-                done_keys |= {g["key"] for g in batch}
-                prev_total, stalls = min(prev_total, total), 0
+                new = self.escalate(tier, f"FAILED_T{tier}", f"implementer {out['status']}" + (f": {out['summary']}" if out.get("summary") else ""))
+                if new == tier:
+                    ok = False
+                    break
+                tier, at_tier, prov, evidence = new, 0, self.pick("implementer", new), str(out.get("summary") or out.get("answer") or "")[-800:]
                 continue
-            stalls += 1
-            had_stall = True
+            if not files:
+                if out.get("_unstructured"):  # nothing changed and no status line: not a confirmed result
+                    self.say("\n" + ((out.get("answer") or "").strip()[-1500:] or "(no answer)"))
+                    return self.finish(False, [], "skipped", [], "no change and no status from the agent", answer=out,
+                                       hint="the agent changed nothing and reported no status — read its message above, then rerun with more detail")
+                self.say("  ✓ agent: no change needed — verification skipped")
+                return self.finish(True, [], "skipped", [], "no change required", answer=out)
+            cmds, vreason, jfiles = select_checks(files, self.p["complexity"], self.task, self.cmds, self.root)
+            cmds += [c for c in sorted(self.strict) if c not in cmds]  # checks the task is about always run
+            if not cmds and not jfiles:
+                self.say(f"  ✓ verify           skipped — {vreason}, no check applies")
+                ok, vres = True, []
+                break
+            ok, vres = verify(self.root, cmds, jfiles, self.dir, self.baseline)
+            vst = verify_status(vres)
+            self.say("  " + {"PASS": "✓", "PASS_WITH_BASELINE_FAILURES": "⚠", "PASS_WITH_WARNINGS": "⚠"}.get(vst, "✗")
+                     + f" verify           ({vreason}) {vst}: " + "  ".join(describe_check(r) for r in vres))
+            if ok:
+                break
             for e in self.log[-1:]:
-                e["ok"] = False
-            if stalls >= 2:
-                if escalated or tier >= min(3, self.p["max_tier"]):
-                    self.escalations.append(f"stop [REPEATED_FAILURE] no diagnostic progress after {stalls} batches")
+                e["ok"] = False  # the call did not solve it: routing history must not count it as a success
+            failed = [r for r in vres if not r["ok"]]
+            fp = hashlib.sha1("|".join(r["cmd"] + "|" + ",".join(sorted(diagnostics(r["tail"])[0])) for r in failed).encode()).hexdigest()[:10]
+            self.fingerprints[fp] = self.fingerprints.get(fp, 0) + 1
+            evidence = "\n".join(f"$ {r['cmd']}\n{r['tail'][-1500:]}" for r in failed)
+            if self.fingerprints[fp] >= 3:
+                self.escalations.append(f"stop [REPEATED_FAILURE] same failure fingerprint {fp} three times")
+                self.say(f"  ■ stop: the same failure repeated three times ({fp}); needs new evidence or a narrower task")
+                break
+            if at_tier >= (LIM["max_attempts_t3"] if tier >= 3 else LIM["max_attempts_per_tier"]):
+                new = self.escalate(tier, f"FAILED_T{tier}", f"{at_tier} attempt(s) failed verification")
+                if new == tier:
                     break
-                tier = self.escalate(tier, f"FAILED_T{tier}", f"no diagnostic progress ({prev_total} remaining)")
-                escalated, stalls = True, 0
-        if state in CLEAN_STATES:
-            deferred = [r for r in active if r["state"] == "deferred" and r["cmd"]]
-            if deferred:
-                extra = self.run_diagnostics([dict(r, state="run") for r in deferred], runner)
-                self.say(render_diags(extra))
-                results = [r for r in results if r["state"] != "deferred"] + extra
-        files = changed(self.root, before)
-        vres = diag_vres(results, addressed)
-        ok = all(v["ok"] for v in vres)  # only real failures fail; unreadable sources and re-read-only reports are warnings
+                tier, at_tier, prov = new, 0, self.pick("implementer", new)
+        for e in self.log:
+            if e["role"] == "implementer" and e["tier"] < tier:
+                e["escalated_after"] = True
         review_state = "skipped"
-        if ok and files and "reviewer" in steps:
-            run_rev, why = review_gate(self.root, files, self.p, outs, vres, [], had_stall)  # initial failures are the task, not a repair
-            if run_rev:
-                self.say(f"  → reviewer: {why}")
-                review_state, ok, vres = self.review(steps["reviewer"], files, prov, tier, before, outs, ok, vres)
-        return self.finish(ok, files, review_state, vres, self.diag_reason(results, ok, f"evidence {total0} → {prev_total if not ok else 0}"))
+        if ok and files and self.needs_review(files):
+            review_state, ok, vres = self.review(files, tier, vres)
+        return self.finish(ok, changed(self.root, self.before), review_state, vres, vreason,
+                           header="BLOCKED" if needs else None, hint=f"the agent needs information: {needs}" if needs else "", answer=out)
+
+    def needs_review(self, files):
+        """An independent review only where it pays: `always` (quality budget) for code changes; `risk` (balanced) only for
+        CRITICAL tasks or changes that touch auth/security/payment/migration code; `never` (economy)."""
+        mode = self.p.get("review", "risk")
+        if mode == "never" or not any(Path(f).suffix in CODE_EXT | {".sql"} or CONFIG_RE.search(f) for f in files):
+            return False
+        if mode == "always" or self.p["complexity"] == "CRITICAL":
+            return True
+        _, diff = sh(["git", "diff", "-U0", "--"] + files, cwd=self.root)
+        touched = "\n".join(x for x in diff.splitlines() if x.startswith(("+", "-")) and not x.startswith(("+++", "---")))
+        return any(SECURITY_CODE.search(f) for f in files) or bool(SECURITY_CODE.search(touched))
+
+    def review(self, files, tier, vres):
+        """One independent read-only review (the other provider when available). Blocking issues get one fix round by the
+        implementer; then the checks run again."""
+        s = next((x for x in self.p["steps"] if x["role"] == "reviewer" and x.get("provider")), None)
+        impl = next((e["provider"] for e in reversed(self.log) if e["role"] == "implementer"), None)
+        self.say("  → reviewer: " + ("quality budget" if self.p.get("review") == "always" else
+                                     "CRITICAL task" if self.p["complexity"] == "CRITICAL" else "security-sensitive change"))
+        rv = self.agent("reviewer", s["tier"] if s else 2, task_prompt("reviewer", self.task, self.root,
+                        extra="Review only these changed files: " + ", ".join(files[:20])), provider=s["provider"] if s else None,
+                        avoid=impl, label="reviewer")
+        if rv.get("status") in ("blocked", "failed"):
+            return "not reviewed (no reviewer could complete)", True, vres
+        issues = rv.get("issues") or []
+        for i in issues:
+            self.say(f"  [{i.get('severity')}] {i.get('file')}:{i.get('line')} {i.get('problem')} → {i.get('fix')}")
+        blocking = [i for i in issues if str(i.get("severity", "")).lower() in ("critical", "high")]
+        if not blocking:
+            return f"passed ({len(issues)} non-blocking)", True, vres
+        fix = "Fix these review issues only:\n" + "\n".join(f"- [{i.get('severity')}] {i.get('file')}:{i.get('line')} {i.get('problem')} → {i.get('fix')}"
+                                                           for i in blocking)
+        out = self.agent("implementer", tier, task_prompt("implementer", self.task, self.root, True, fix, self.gdirs), provider=impl,
+                         write=True, label="implementer-fix")
+        if out.get("status") in ("blocked", "failed"):
+            return f"{len(blocking)} blocking issue(s) unresolved", False, vres
+        files = changed(self.root, self.before)
+        cmds, _, jfiles = select_checks(files, self.p["complexity"], self.task, self.cmds, self.root)
+        cmds += [c for c in sorted(self.strict) if c not in cmds]
+        if cmds or jfiles:
+            ok, vres = verify(self.root, cmds, jfiles, self.dir, self.baseline)
+            self.say("  " + ("✓" if ok else "✗") + f" verify           {verify_status(vres)}: " + "  ".join(describe_check(r) for r in vres))
+            if not ok:
+                return "fix round failed verification", False, vres
+        return f"{len(blocking)} blocking issue(s) fixed", True, vres
 
     def pre_content(self, f):
         if f in self.pre:
@@ -2224,10 +1658,8 @@ class Run:
     def baseline(self, cmd):
         """Pre-task result of one check: briefly put the task's changed files back to their pre-task content (HEAD or the
         user's own dirty version), run the check, restore. Cached per command. Other files are never touched."""
-        if cmd == self.diag_cmd or cmd in self.strict_cmds:
-            return None  # "fix all errors": the pre-existing errors are the task, so no baseline tolerance
-        if cmd in getattr(self, "aggregate_base", {}):
-            return self.aggregate_base[cmd]  # broad maintenance: the initial diagnostics are the baseline
+        if cmd in self.strict:
+            return None  # a check the task is about (or "fix all errors"): its pre-existing failures are the task
         if cmd in self.base_cache:
             return self.base_cache[cmd]
         files = changed(self.root, self.before)
@@ -2258,20 +1690,8 @@ class Run:
         self.base_cache[cmd] = result
         return result
 
-    def reclassify(self, out, steps):
-        """Explorer evidence may move complexity up or down (MICRO..COMPLEX); CRITICAL is never entered or left automatically."""
-        new, old = str(out.get("complexity", "")).upper(), self.p["complexity"]
-        if new not in ("MICRO", "SMALL", "MEDIUM", "COMPLEX") or old == "CRITICAL" or new == old or self.p["intent"] == "ARCHITECTURE":
-            return
-        self.p["complexity"] = new
-        if "implementer" in steps:
-            t = CFG["pipelines"][new]["implementer"]
-            r = choose("implementer", t, new, intent=self.p["intent"], docs=self.p["signals"].get("docs"))
-            steps["implementer"] = {"tier": t, "provider": r[0]["provider"] if r else steps["implementer"]["provider"]}
-        self.say(f"  ↺ reclassified {old}→{new} from explorer evidence")
-
     def escalate(self, tier, code, why):
-        cap = min(CFG["escalation_cap"].get(self.p["complexity"], 3), self.p["max_tier"] if self.p["complexity"] != "CRITICAL" else 3)
+        cap = min(CFG["escalation_cap"].get(self.p["complexity"], 3), self.p.get("max_tier", 3) if self.p["complexity"] != "CRITICAL" else 3)
         new = min(tier + 1, cap)
         if new == tier:
             return tier
@@ -2279,284 +1699,14 @@ class Run:
         self.say(f"  ↑ escalate T{tier}→T{new} [{code}] {why}")
         return new
 
-    def answer_only(self, out, label):
-        self.say("\n" + ("\n".join(str(x) for x in out.get("findings", []) if x) or "(no answer)"))
-        if out.get("files") or out.get("relevant_files"):
-            self.say("Files: " + ", ".join(map(str, out.get("files") or out.get("relevant_files"))))
-        qs = "; ".join(str(x) for x in (out.get("open_questions") or out.get("unresolved_questions") or []) if x)[:400]
-        needs = out.get("status") == "blocked" and bool(qs) and not out.get("_unstructured")
-        return self.finish(out.get("status") not in ("blocked", "failed"), [], "skipped", [], f"read-only ({label})",
-                           header="BLOCKED" if needs else None, hint=f"needs information: {qs}" if needs else "")
-
-    def execute(self):
-        """Run the plan. BLOCKED only when the task truly cannot continue: no provider can take a call, or the agents need
-        information only the user has."""
-        try:
-            return self._execute()
-        except NoProvider as e:
-            cool = cooldowns()
-            hint = ("rate-limited: " + ", ".join(f"{k} until {v[11:16]}" for k, v in sorted(cool.items())) + " — rerun after that"
-                    if cool else "check `ai-team --providers` and each CLI's login")
-            return self.finish(False, changed(self.root, self.before), "skipped", [], str(e), header="BLOCKED", hint=hint)
-
-    def _execute(self):
-        p, cons = self.p, "Stay within FILES unless the change requires otherwise."
-        steps = {s["role"]: s for s in p["steps"] if s["provider"]}
-        gate = p.get("evidence_gate") or []
-        self.strict_cmds = {r["cmd"] for r in gate if r["state"] in RUN_STATES and r.get("cmd") and not (r.get("cmds") or r.get("output") or r.get("evidence"))}
-        before = snapshot(self.root)
-        self.before = before
-        for f in (before or {}):  # user's own uncommitted work: remember it exactly, never assume ai-team made it
-            fp = self.root / f
-            self.pre[f] = fp.read_bytes() if fp.is_file() else None
-        if before:
-            self.say(f"  note: {len(before)} file(s) already modified; excluded from change detection unless touched")
-        if p.get("evidence_audit"):
-            return self.evidence_audit()
-        if "answer" in steps:
-            return self.answer_only(self.agent("answer", 1, self.task, provider=steps["answer"]["provider"]), "answer")
-        if p["intent"] == "REVIEW":
-            files = sorted(before or [])
-            if not files:
-                self.say("  nothing to review: working tree is clean")
-                return self.finish(True, [], "skipped", [], "no changes")
-            s = steps["reviewer"]
-            rv = self.agent("reviewer", s["tier"], make_handoff(self.task, dict(self.st, files=set(files)), "Review the diff."),
-                            provider=s["provider"], extra=diff_for(self.root, files))
-            for i in rv.get("issues", []):
-                self.say(f"  [{i.get('severity')}] {i.get('file')}:{i.get('line')} {i.get('problem')} → {i.get('fix')}")
-            return self.finish(rv.get("status") not in ("blocked", "failed"), [], f"{len(rv.get('issues', []))} issue(s)", [], "review only")
-        if p["signals"].get("aggregate"):
-            return self.aggregate_repair(steps, cons)
-
-        if False:
-            c, ok0, groups = diagnose(self.root, self.task, self.cmds)
-            if ok0:
-                self.say(f"  ✓ T0 diagnostics: `{c}` passes — nothing to fix, 0 model calls")
-                return self.finish(True, [], "skipped", [{"cmd": c, "ok": True}] if c else [], "diagnostics clean")
-            n = sum(len(v) for v in groups.values())
-            self.say(f"  ✗ T0 diagnostics: `{c}` → {n} error line(s) in {len(groups)} file(s)")
-            self.st["files"] |= {f for f in groups if not f.startswith("(")}
-            self.st["findings"] = [x for f in list(groups)[:12] for x in groups[f][:4]][:LIM["diagnostic_errors"]]
-            self.p["complexity"] = "SMALL" if len(groups) <= 2 and n <= 5 else "MEDIUM"
-            self.diag_cmd = c
-            steps["implementer"]["tier"] = 1 if self.p["complexity"] == "SMALL" else 2
-        for role in ("explorer", "researcher"):
-            if role not in steps:
-                continue
-            s = steps[role]
-            if role == "researcher" and p["intent"] in CODE_INTENTS and not RESEARCH.search(self.task):
-                continue  # added dynamically below if the explorer asks
-            probe = p["intent"] in ("QUESTION", "UNKNOWN", "PLAN") or (p["signals"].get("analysis_first") and "architect" not in steps)
-            action = {"researcher": "Collect only the external facts this task needs.",
-                      "explorer": ("If this is a question, answer it (status done). If it needs file changes, give the exact change "
-                                   "(status needs_change). If nothing is needed, status no_change." if probe else
-                                   "Find the files, symbols and behaviour the implementer needs; nothing else.")}[role]
-            out = self.agent(role, s["tier"], make_handoff(self.task, self.st, action), provider=s["provider"])
-            self.last[role] = out
-            self.absorb(out)
-            if role == "researcher" and p["intent"] == "RESEARCH":
-                return self.answer_only(out, "research")
-            if role != "explorer":
-                continue
-            if probe:
-                if p["intent"] == "PLAN":
-                    if "architect" not in steps:
-                        return self.answer_only(out, "plan")
-                    continue
-                if out.get("status") != "needs_change":
-                    return self.answer_only(out, "diagnosis" if p["signals"].get("analysis_first") else "probe")
-                cx = str(out.get("complexity", "SMALL")).upper()
-                self.p["complexity"] = cx if cx in ("MICRO", "SMALL", "MEDIUM") else "MEDIUM"
-                t = 2 if self.p["complexity"] == "MEDIUM" else 1
-                r = choose("implementer", t, self.p["complexity"], intent=p["intent"], docs=p["signals"].get("docs"))
-                steps["implementer"] = {"tier": t, "provider": r[0]["provider"] if r else None}
-                if out.get("next_action"):
-                    self.st["findings"].append("Requested change: " + str(out["next_action"]))
-                self.say(f"  → probe: change needed ({self.p['complexity']}) → implementer T{t}")
-                continue
-            if out.get("status") == "no_change":
-                self.say("  ✓ explorer: NO_CHANGE_REQUIRED — stopping")
-                return self.finish(True, [], "skipped", [], "no change required")
-            self.reclassify(out, steps)
-            if out.get("external_research_required") or out.get("external_knowledge_needed"):
-                r = choose("researcher", 1, self.p["complexity"])
-                if r:
-                    self.say("  → researcher: explorer reports missing external knowledge")
-                    rs = self.agent("researcher", 1, make_handoff(self.task, self.st, "Collect only the external facts this task needs."), provider=r[0]["provider"])
-                    self.absorb(rs)
-            planned = "architect" in steps
-            run_arch, codes, why = architect_gate(out, self.p, planned)
-            if planned and not run_arch:
-                steps.pop("architect"); self.pruned.append("architect")
-                self.say(f"  ⤼ skip architect: {why}")
-                if out.get("next_action"):
-                    self.st["findings"].append("Fix: " + str(out["next_action"]))
-            elif run_arch and not planned:
-                t = self.escalate(1, codes[0], f"explorer evidence needs a reasoning stage ({why})")
-                r = choose("architect", max(2, t), self.p["complexity"], intent=p["intent"])
-                steps["architect"] = {"tier": max(2, t), "provider": r[0]["provider"] if r else None}
-            elif run_arch:
-                self.say(f"  → architect [{','.join(codes)}]: {why}")
-        workstreams = [{"files": sorted(self.st["files"]), "action": "Implement TASK."}]
-        if "architect" in steps:
-            s = steps["architect"]
-            action = ("Find the root cause from the evidence; set change_required and, if true, the exact fix as next_action."
-                      if p["signals"].get("analysis_first") else "Decide the approach; outline the implementation.")
-            out = self.agent("architect", s["tier"], make_handoff(self.task, self.st, action), provider=s.get("provider"))
-            conf = float(out.get("confidence", 1) or 0)
-            if conf < CFG["gates"]["architect"]["t3_below_confidence"] and s["tier"] < 3 and rank(self.p["complexity"]) >= RANK["COMPLEX"]:
-                t = self.escalate(s["tier"], "LOW_CONFIDENCE", f"architect confidence {conf:.2f} on {self.p['complexity']}")
-                if t > s["tier"]:
-                    self.absorb(out)
-                    r = choose("architect", t, self.p["complexity"], intent=p["intent"])
-                    out = self.agent("architect", t, make_handoff(self.task, self.st, action + " A cheaper model was unsure; verify its decision."),
-                                     provider=r[0]["provider"] if r else None, label="architect-t3")
-            self.absorb(out)
-            summary = {"findings": [out.get("decision", "")] + list(out.get("findings", [])) + [out.get("next_action", "")], "files": out.get("files", [])}
-            if p["intent"] == "PLAN":
-                return self.answer_only(summary, "plan")
-            if p["intent"] == "ARCHITECTURE" and not p.get("apply"):
-                summary["findings"].append(f"Not applied. To implement: ai-team --apply \"{self.task}\"")
-                return self.answer_only(summary, "architecture decision")
-            if p["signals"].get("analysis_first") and (out.get("change_required") is False or out.get("status") == "no_change"):
-                return self.answer_only(summary, "root cause, no change required")
-            ws = [w for w in out.get("workstreams", []) if w.get("files")]
-            flat = [f for w in ws for f in w["files"]]
-            if len(ws) >= 2 and len(flat) == len(set(flat)) and p["max_parallel"] > 1:
-                workstreams = ws[:p["max_parallel"]]
-                self.say(f"  ∥ {len(workstreams)} parallel workstreams on disjoint files")
-            elif out.get("next_action"):
-                workstreams = [{"files": sorted(self.st["files"]), "action": str(out["next_action"])}]
-        impl = steps.get("implementer")
-        if not impl or not impl.get("provider"):
-            raise no_provider("implementer")
-        return self.implement(impl, workstreams, steps, before, cons)
-
-    def implement(self, impl, workstreams, steps, before, cons):
-        tier, at_tier, evidence, ok, vres, vreason = impl["tier"], 0, "", True, [], "no files changed"
-        prov, files, outs, repaired, attempt, needs = impl["provider"], [], [], False, 0, ""
-        while True:
-            attempt += 1
-
-            def one(i_w):
-                i, w = i_w
-                st = dict(self.st, files=set(w["files"]) or self.st["files"])
-                action = w["action"] + " If no change is actually needed, return status no_change."
-                if evidence:
-                    action += f"\nPREVIOUS ATTEMPT FAILED — fix this root cause, do not repeat the same approach:\n{evidence}"
-                return self.agent("implementer", tier, make_handoff(self.task, st, action, cons), provider=prov, write=True, attempt=attempt,
-                                  label=f"implementer{'-' + str(i + 1) if len(workstreams) > 1 else ''}-t{tier}a{at_tier + 1}")
-            start = len(self.log)
-            with ThreadPoolExecutor(max_workers=max(1, min(len(workstreams), self.p["max_parallel"]))) as ex:
-                outs = list(ex.map(one, enumerate(workstreams)))
-            at_tier += 1
-            files = changed(self.root, before)
-            if not files and all(o.get("status") in ("no_change", "done") for o in outs):
-                self.say("  ✓ implementer: NO_CHANGE_REQUIRED — verification and review skipped")
-                return self.finish(True, [], "skipped", [], "no change required")
-            limit = LIM["max_attempts_t3"] if tier >= 3 else LIM["max_attempts_per_tier"]
-            if any(o.get("status") in ("blocked", "failed") or float(o.get("confidence", 1) or 0) < 0.5 for o in outs):
-                q = "; ".join(str(x) for o in outs for x in o.get("open_questions", []))[:500]
-                new = self.escalate(tier, "LOW_CONFIDENCE" if q else f"FAILED_T{tier}", f"implementer blocked/low confidence ({q or 'no reason given'})")
-                if new == tier:
-                    ok, needs = False, (q if any(o.get("status") == "blocked" for o in outs) else "")
-                    break
-                tier, at_tier, evidence = new, 0, q
-                continue
-            cmds, vreason, jfiles = select_checks(files, self.p["complexity"], self.task, self.cmds, self.root)
-            if self.diag_cmd and files and self.diag_cmd not in cmds:
-                cmds = [self.diag_cmd] + cmds  # "fix all errors": the diagnostic itself is the acceptance check
-            if files:  # evidence the task named is an acceptance check too (no baseline tolerance)
-                cmds += [c for c in sorted(self.strict_cmds) if c not in cmds]
-            if not cmds and not jfiles:
-                self.say(f"  ✓ verify           skipped — {vreason}, no check applies")
-                ok, vres, self.passed = True, [], set()
-                break
-            ok, vres = verify(self.root, cmds, jfiles, self.dir, self.baseline)
-            self.passed = {r["cmd"] for r in vres if r["ok"]}
-            vst = verify_status(vres)
-            self.say("  " + {"PASS": "✓", "PASS_WITH_BASELINE_FAILURES": "⚠"}.get(vst, "✗") + f" verify           ({vreason}) {vst}: "
-                     + "  ".join(describe_check(r) for r in vres))
-            if ok:
-                break
-            repaired = True
-            for e in self.log[start:]:
-                e["ok"] = False
-            failed = [r for r in vres if not r["ok"]]
-            fp = hashlib.sha1("|".join(r["cmd"] + "|" + ",".join(sorted(diagnostics(r["tail"])[0])) for r in failed).encode()).hexdigest()[:10]
-            self.fingerprints[fp] = self.fingerprints.get(fp, 0) + 1
-            evidence = "\n".join(f"$ {r['cmd']}\n{r['tail'][-1500:]}" for r in failed)
-            if self.fingerprints[fp] >= 3:
-                self.escalations.append(f"stop [REPEATED_FAILURE] same failure fingerprint {fp} three times")
-                self.say(f"  ■ stop: the same failure repeated three times ({fp}); needs new evidence or a narrower task")
-                break
-            if at_tier >= limit:
-                new = self.escalate(tier, f"FAILED_T{tier}", f"{at_tier} attempt(s) failed verification")
-                if new == tier:
-                    break
-                tier, at_tier = new, 0
-        for e in self.log:
-            if e["role"] == "implementer" and e["tier"] < tier:
-                e["escalated_after"] = True
-        review_state = "skipped"
-        if ok and files and "reviewer" in steps:
-            run_rev, why = review_gate(self.root, files, self.p, outs, vres, sorted(self.st["files"]), repaired)
-            if run_rev:
-                self.say(f"  → reviewer: {why}")
-                review_state, ok, vres = self.review(steps["reviewer"], files, prov, tier, before, outs, ok, vres)
-            else:
-                self.pruned.append("reviewer")
-                self.say(f"  ⤼ skip reviewer: {why}")
-                review_state = f"skipped ({why})"
-        return self.finish(ok, changed(self.root, before), review_state, vres, vreason,
-                           header="BLOCKED" if needs else None, hint=f"the agents need information: {needs}" if needs else "")
-
-    def review(self, s, files, prov, tier, before, outs, ok, vres):
-        rounds = 0
-        vsum = "; ".join(f"{r['cmd']} {'passed' if r['ok'] else 'FAILED'}" for r in vres) or "no checks applied"
-        while True:
-            rv = self.agent("reviewer", s["tier"], make_handoff(self.task, dict(self.st, files=set(files)), f"Review the diff below. Checks: {vsum}."),
-                            provider=s["provider"], label=f"reviewer-r{rounds + 1}", avoid=prov if self.p["cross_review"] else None,
-                            extra=diff_for(self.root, files))
-            if rv.get("status") in ("blocked", "failed"):
-                return "not reviewed (no reviewer could complete)", ok, vres  # verified work stays verified
-            blocking = [i for i in rv.get("issues", []) if str(i.get("severity", "")).lower() in ("critical", "high")]
-            if not blocking:
-                return f"passed ({len(rv.get('issues', []))} non-blocking)", ok, vres
-            if rounds >= LIM["max_review_rounds"]:
-                if self.p["judge"]:
-                    self.escalations.append("T2→T3 [CONFLICTING_EVIDENCE] reviewer vs implementer after a fix round")
-                    jd = self.agent("judge", 3, make_handoff(self.task, self.st,
-                                    "Question: are these review issues real defects that block completion?\n"
-                                    f"Reviewer issues: {json.dumps(blocking, ensure_ascii=False)[:2500]}\n"
-                                    f"Implementer position: {json.dumps([o.get('findings') for o in outs], ensure_ascii=False)[:1200]}"),
-                                    label="judge", extra=diff_for(self.root, files)[:12000])
-                    if jd.get("status") in ("blocked", "failed"):
-                        return "judge could not complete", False, vres
-                    jb = [i for i in jd.get("issues", []) if str(i.get("severity", "")).lower() in ("critical", "high")]
-                    return ("judge: blocking issues remain" if jb else "judge: resolved, no blocking issues"), ok and not jb, vres
-                return f"{len(blocking)} blocking issue(s) unresolved", False, vres
-            rounds += 1
-            fix = "Fix these review issues only:\n" + "\n".join(f"- [{i.get('severity')}] {i.get('file')}:{i.get('line')} {i.get('problem')} → {i.get('fix')}" for i in blocking)
-            outs = [self.agent("implementer", tier, make_handoff(self.task, self.st, fix), provider=prov, write=True, label=f"implementer-fix{rounds}")]
-            if any(o.get("status") in ("blocked", "failed") for o in outs):
-                return "review fix could not complete", False, vres
-            files = changed(self.root, before)
-            cmds, _, jfiles = select_checks(files, self.p["complexity"], self.task, self.cmds, self.root)
-            ok, vres = verify(self.root, cmds, jfiles, self.dir, self.baseline)
-            self.say("  " + ("✓" if ok else "✗") + f" verify           {verify_status(vres)}: " + "  ".join(describe_check(r) for r in vres))
-            if not ok:
-                return "fix round failed verification", False, vres
-
-    def finish(self, ok, files, review_state, vres, vreason, header=None, hint=""):
-        ok, vres, vreason, gate_header, gate_hint = self.evidence_gate(ok, list(vres), vreason)
-        header, hint = header or gate_header, hint or gate_hint
+    def finish(self, ok, files, review_state, vres, vreason, header=None, hint="", answer=None):
         dur = round(time.time() - self.t0)
         tin = sum(x["in"] for x in self.log); tc = sum(x["cached"] for x in self.log); tout = sum(x["out"] for x in self.log)
         usd = sum(x["usd"] or 0 for x in self.log)
         print("\n" + "─" * 60)
         print(f"{header or ('DONE' if ok else 'NOT DONE')} · {self.id} · {self.p['intent']} · {self.p['complexity']} · {self.p['budget']} · {dur}s")
+        if answer and answer.get("summary"):
+            print(f"Summary:     {str(answer['summary'])[:300]}")
         print(f"Changed:     {', '.join(files) or 'nothing'}")
         print(f"Verify:      {verify_status(vres) + ' · ' + '; '.join(describe_check(r) for r in vres) if vres else 'skipped'} ({vreason})")
         print(f"Review:      {review_state}")
@@ -2564,18 +1714,17 @@ class Run:
         hops = [f"{t['label']} {t['provider']} T{t['tier']} {t['result']}" for t in self.trace if t["result"] not in ("done", "no_change", "needs_change")]
         if hops:
             print(f"Fallbacks:   {'; '.join(hops)}")
+        if self.gen_edits:
+            print(f"Generated:   {len(self.gen_edits)} generated-file edit(s) reverted")
         if self.trace:
             (self.dir / "route.json").write_text(json.dumps(self.trace, indent=1))
-        if self.pruned:
-            print(f"Pruned:      {', '.join(self.pruned)} (evidence was sufficient; call not paid)")
-        print(f"Model calls: {len(self.log)} · fresh {tin / 1000:.1f}k · cached {tc / 1000:.1f}k · out {tout / 1000:.1f}k"
-              + (f" · ${usd:.3f}" if usd else "") + f" · ours ~{sum(x['ctx'] for x in self.log) / 1000:.1f}k")
+        print(f"Model calls: {len(self.log)} · in {tin / 1000:.1f}k · cached {tc / 1000:.1f}k · out {tout / 1000:.1f}k" + (f" · ${usd:.3f}" if usd else ""))
         print(f"State:       {self.dir.relative_to(self.root)}  (input-*.md = exact prompts; kept for the last {LIM['retain_tasks']} tasks)")
         if hint:
             print("Next:        " + hint.replace("\n", "\n             "))
         elif not ok:
             print("Next:        read the last *.json / verification.json there, or rerun with --budget quality")
-        record(self.root, self.p, self.log, ok, review_state, vres, vreason, self.dir, dur, self.escalations, self.pruned, len(hops))
+        record(self.root, self.p, self.log, ok, review_state, vres, vreason, self.dir, dur, self.escalations, (), len(hops))
         return 0 if ok else 1
 
 
@@ -2585,7 +1734,7 @@ def cmd_map(root):
     new = detect_map(root)
     if p.exists():  # keep hand-written keys
         old = json.loads(p.read_text())
-        for k in ("boundaries", "notes", "docs", "custom_checks"):
+        for k in ("boundaries", "notes", "docs"):
             if k in old:
                 new[k] = old[k]
         for k, v in old.get("commands", {}).items():
@@ -2605,14 +1754,14 @@ def cmd_doctor(root, probe):
         for name in available():
             for t in CFG["providers"][name]["tiers"]:
                 try:
-                    _, u, model = run_provider(name, int(t), 'Reply with exactly: {"status":"done"}', False, "explorer", d, f"probe-{name}-{t}", [], cwd=root)
+                    _, u, model = run_provider(name, int(t), 'Reply with exactly: {"status":"done"}', False, "explorer", d, f"probe-{name}-{t}", cwd=root)
                     print(f"  probe {name} T{t} {model}: OK ({(u['in'] + u['cached']) / 1000:.1f}k in)")
                 except Exception as e:  # noqa: BLE001
                     print(f"  probe {name} T{t}: FAILED {str(e)[-200:]}")
     if shutil.which("codex") and not shutil.which("codex-code-mode-host"):
         print("  ! codex-code-mode-host not on PATH: `codex exec` cannot run shell commands. Link it from the Codex/ChatGPT app bundle.")
     print("Repo:")
-    for rel in (".ai/CONTEXT.md", ".ai/repo-map.json", ".ai/decisions.md", "AGENTS.md", "CLAUDE.md", "GEMINI.md"):
+    for rel in (".ai/CONTEXT.md", ".ai/repo-map.json", ".ai/decisions.md", "AGENTS.md", "CLAUDE.md"):
         fp = root / rel
         print(f"  {'✓' if fp.exists() else '✗'} {rel}" + (f"  ~{tok(fp.read_text())} tokens" if fp.exists() else ""))
     rc, _ = sh(["git", "check-ignore", "-q", ".ai/state/x"], cwd=root)
@@ -2679,14 +1828,12 @@ def cmd_install():
 
 
 # ── self-test ──────────────────────────────────────────────────────────────────
-CATEGORY = {"Eval": "Routing scenarios", "ZeroToken": "Zero-token paths", "ContextBudget": "Context budgets", "Fallback": "Provider fallback",
-            "StagePruning": "Conditional DAG", "PrunedExecution": "Conditional DAG", "Verification": "Verification matrix",
-            "Escalation": "T3 / escalation", "Security": "Security", "CostAware": "Cost-aware selection", "Budgets": "Budget modes",
-            "ReviewGate": "Review gate", "Maintenance": "Diagnostics-first",
-            "EvidenceGuard": "History sample guard", "ReviewerWording": "Reviewer wording", "ReviewSizing": "Review sizing", "BaselineVerification": "Baseline-aware verify", "AggregateDiagnostics": "Aggregate diagnostics",
-            "EvidenceRouting": "Evidence routing", "EvidenceSources": "Evidence sources", "EvidenceRegistry": "Adapter registry",
-            "CustomChecks": "Custom checks", "Classification": "Finding classes", "ProviderFailover": "Provider fallback",
-            "ReadOnlyDerivation": "Read-only derivation", "GeneratedOutput": "Generated output", "RequiredOptional": "Required vs optional"}
+CATEGORY = {"Eval": "Routing scenarios", "ZeroToken": "Zero-token paths", "PromptMinimal": "Minimal prompts", "Fallback": "Provider fallback",
+            "ProviderFailover": "Provider fallback", "NativeExecution": "Native CLI execution", "SingleAgent": "Single-agent execution",
+            "Verification": "Verification matrix", "CheckCommands": "Read-only checks", "Escalation": "T3 / escalation",
+            "Security": "Security", "CostAware": "Cost-aware selection", "EvidenceGuard": "History sample guard", "Budgets": "Budget modes",
+            "RiskReview": "Review gate", "ReviewerWording": "Reviewer wording", "ReviewSizing": "Review sizing",
+            "BaselineVerification": "Baseline-aware verify", "GeneratedOutput": "Generated output", "ContextEstimate": "Context estimate"}
 
 
 def cmd_self_test(live):
@@ -2765,30 +1912,10 @@ def main():
     if argv[:1] == ["update"]:
         return subprocess.run([sys.executable, str(KIT / "scripts/manage.py"), "update"],
                               env={**os.environ, "AI_KIT": str(KIT)}).returncode
-    if argv[:1] == ["--all-providers"]:
-        show_providers(); print("  gemini  inactive; no configuration or installation required"); return 0
     flags = {"--status": lambda: show_status(root), "--providers": show_providers, "--models": show_models,
              "--last": lambda: show_last(root), "--cost": show_cost, "--routing": lambda: print(ROUTING_HELP)}
     if len(argv) == 1 and argv[0] in flags:
         return flags[argv[0]]() or 0
-    if argv[:1] == ["--diagnose"]:
-        dp = argparse.ArgumentParser(prog="ai-team --diagnose")
-        dp.add_argument("task", nargs="*"); dp.add_argument("--evidence", action="append", default=[], metavar="[SOURCE=]PATH")
-        da = dp.parse_args(argv[1:])
-        task, evidence = " ".join(da.task) or "fix all existing errors and warnings in this project", parse_evidence(da.evidence)
-        rmap, p = load_map(root), plan(task, "balanced", None, root, evidence=evidence)
-        r = Run(task, p, root, rmap)
-        rows = p.get("diagnostics") or p.get("evidence_gate") or DIAG.plan_rows(task, r.ctx(), maintenance=True, broad=True, supplied=evidence)
-        snap = snapshot(root)
-        r.before, r.pre = snap, {f: ((root / f).read_bytes() if (root / f).is_file() else None) for f in (snap or {})}
-        res = r.run_diagnostics(rows)
-        notes = generated_notes(root, r.gen(), PATH_RE.findall(task))
-        print(f"Diagnostics (read-only, 0 model calls) for: {task}\n" + render_diags(res) + "".join("\n" + x for x in notes)
-              + f"\nOverall: {overall_state(res)}")
-        for g in group_diags(res, is_gen=r.gen()):
-            print(f"  group ×{g['count']:<3} {g['key'][:80]}  ({len(g['files'])} file(s))")
-        shutil.rmtree(r.dir, ignore_errors=True)
-        return 0 if overall_state(res) in CLEAN_STATES else 1
     if argv[:1] == ["--self-test"]:
         return cmd_self_test("--live" in argv)
     if argv[:1] == ["map"]:
@@ -2802,35 +1929,37 @@ def main():
                               env={**os.environ, "AI_KIT": str(KIT)}).returncode
     if argv[:1] == ["instructions"]:
         ap = argparse.ArgumentParser(prog="ai-team instructions")
-        ap.add_argument("role", choices=["orchestrator", "explorer", "architect", "implementer", "reviewer", "researcher", "judge"])
-        ap.add_argument("task", nargs="*", help="optional task text for conditional guidance")
+        ap.add_argument("role", choices=ROLES)
+        ap.add_argument("task", nargs="*", help="optional task text")
         a = ap.parse_args(argv[1:])
         print(role_instructions(a.role, " ".join(a.task), root))
         return 0
     if argv[:1] == ["role"]:
         ap = argparse.ArgumentParser(prog="ai-team role")
-        ap.add_argument("role"); ap.add_argument("handoff"); ap.add_argument("--tier", type=int, default=1)
+        ap.add_argument("role", choices=list(CFG["role_providers"])); ap.add_argument("prompt"); ap.add_argument("--tier", type=int, default=1)
         ap.add_argument("--provider"); ap.add_argument("--write", action="store_true")
         a = ap.parse_args(argv[1:])
-        h = Path(a.handoff[1:]).read_text() if a.handoff.startswith("@") else a.handoff
+        prompt = Path(a.prompt[1:]).read_text() if a.prompt.startswith("@") else a.prompt
         p = {"intent": "ROLE", "complexity": "SMALL", "budget": "balanced", "signals": {}, "steps": [], "max_tier": 3}
-        out = Run(f"role {a.role}", p, root, load_map(root)).agent(a.role, a.tier, h, provider=a.provider, write=a.write or a.role == "implementer")
+        try:
+            out = Run(f"role {a.role}", p, root, load_map(root)).agent(a.role, a.tier, prompt, provider=a.provider,
+                                                                        write=a.write or a.role == "implementer")
+        except NoProvider as e:
+            sys.exit(f"ai-team: {e}")
         print(json.dumps({k: v for k, v in out.items() if not k.startswith("_")}, indent=1, ensure_ascii=False))
         return 0
     ap = argparse.ArgumentParser(prog="ai-team", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("task", nargs="+")
     ap.add_argument("--plan", action="store_true", help="routing only; no model calls")
-    ap.add_argument("--context-plan", action="store_true", help="context sources each call would receive; no model calls")
+    ap.add_argument("--context-plan", action="store_true", help="the exact prompt the agent would receive; no model calls")
     ap.add_argument("--budget", choices=list(CFG["budgets"]), default=os.environ.get("AI_TEAM_BUDGET", "balanced"))
     ap.add_argument("--complexity", choices=LEVELS)
     ap.add_argument("--json", action="store_true", help="with --plan: machine-readable plan")
-    ap.add_argument("--apply", action="store_true", help="ARCHITECTURE tasks: implement the decision instead of stopping at it")
-    ap.add_argument("--evidence", action="append", default=[], metavar="[SOURCE=]PATH",
-                    help="diagnostic evidence you already have (SARIF, JetBrains export dir, JUnit, JSON findings, tool/CI log); repeatable")
+    ap.add_argument("--apply", action="store_true", help="architecture tasks: implement the decision instead of stopping at it")
     a = ap.parse_args(argv)
     task = " ".join(a.task)
-    p = plan(task, a.budget, a.complexity, root, a.apply, parse_evidence(a.evidence))
-    rmap = {} if p.get("local") and p["intent"] != "TOOL" and p["signals"].get("meta") != "project" and not p.get("evidence_audit") else load_map(root)
+    p = plan(task, a.budget, a.complexity, root, a.apply)
+    rmap = {} if p.get("local") and p["intent"] != "TOOL" and p["signals"].get("meta") != "project" else load_map(root)
     if a.plan and a.json:
         print(json.dumps(p, indent=1, ensure_ascii=False)); return 0
     if a.context_plan:
@@ -2841,7 +1970,7 @@ def main():
     print()
     if p.get("local"):
         return local(p, root, rmap, task)
-    if not available() and not (p.get("evidence_audit") or p["signals"].get("aggregate")):  # T0 diagnostics need no model
+    if not available():
         sys.exit("ai-team: no active AI provider CLI found (codex or claude). Install one and rerun `ai-team doctor`.")
     return Run(task, p, root, rmap).execute()
 

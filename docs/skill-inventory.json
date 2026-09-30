@@ -9,7 +9,7 @@
   },
   "canonical_runtime": {
     "manifest": "capabilities.json",
-    "capability_count": 15,
+    "capability_count": 8,
     "provider_adapter_count": 6,
     "providers": [
       "codex",
@@ -19,45 +19,56 @@
     "entries": [
       {
         "id": "runtime-controls",
-        "name": "Deterministic orchestration controls",
+        "name": "Router controls",
         "runtime_type": "script",
         "scope": "global",
         "providers": "shared",
         "load_strategy": "always",
-        "status": "replace",
-        "reason": "Triage, evidence routing (diagnostics/ adapters), budgeting, verification, mapping, routing and cost estimation stay in existing code; no prompt copies.",
+        "status": "keep",
+        "reason": "Classification, context estimate, provider/tier choice, fallback, cooldowns, verification and cost tracking live in code; no prompt copies.",
         "sources": [
           "bin/ai-team",
           "scripts/bootstrap.py",
           "scripts/manage.py",
-          "diagnostics/core.py",
-          "diagnostics/__init__.py",
           "routing.json",
           "POLICY.md"
         ]
       },
       {
+        "id": "provider-adapters",
+        "name": "Native agent execution",
+        "runtime_type": "adapter",
+        "scope": "global",
+        "providers": "Codex / Claude",
+        "load_strategy": "lazy",
+        "status": "keep",
+        "reason": "The original task goes to the native Codex / Claude Code CLI, which uses its own tools inside its own sandbox; thin interactive entrypoints load canonical roles.",
+        "sources": [
+          "bin/ai-team"
+        ]
+      },
+      {
         "id": "orchestration",
-        "name": "Orchestration",
+        "name": "Orchestration entrypoint",
         "runtime_type": "role",
         "scope": "global",
         "providers": "shared",
         "load_strategy": "lazy",
         "status": "keep",
-        "reason": "One lead workflow; current policy and routing remain authoritative.",
+        "reason": "/team and Codex `team`: plan with ai-team, then run it.",
         "sources": [
           "roles/orchestrator.md"
         ]
       },
       {
         "id": "exploration",
-        "name": "Targeted exploration",
+        "name": "Exploration",
         "runtime_type": "role",
         "scope": "global",
         "providers": "shared",
         "load_strategy": "lazy",
         "status": "keep",
-        "reason": "Read only evidence needed for the next action; no ecosystem discovery.",
+        "reason": "Interactive read-only investigation subagent.",
         "sources": [
           "roles/explorer.md"
         ]
@@ -70,28 +81,10 @@
         "providers": "shared",
         "load_strategy": "lazy",
         "status": "keep",
-        "reason": "Bounded changes from established evidence.",
+        "reason": "Interactive bounded-change subagent.",
         "sources": [
           "roles/implementer.md"
         ]
-      },
-      {
-        "id": "debugging",
-        "name": "Debugging / test repair",
-        "runtime_type": "role",
-        "scope": "global",
-        "providers": "shared",
-        "load_strategy": "conditional",
-        "status": "merge",
-        "reason": "One root-cause workflow, including test failure diagnosis; selected existing roles only.",
-        "sources": [
-          "workflows/debugging.md"
-        ],
-        "roles": [
-          "explorer",
-          "implementer"
-        ],
-        "task_pattern": "\\b(debug|bug|error|fail\\w*|crash\\w*|broken|regression|flaky|root cause|test repair)\\b|\u043e\u0448\u0438\u0431\u043a|\u0431\u0430\u0433|\u043f\u0430\u0434\u0430|\u043f\u043e\u0447\u0438\u043d"
       },
       {
         "id": "architecture",
@@ -101,125 +94,22 @@
         "providers": "shared",
         "load_strategy": "lazy",
         "status": "keep",
-        "reason": "Existing architect decides only unresolved cross-module choices.",
+        "reason": "Interactive read-only decision subagent.",
         "sources": [
           "roles/architect.md"
         ]
       },
       {
         "id": "review",
-        "name": "Review / disagreement resolution",
-        "runtime_type": "role",
-        "scope": "global",
-        "providers": "shared",
-        "load_strategy": "lazy",
-        "status": "merge",
-        "reason": "One reviewer plus conditional judge; retain existing risk gates.",
-        "sources": [
-          "roles/reviewer.md",
-          "roles/judge.md"
-        ]
-      },
-      {
-        "id": "research",
-        "name": "Research",
+        "name": "Review",
         "runtime_type": "role",
         "scope": "global",
         "providers": "shared",
         "load_strategy": "lazy",
         "status": "keep",
-        "reason": "External facts with exact versions and official sources when needed.",
+        "reason": "Interactive read-only diff review subagent.",
         "sources": [
-          "roles/researcher.md"
-        ]
-      },
-      {
-        "id": "dependencies",
-        "name": "Dependency investigation",
-        "runtime_type": "role",
-        "scope": "global",
-        "providers": "shared",
-        "load_strategy": "conditional",
-        "status": "merge",
-        "reason": "Relevant manifest/lockfile/caller evidence; no separate agent or package installation.",
-        "sources": [
-          "workflows/dependencies.md"
-        ],
-        "roles": [
-          "explorer",
-          "researcher",
-          "implementer"
-        ],
-        "task_pattern": "\\b(dependenc\\w*|package|lockfile|peer|upgrade|version)\\b|\u0437\u0430\u0432\u0438\u0441\u0438\u043c|\u043e\u0431\u043d\u043e\u0432\u0438"
-      },
-      {
-        "id": "migration",
-        "name": "Migration planning",
-        "runtime_type": "role",
-        "scope": "global",
-        "providers": "shared",
-        "load_strategy": "conditional",
-        "status": "merge",
-        "reason": "Phases, compatibility, checks and recovery augment existing roles.",
-        "sources": [
-          "workflows/migration.md"
-        ],
-        "roles": [
-          "architect",
-          "researcher",
-          "implementer"
-        ],
-        "task_pattern": "\\b(migrat\\w*|schema change|rollback)\\b|\u043c\u0438\u0433\u0440\u0430\u0446"
-      },
-      {
-        "id": "security",
-        "name": "Security review",
-        "runtime_type": "role",
-        "scope": "global",
-        "providers": "shared",
-        "load_strategy": "conditional",
-        "status": "merge",
-        "reason": "Evidence-based trust-boundary review; no always-on external scanner.",
-        "sources": [
-          "workflows/security.md"
-        ],
-        "roles": [
-          "reviewer",
-          "architect"
-        ],
-        "task_pattern": "\\b(auth\\w*|security|permission\\w*|secret\\w*|credential\\w*|payment\\w*|injection|xss|csrf)\\b|\u0431\u0435\u0437\u043e\u043f\u0430\u0441\u043d|\u0430\u0432\u0442\u043e\u0440\u0438\u0437"
-      },
-      {
-        "id": "performance",
-        "name": "Performance investigation",
-        "runtime_type": "role",
-        "scope": "global",
-        "providers": "shared",
-        "load_strategy": "conditional",
-        "status": "merge",
-        "reason": "Measure and profile before changing a hot path; use existing roles.",
-        "sources": [
-          "workflows/performance.md"
-        ],
-        "roles": [
-          "explorer",
-          "implementer",
-          "architect"
-        ],
-        "task_pattern": "\\b(performance|profil\\w*|latency|slow|throughput|leak\\w*|allocation|contention|hot path)\\b|\u043f\u0440\u043e\u0438\u0437\u0432\u043e\u0434\u0438\u0442\u0435\u043b\u044c\u043d|\u0443\u0442\u0435\u0447\u043a"
-      },
-      {
-        "id": "handoff",
-        "name": "Structured handoff",
-        "runtime_type": "script",
-        "scope": "global",
-        "providers": "shared",
-        "load_strategy": "conditional",
-        "status": "keep",
-        "reason": "Existing make_handoff and role output schemas; protocol is a reference, not repeated prompt content.",
-        "sources": [
-          "bin/ai-team",
-          "PROTOCOL.md"
+          "roles/reviewer.md"
         ]
       },
       {
@@ -230,26 +120,13 @@
         "providers": "shared",
         "load_strategy": "conditional",
         "status": "optional",
-        "reason": "One compact global workflow; valid local graph and installed CLI required, otherwise targeted exploration.",
+        "reason": "One line in the prompt (and guidance for interactive explorer/architect) only with an installed CLI and a valid local graph.",
         "sources": [
           "skills/graphify/SKILL.md"
         ],
         "roles": [
           "explorer",
           "architect"
-        ]
-      },
-      {
-        "id": "provider-adapters",
-        "name": "Provider adapters",
-        "runtime_type": "adapter",
-        "scope": "global",
-        "providers": "Codex / Claude",
-        "load_strategy": "lazy",
-        "status": "merge",
-        "reason": "Generate format-only pointers to canonical instructions; never copy vendor caches.",
-        "sources": [
-          "bin/ai-team"
         ]
       }
     ]
@@ -268,22 +145,7 @@
       "runtime_enabled": true
     },
     {
-      "source": "PROTOCOL.md",
-      "classification": "canonical",
-      "runtime_enabled": true
-    },
-    {
       "source": "bin/ai-team",
-      "classification": "canonical",
-      "runtime_enabled": true
-    },
-    {
-      "source": "diagnostics/__init__.py",
-      "classification": "canonical",
-      "runtime_enabled": true
-    },
-    {
-      "source": "diagnostics/core.py",
       "classification": "canonical",
       "runtime_enabled": true
     },
@@ -303,17 +165,7 @@
       "runtime_enabled": true
     },
     {
-      "source": "roles/judge.md",
-      "classification": "canonical",
-      "runtime_enabled": true
-    },
-    {
       "source": "roles/orchestrator.md",
-      "classification": "canonical",
-      "runtime_enabled": true
-    },
-    {
-      "source": "roles/researcher.md",
       "classification": "canonical",
       "runtime_enabled": true
     },
@@ -339,31 +191,6 @@
     },
     {
       "source": "skills/graphify/SKILL.md",
-      "classification": "canonical",
-      "runtime_enabled": true
-    },
-    {
-      "source": "workflows/debugging.md",
-      "classification": "canonical",
-      "runtime_enabled": true
-    },
-    {
-      "source": "workflows/dependencies.md",
-      "classification": "canonical",
-      "runtime_enabled": true
-    },
-    {
-      "source": "workflows/migration.md",
-      "classification": "canonical",
-      "runtime_enabled": true
-    },
-    {
-      "source": "workflows/performance.md",
-      "classification": "canonical",
-      "runtime_enabled": true
-    },
-    {
-      "source": "workflows/security.md",
       "classification": "canonical",
       "runtime_enabled": true
     }

@@ -1,9 +1,11 @@
-"""ai-team routing / context / security regression suite. No model calls: CLIs are faked, providers are stubbed.
+"""ai-team router regression suite: classification → one native agent at the cheapest capable tier → fallback, retry and
+escalation only on failure. No model calls: CLIs are faked and providers are stubbed.
 
 Run: ai-team --self-test      (or: python3 -m unittest discover -s ~/.ai-kit/tests)
 """
 import contextlib, importlib.machinery, importlib.util, io, json, os, subprocess, tempfile, unittest
 from pathlib import Path
+from unittest.mock import patch
 
 SRC = Path(os.environ.get("AI_KIT", str(Path(__file__).resolve().parents[1]))) / "bin" / "ai-team"
 loader = importlib.machinery.SourceFileLoader("ai_team_under_test", str(SRC))
@@ -11,13 +13,14 @@ spec = importlib.util.spec_from_loader("ai_team_under_test", loader)
 m = importlib.util.module_from_spec(spec)
 loader.exec_module(m)
 
-# Isolation: fake installed CLIs (codex + claude, no gemini), no history, no real cooldowns, no metric writes, no real calls.
+# Isolation: fake installed CLIs (codex + claude), no history, no real cooldowns, no metric writes, no real calls, no sleeping.
 m.shutil.which = lambda b: f"/usr/bin/{b}" if b in ("codex", "claude") else None
 m.metrics = lambda: []
 m._HIST = []
 m.record = lambda *a, **k: None
 m.COOLDOWN_FILE = Path(tempfile.mkdtemp()) / "cooldown.json"
 m._AVAIL.clear()
+m.SLEEP = lambda s: None
 
 
 def forbid(*a, **k):
@@ -26,17 +29,18 @@ def forbid(*a, **k):
 
 REAL_RUN_PROVIDER = m.run_provider
 REAL_VERIFY = m.verify
-REAL_DIAGNOSE = m.diagnose
 m.run_provider = forbid
-m.SLEEP = lambda s: None  # retry backoff never really sleeps in tests
 
 
-def git_repo(files):
-    d = Path(tempfile.mkdtemp())
+def git_repo(files, after=None):
+    d = Path(tempfile.mkdtemp(prefix="router repo "))
     for rel, body in files.items():
         (d / rel).parent.mkdir(parents=True, exist_ok=True)
-        (d / rel).write_text(body)
+        (d / rel).write_text(body if isinstance(body, str) else json.dumps(body))
     subprocess.run("git init -q && git add -A && git -c user.email=t@t -c user.name=t commit -qm init", shell=True, cwd=d, check=True)
+    for rel, body in (after or {}).items():  # untracked / ignored files created after the commit
+        (d / rel).parent.mkdir(parents=True, exist_ok=True)
+        (d / rel).write_text(body)
     return d
 
 
@@ -46,8 +50,8 @@ NO_AUTH = git_repo({"src/cart.js": "module.exports = 1\n", "README.md": "# x\n",
 WITH_AUTH = git_repo({"src/auth/session.ts": "export const session = {}\n"})
 
 
-def plan(task, budget="balanced", root=NO_AUTH, forced=None):
-    return m.plan(task, budget, forced, root)
+def plan(task, budget="balanced", root=NO_AUTH, forced=None, apply=False):
+    return m.plan(task, budget, forced, root, apply)
 
 
 def roles(p, stage=None):
@@ -55,16 +59,30 @@ def roles(p, stage=None):
 
 
 def stub(responses):
-    """run_provider stub: responses[role] is a dict or callable(tier) → dict. Records (role, provider, tier)."""
+    """run_provider stub: responses[role] is the agent's status line (dict), a callable(tier) → dict, or a raw final message
+    (str). Records (role, provider, tier, prompt, write)."""
     calls = []
 
-    def run(provider, tier, prompt, write, role, tdir, label, allow, **k):
-        calls.append((role, provider, tier))
-        r = responses.get(role, {"status": "done", "confidence": 0.9})
+    def run(provider, tier, prompt, write, role, tdir, label, cwd=None, research=False):
+        calls.append((role, provider, tier, prompt, write))
+        r = responses.get(role, {"status": "done", "summary": "ok"})
         r = r(tier) if callable(r) else r
-        return json.dumps(r), {"in": 1, "cached": 0, "out": 1, "usd": None}, "stub"
+        return (r if isinstance(r, str) else "Done.\n" + json.dumps(r)), {"in": 1, "cached": 0, "out": 1, "usd": None}, "stub"
     m.run_provider = run
     return calls
+
+
+def execute(task, root=NO_AUTH, rmap=None, budget="balanced"):
+    """plan → local answer or Run.execute, stdout captured → (rc, stdout, run or None)."""
+    p = plan(task, budget, root)
+    buf, r = io.StringIO(), None
+    with contextlib.redirect_stdout(buf):
+        if p.get("local"):
+            rc = m.local(p, root, m.load_map(root), task)
+        else:
+            r = m.Run(task, p, root, rmap if rmap is not None else {"commands": {}})
+            rc = r.execute()
+    return rc, buf.getvalue(), r
 
 
 class Base(unittest.TestCase):
@@ -74,80 +92,70 @@ class Base(unittest.TestCase):
         m._AVAIL.clear()
         m.run_provider = forbid
         m.verify = lambda *a: (True, [])
-        m.diagnose = REAL_DIAGNOSE
         m.COOLDOWN_FILE.write_text("{}")
         os.environ.pop("AI_TEAM_PROVIDERS", None)
         subprocess.run("git checkout -q . && git clean -qfd -e .ai", shell=True, cwd=NO_AUTH)
 
 
-EVAL = [  # (id, task, intent, complexity or None, required roles, extra assertion)
-    (1, "ты работаешь?", "META", "TRIVIAL", [], "local"),
-    (2, "show providers", "META", "TRIVIAL", [], "local"),
-    (3, "explain what this component does", "QUESTION", "SMALL", ["explorer"], "readonly"),
-    (4, "where is authentication configured?", "QUESTION", "SMALL", ["explorer"], "readonly"),
-    (5, "change the border radius of the login button", "IMPLEMENTATION", "MICRO", ["implementer"], "micro"),
-    (6, "fix typo in README", "IMPLEMENTATION", "MICRO", ["implementer"], "micro-docs"),
-    (7, "add loading state to submit button", "IMPLEMENTATION", "SMALL", ["implementer"], "single"),
-    (8, "find why this component renders twice", "DEBUG", None, ["explorer"], "cheap-debug"),
-    (9, "find and fix an authentication race condition", "DEBUG", "COMPLEX", ["explorer", "implementer"], "dag"),
-    (10, "redesign authentication architecture", "ARCHITECTURE", "COMPLEX", ["explorer", "architect"], "architecture"),
-    (11, "review my current changes", "REVIEW", None, [], "local"),   # clean tree → nothing to review (sized cases: ReviewSizing)
-    (12, "check whether dependency X changed its API in the latest version", "RESEARCH", None, ["researcher"], "readonly"),
-    (13, "fix all current TypeScript errors", "DEBUG", "MEDIUM", ["implementer"], "maintenance"),
-    (14, "tell me what build command this project uses", "META", "TRIVIAL", [], "local"),
-    (15, "plan how to add pagination to the list page", "PLAN", None, ["explorer"], "plan"),
-    (16, "how should we implement pagination?", "PLAN", None, ["explorer"], "plan"),
-    (17, "clean up the codebase", "IMPLEMENTATION", "MEDIUM", ["implementer"], "maintenance"),
-    (18, "clean up the project?", "QUESTION", None, ["explorer"], "readonly"),
+EVAL = [  # (id, task, intent, complexity or None, role (None = T0 local answer), edits?, starting tier)
+    (1, "ты работаешь?", "META", "TRIVIAL", None, False, None),
+    (2, "show providers", "META", "TRIVIAL", None, False, None),
+    (3, "explain what this component does", "QUESTION", "SMALL", "explorer", False, 1),
+    (4, "where is authentication configured?", "QUESTION", "SMALL", "explorer", False, 1),
+    (5, "what is a race condition?", "QUESTION", "SMALL", "answer", False, 1),
+    (6, "change the border radius of the login button", "IMPLEMENTATION", "MICRO", "implementer", True, 1),
+    (7, "fix typo in README", "IMPLEMENTATION", "MICRO", "implementer", True, 1),
+    (8, "add loading state to submit button", "IMPLEMENTATION", "SMALL", "implementer", True, 1),
+    (9, "find why this component renders twice", "DEBUG", None, "explorer", False, 1),
+    (10, "find and fix an authentication race condition", "DEBUG", "COMPLEX", "implementer", True, 2),
+    (11, "redesign authentication architecture", "ARCHITECTURE", "COMPLEX", "architect", False, 2),
+    (12, "review my current changes", "REVIEW", None, None, False, None),   # clean tree: nothing to review
+    (13, "check whether dependency X changed its API in the latest version", "RESEARCH", None, "researcher", False, 1),
+    (14, "fix all current TypeScript errors", "DEBUG", "MEDIUM", "implementer", True, 2),
+    (15, "tell me what build command this project uses", "META", "TRIVIAL", None, False, None),
+    (16, "plan how to add pagination to the list page", "PLAN", None, "architect", False, 1),
+    (17, "how should we implement pagination?", "PLAN", None, "architect", False, 1),
+    (18, "clean up the codebase", "IMPLEMENTATION", "MEDIUM", "implementer", True, 2),
+    (19, "clean up the project?", "QUESTION", None, "explorer", False, 1),
+    (20, "fix all WebStorm errors", "DEBUG", "MEDIUM", "implementer", True, 2),
+    (21, "fix all Sonar issues", "IMPLEMENTATION", "MEDIUM", "implementer", True, 2),
+    (22, "the dark mode toggle for the settings page", "UNKNOWN", "SMALL", "implementer", True, 1),
 ]
 
 
 class Eval(Base):
     def test_scenarios(self):
-        for i, task, intent, cx, req, kind in EVAL:
+        for i, task, intent, cx, role, write, tier in EVAL:
             with self.subTest(i=i, task=task):
                 p = plan(task)
                 self.assertEqual(p["intent"], intent)
                 if cx:
                     self.assertEqual(p["complexity"], cx)
-                self.assertEqual(roles(p, "required"), req)
-                self.assertFalse(any(s["tier"] == 3 for s in p["steps"]), "T3 at plan time needs an escalation reason")
-                self.assertFalse(any(s["provider"] == "gemini" for s in p["steps"]), "unavailable provider selected")
-                if kind == "local":
+                if role is None:
                     self.assertTrue(p.get("local")); self.assertEqual(p["steps"], [])
-                if kind == "readonly":
-                    self.assertNotIn("implementer", roles(p)); self.assertEqual(max(s["tier"] for s in p["steps"]), 1)
-                if kind.startswith("micro"):
-                    self.assertEqual(roles(p), ["implementer"]); self.assertEqual(p["steps"][0]["tier"], 1)
-                if kind == "micro-docs":
-                    self.assertEqual(m.select_checks(["README.md"], "MICRO", task, CMDS)[0], [])
-                if kind == "single":
-                    self.assertEqual(roles(p), ["implementer"])
-                if kind == "cheap-debug":
-                    self.assertNotIn("architect", roles(p, "required")); self.assertEqual(p["steps"][0]["tier"], 1)
-                if kind == "dag":
-                    self.assertEqual(roles(p, "conditional"), ["architect", "reviewer"])
-                if kind == "architecture":
-                    self.assertEqual(roles(p, "approval"), ["implementer"])
-                if kind == "review":
-                    self.assertNotIn("implementer", roles(p))
-                if kind == "maintenance":
-                    self.assertTrue(p["signals"]["maintenance"]); self.assertNotIn("explorer", roles(p))
-                if kind in ("plan", "readonly"):
-                    self.assertNotIn("implementer", roles(p)); self.assertFalse(p["signals"].get("aggregate"))
-
-    def test_conditional_stages_never_in_minimum(self):
-        p = plan("find and fix an authentication race condition")
-        req = sum(s["est"] for s in p["steps"] if s["stage"] == "required")
-        exp = sum(s["est"] for s in p["steps"] if s["stage"] in ("required", "conditional"))
-        self.assertLess(req, exp)
+                    continue
+                self.assertEqual(roles(p, "required"), [role])                    # ONE agent does the task
+                self.assertEqual((p["steps"][0]["write"], p["steps"][0]["tier"]), (write, tier))
+                self.assertFalse(any(s["tier"] == 3 for s in p["steps"]), "T3 only by escalation")
+                self.assertTrue(set(roles(p)) <= {role, "reviewer"})              # no explorer/architect/judge pipeline
 
     def test_critical_needs_repo_evidence(self):
         self.assertEqual(plan("fix authentication race condition")["complexity"], "COMPLEX")
         p = plan("fix authentication race condition", root=WITH_AUTH)
         self.assertEqual(p["complexity"], "CRITICAL")
-        self.assertEqual(roles(p, "required"), ["explorer", "architect", "implementer"])
-        self.assertFalse(any(s["tier"] == 3 for s in p["steps"]))
+        self.assertEqual((roles(p, "required"), p["steps"][0]["tier"]), (["implementer"], 2))
+        self.assertTrue(p["steps"][1]["likely"])                                  # CRITICAL → the independent review will run
+
+    def test_no_tool_specific_logic(self):
+        base = plan("fix all errors")
+        for tool in ("WebStorm", "Sonar", "Jira", "VS Code", "Qodana", "CI", "Stylelint"):
+            with self.subTest(tool=tool):
+                p = plan(f"fix all {tool} errors")
+                s = p["steps"][0]
+                self.assertEqual((s["role"], s["tier"], s["provider"]), (base["steps"][0]["role"], base["steps"][0]["tier"], base["steps"][0]["provider"]))
+                self.assertTrue(m.task_prompt("implementer", f"fix all {tool} errors", NO_AUTH, True).startswith(f"fix all {tool} errors"))
+        self.assertFalse(hasattr(m, "DIAG"))
+        self.assertFalse((m.KIT / "diagnostics").exists())
 
 
 class ZeroToken(Base):
@@ -157,67 +165,60 @@ class ZeroToken(Base):
             with self.subTest(t=t):
                 p = plan(t)
                 self.assertTrue(p.get("local"))
-                m.local(p, NO_AUTH, m.load_map(NO_AUTH), t)  # forbid() raises if a provider is touched
+                with contextlib.redirect_stdout(io.StringIO()):
+                    m.local(p, NO_AUTH, m.load_map(NO_AUTH), t)  # forbid() raises if a provider is touched
 
     def test_plan_and_context_plan_make_no_calls(self):
-        for t in ("find and fix an authentication race condition", "explain what this component does"):
+        calls = m.MODEL_CALLS[0]
+        for t in ("find and fix an authentication race condition", "explain what this component does", "fix all WebStorm errors",
+                  "what is a race condition?"):
             p = plan(t)
-            m.print_plan(p, NO_AUTH, {}, t)
-            m.print_context_plan(p, NO_AUTH, {}, t)
-
-    def test_clean_diagnostics_need_no_model(self):
-        # Shell-only checks: no package manager is required by the deterministic suite.
-        root = git_repo({"src/file.py": "x = 1\n"})
-        self.assertEqual(m.Run("fix all errors", plan("fix all errors", root=root), root,
-                               {"commands": {k: "true" for k in CMDS}}).execute(), 0)
+            with contextlib.redirect_stdout(io.StringIO()):
+                m.print_plan(p, NO_AUTH, {}, t)
+                m.print_context_plan(p, NO_AUTH, {}, t)
+        self.assertEqual(m.MODEL_CALLS[0], calls)
 
 
-class ContextBudget(Base):
-    LIMITS = {"QUESTION": 1000, "MICRO": 600, "SMALL": 800, "MEDIUM": 1500, "COMPLEX": 1500}
+class PromptMinimal(Base):
+    def test_prompt_is_the_original_task_plus_a_few_router_lines(self):
+        root = git_repo({".ai/CONTEXT.md": "# P\n\n## Project facts\n" + "fact\n" * 200 + "\n## Rules\n- r\n"})
+        task = "add a dark mode toggle to the settings page"
+        for role, write in (("implementer", True), ("explorer", False), ("architect", False), ("researcher", False), ("reviewer", False)):
+            with self.subTest(role=role):
+                p = m.task_prompt(role, task, root, write)
+                self.assertTrue(p.startswith(task + "\n"))
+                self.assertLessEqual(m.tok(p) - m.tok(task), 110)                    # router lines only
+                self.assertNotIn("fact", p); self.assertNotIn("# Role:", p)          # no project dump, no role essay
+        self.assertEqual(m.task_prompt("answer", "what is a race condition?"), "what is a race condition?")
+        self.assertIn("Read-only", m.task_prompt("explorer", task, root))
+        self.assertIn('"issues"', m.task_prompt("reviewer", task, root))
+        self.assertIn("Never edit generated output (dist-dev/)", m.task_prompt("implementer", task, root, True, gdirs=["dist-dev"]))
 
-    def test_orchestrator_context_regression(self):
-        for i, task, intent, cx, req, kind in EVAL:
+    def test_plan_context_is_small_and_stable(self):
+        for i, task, *_ in EVAL:
             p = plan(task)
-            if p.get("local"):
-                continue
-            limit = self.LIMITS.get(intent if intent == "QUESTION" else p["complexity"], 1500)
             for s in p["steps"]:
                 with self.subTest(i=i, role=s["role"]):
-                    self.assertLessEqual(s["ctx"], limit, f"{task}: {s['role']} context {s['ctx']} > {limit}")
-
-    def test_progressive_disclosure(self):
-        root = git_repo({".ai/CONTEXT.md": "# P\n\n## Project facts\n" + "fact\n" * 50 + "\n## Graphify\n" + "g\n" * 50 + "\n## Rules\n- r\n"})
-        _, micro = m.build_prompt("implementer", "TASK: x\nNEXT ACTION: y", root, {}, "MICRO")
-        _, med = m.build_prompt("implementer", "TASK: x\nNEXT ACTION: y", root, {}, "MEDIUM")
-        _, exp = m.build_prompt("explorer", "TASK: x\nNEXT ACTION: y", root, {"dirs": ["a"]}, "SMALL")
-        self.assertLess(micro["project"], med["project"])   # MICRO editor gets Rules only
-        self.assertEqual(exp["project"], med["project"])  # no valid graph/CLI: graph instructions stay unloaded
-        self.assertNotIn("repo-map", micro)
-        self.assertIn("repo-map", exp)
-
-    def test_oversized_context_is_trimmed(self):
-        _, sizes = m.build_prompt("reviewer", "TASK: x\nNEXT ACTION: y", NO_AUTH, {}, "SMALL", extra="x" * 40000)
-        self.assertTrue(sizes.get("_trimmed"))
-        self.assertLessEqual(sum(v for k, v in sizes.items() if not k.startswith("_")), m.CFG["context_budget"]["SMALL"] + 60)
-
-    def test_answer_mode_carries_only_the_task(self):
-        _, sizes = m.build_prompt("answer", "what is a race condition?", NO_AUTH, {}, "SMALL")
-        self.assertEqual(list(sizes), ["task"])
+                    self.assertLessEqual(s["ctx"] - m.tok(task), 110)
+        a, b = m.task_prompt("implementer", "task a", NO_AUTH, True), m.task_prompt("implementer", "task a", NO_AUTH, True)
+        self.assertEqual(a, b); self.assertNotRegex(a, r"20\d\d-\d\d-\d\d|T20\d{6}")
 
     def test_permanent_kit_files_stay_small(self):
         for f in (m.KIT / "roles").glob("*.md"):
             with self.subTest(f=f.name):
                 self.assertLessEqual(len(f.read_text()), 600 if f.stem == "orchestrator" else 400)
         self.assertLessEqual(len((m.KIT / "template" / "CONTEXT.md").read_text()), 1200)
-        for s in m.SCHEMA.values():
-            self.assertLessEqual(len(s), 600)
+        for s in (m.WRITE_STATUS, m.READ_STATUS, m.REVIEW_STATUS):
+            self.assertLessEqual(len(s), 300)
 
-    def test_no_volatile_data_in_stable_prefix(self):
-        p1, _ = m.build_prompt("implementer", "TASK: a\nNEXT ACTION: b", NO_AUTH, {}, "SMALL")
-        p2, _ = m.build_prompt("implementer", "TASK: c\nNEXT ACTION: d", NO_AUTH, {}, "SMALL")
-        prefix = p1.split("# Handoff")[0]
-        self.assertEqual(prefix, p2.split("# Handoff")[0])
-        self.assertNotRegex(prefix, r"20\d\d-\d\d-\d\d|T20\d{6}")
+    def test_parse_status(self):
+        out = m.parse_status("Renamed x to y in a.js.\n{\"status\":\"done\",\"summary\":\"renamed\",\"files\":[\"a.js\"]}", "implementer")
+        self.assertEqual((out["status"], out["summary"], out["files"], out["answer"]), ("done", "renamed", ["a.js"], "Renamed x to y in a.js."))
+        fenced = m.parse_status("The router is in bin/ai-team.\n```json\n{\"status\":\"done\",\"summary\":\"found\"}\n```", "explorer")
+        self.assertEqual((fenced["status"], fenced["answer"]), ("done", "The router is in bin/ai-team."))
+        prose = m.parse_status("Just prose, no status line.", "explorer")
+        self.assertEqual((prose["status"], prose["answer"], prose["_unstructured"]), ("done", "Just prose, no status line.", True))
+        self.assertEqual(m.parse_status("{not json", "answer"), {"status": "done", "answer": "{not json"})
 
 
 class Fallback(Base):
@@ -247,8 +248,251 @@ class Fallback(Base):
         m.run_provider = run
         p = plan("add loading state to submit button")
         self.assertEqual(p["steps"][0]["provider"], "codex")
-        m.Run("t", p, NO_AUTH, {"commands": {}}).execute()
+        with contextlib.redirect_stdout(io.StringIO()):
+            m.Run("t", p, NO_AUTH, {"commands": {}}).execute()
         self.assertEqual(calls, ["codex", "claude"])
+
+
+class ProviderFailover(Base):
+    """Native agent CLIs behind a claude-code-router-style fallback chain: classify the failure, then retry, cool down or
+    disable the provider, and hand the call to the next capable one."""
+
+    def setUp(self):
+        super().setUp()
+        self.sleeps = []
+        m.SLEEP = self.sleeps.append
+        self.addCleanup(setattr, m, "SLEEP", lambda s: None)
+
+    def run_with(self, script, task="add loading state to submit button"):
+        """script: {provider: [outcome, …]} consumed per call; a str outcome is a CLI failure message, a dict the agent's status."""
+        calls, queue = [], {k: list(v) for k, v in script.items()}
+
+        def run(provider, tier, prompt, write, role, *a, **k):
+            calls.append((role, provider, tier, prompt))
+            nxt = queue[provider].pop(0) if queue.get(provider) else {"status": "no_change"}
+            if isinstance(nxt, str):
+                raise m.ProviderError(nxt)
+            return json.dumps(nxt), {"in": 1, "cached": 0, "out": 1, "usd": None}, "stub"
+        m.run_provider = run
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            r = m.Run(task, plan(task), NO_AUTH, {"commands": {}})
+            rc = r.execute()
+        return rc, calls, buf.getvalue(), r
+
+    def test_failure_classes(self):
+        for text, kind in (("You've hit your usage limit. Try again in 2 hours.", "rate_limit"), ("HTTP 429 Too Many Requests", "rate_limit"),
+                           ("Claude AI usage limit reached|1759999999", "rate_limit"), ("Invalid API key · Please run /login", "auth"),
+                           ("unexpected status 401 Unauthorized", "auth"), ("error_max_budget_usd", "budget"), ("error_max_turns", "budget"),
+                           ("API Error: 529 overloaded_error", "transient"), ("stream disconnected before completion", "transient"),
+                           ("503 Service Unavailable", "transient"), ("model not found", "fatal")):
+            with self.subTest(text=text):
+                self.assertEqual(m.failure_kind(text), kind)
+
+    def test_cooldown_and_backoff_follow_the_provider(self):
+        now = m.datetime.datetime(2026, 9, 30, 10, 0)
+        self.assertEqual(m.cooldown_minutes("try again in 1 day 3 hours 32 minutes", now), 1652)
+        self.assertEqual(m.cooldown_minutes("5-hour limit reached · resets 3pm", now), 300)
+        self.assertEqual(m.cooldown_minutes(f"usage limit reached|{int(now.timestamp()) + 5400}", now), 90)
+        self.assertEqual(m.cooldown_minutes("quota exceeded", now), 60)
+        self.assertEqual((m.retry_delay("please retry after 3 seconds", 1), m.retry_delay("503", 1), m.retry_delay("503", 9)), (3, 1, 30))
+
+    def test_transient_failure_is_retried_on_the_same_provider(self):
+        rc, calls, out, _ = self.run_with({"codex": ["503 Service Unavailable", {"status": "no_change"}]})
+        self.assertEqual([c[1] for c in calls], ["codex", "codex"]); self.assertEqual(self.sleeps, [1])
+        self.assertEqual(rc, 0, out); self.assertNotIn("codex", m.BROKEN)
+
+    def test_rate_limit_cools_down_and_falls_back(self):
+        rc, calls, out, _ = self.run_with({"codex": ["You've hit your usage limit. Try again in 2 hours."]})
+        self.assertEqual([c[1] for c in calls], ["codex", "claude"]); self.assertEqual(rc, 0, out)
+        until = m.datetime.datetime.fromisoformat(json.loads(m.COOLDOWN_FILE.read_text())["codex"])
+        self.assertAlmostEqual((until - m.datetime.datetime.now()).total_seconds() / 60, 120, delta=2)
+        self.assertIn("Fallbacks:   implementer-t1a1 codex T1 rate_limit", out)
+        rc, calls, out, _ = self.run_with({})                                     # the next task skips the provider in cooldown
+        self.assertEqual({c[1] for c in calls}, {"claude"})
+
+    def test_auth_error_disables_the_provider_but_a_budget_limit_only_skips_the_call(self):
+        rc, calls, out, _ = self.run_with({"codex": ["Invalid API key · Please run /login"]})
+        self.assertEqual(([c[1] for c in calls], rc), (["codex", "claude"], 0)); self.assertIn("codex", m.BROKEN)
+        m.BROKEN.clear(); m._AVAIL.clear()
+        rc, calls, out, _ = self.run_with({"codex": ["context window exceeded: prompt is too long"]})
+        self.assertEqual(([c[1] for c in calls], rc), (["codex", "claude"], 0))
+        self.assertNotIn("codex", m.BROKEN); self.assertIn("codex", m.available())
+
+    def test_agent_that_gives_up_hands_over_to_the_next_provider(self):
+        rc, calls, out, _ = self.run_with({"codex": [{"status": "blocked", "questions": ["which API version?"]}]})
+        self.assertEqual([c[1] for c in calls], ["codex", "claude"]); self.assertEqual(rc, 0, out)
+        self.assertIn("a previous codex attempt ended blocked (which API version?)", calls[1][3])
+
+    def test_failed_agent_escalates_one_tier(self):
+        rc, calls, out, r = self.run_with({"codex": [{"status": "failed"}, {"status": "no_change"}], "claude": [{"status": "failed"}]})
+        self.assertEqual([(c[1], c[2]) for c in calls], [("codex", 1), ("claude", 1), ("codex", 2)]); self.assertEqual(rc, 0, out)
+        self.assertTrue(any("T1→T2 [FAILED_T1]" in e for e in r.escalations))
+
+    def test_blocked_only_when_no_provider_can_continue(self):
+        rc, calls, out, _ = self.run_with({"codex": ["usage limit reached"], "claude": ["usage limit reached"]})
+        self.assertEqual(rc, 1); self.assertIn("BLOCKED ·", out)
+        self.assertIn("no working provider for implementer (tried codex, claude)", out); self.assertIn("rate-limited: claude until", out)
+
+    def test_blocked_when_the_agent_needs_information(self):
+        q = {"status": "blocked", "questions": ["Which payment provider should be used?"]}
+        rc, calls, out, r = self.run_with({"codex": [q], "claude": [q]})
+        self.assertEqual((rc, len(calls), r.escalations), (1, 2, []))           # both providers asked; no bigger model can know it
+        self.assertIn("BLOCKED ·", out); self.assertIn("the agent needs information: Which payment provider", out)
+
+
+class NativeExecution(Base):
+    """Each CLI runs with its own tools and its own safety model; ai-team only picks the role's permissions."""
+
+    def command(self, provider, write, role="implementer", research=False, tier=1):
+        captured = {}
+
+        def fake_run(cmd, **k):
+            captured["cmd"], captured["cwd"] = cmd, k.get("cwd")
+            if provider == "codex":
+                Path(cmd[cmd.index("-o") + 1]).write_text('done\n{"status":"done"}')
+                return subprocess.CompletedProcess(cmd, 0, '{"usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3}}', "")
+            return subprocess.CompletedProcess(cmd, 0, json.dumps({"result": "ok", "usage": {}}), "")
+        with patch.object(m.subprocess, "run", side_effect=fake_run), patch.object(m, "codex_lean_flags", return_value=["--disable", "plugins"]), \
+                patch.object(m, "_CODEX_KNOWN", {"web_search_request"}):
+            REAL_RUN_PROVIDER(provider, tier, "the task", write, role, Path(tempfile.mkdtemp()), "t", cwd="/repo", research=research)
+        m.MODEL_CALLS[0] -= 1  # the command was captured, not executed
+        self.assertEqual(captured["cwd"], "/repo")
+        return captured["cmd"]
+
+    def test_codex_uses_its_own_sandbox_and_project_instructions(self):
+        w, r = self.command("codex", True), self.command("codex", False, "explorer")
+        self.assertEqual(w[w.index("-s") + 1], "workspace-write"); self.assertEqual(r[r.index("-s") + 1], "read-only")
+        self.assertNotIn("project_doc_max_bytes=0", w)                              # AGENTS.md → .ai/CONTEXT.md loads natively
+        self.assertNotIn("web_search_request", w)
+        self.assertIn("web_search_request", self.command("codex", False, "researcher", research=True))
+
+    def test_claude_writer_runs_freely_inside_its_bash_sandbox(self):
+        c = self.command("claude", True)
+        sandbox = json.loads(c[c.index("--settings") + 1])["sandbox"]
+        self.assertTrue(sandbox["enabled"] and sandbox["autoAllowBashIfSandboxed"] and not sandbox["allowUnsandboxedCommands"])
+        self.assertEqual(c[c.index("--permission-mode") + 1], "acceptEdits")
+        tools = c[c.index("--tools") + 1:c.index("--allowedTools")]
+        self.assertTrue({"Bash", "Edit", "Write", "Read"} <= set(tools))
+        self.assertNotIn("Bash", c[c.index("--allowedTools") + 1:c.index("--disallowedTools")])  # no allowlist: the sandbox decides
+        deny = c[c.index("--disallowedTools") + 1:]
+        self.assertIn("Read(./.env)", deny); self.assertIn("Bash(git push:*)", deny)
+        self.assertEqual(c[c.index("--setting-sources") + 1], "project,local")     # project CLAUDE.md → .ai/CONTEXT.md
+        self.assertIn("--strict-mcp-config", c)                                    # no user plugins/MCP: token cost
+
+    def test_claude_reader_is_read_only(self):
+        c = self.command("claude", False, "explorer")
+        self.assertEqual(c[c.index("--permission-mode") + 1], "dontAsk")
+        tools = c[c.index("--tools") + 1:c.index("--allowedTools")]
+        self.assertFalse({"Edit", "Write"} & set(tools))
+        self.assertIn("Bash(git diff:*)", c); self.assertIn("Read(./.env)", c)
+
+    def test_answers_and_research(self):
+        a = self.command("claude", False, "answer")
+        self.assertEqual((a[a.index("--tools") + 1], a[a.index("--setting-sources") + 1]), ("", ""))   # no tools, no project files
+        r = self.command("claude", False, "researcher", research=True)
+        self.assertTrue({"WebSearch", "WebFetch"} <= set(r))
+
+
+class SingleAgent(Base):
+    def test_one_call_does_the_whole_change(self):
+        calls = stub({"implementer": lambda t: (NO_AUTH / "src/cart.js").write_text("module.exports = 2\n") and {"status": "done", "summary": "edited"}})
+        rc, out, _ = execute("add loading state to submit button")
+        self.assertEqual([c[0] for c in calls], ["implementer"]); self.assertEqual(rc, 0, out)
+        self.assertTrue(calls[0][4]); self.assertTrue(calls[0][3].startswith("add loading state to submit button"))
+        self.assertIn("Summary:     edited", out); self.assertIn("Changed:     src/cart.js", out)
+
+    def test_unconfirmed_no_change_is_not_done(self):
+        calls = stub({"implementer": "I could not find a submit button in this project."})
+        rc, out, r = execute("add loading state to submit button")
+        self.assertEqual((len(calls), rc, r.escalations), (1, 1, []))             # no extra spend, but no false DONE
+        self.assertIn("NOT DONE", out); self.assertIn("I could not find a submit button", out)
+
+    def test_read_only_answer_is_the_output(self):
+        calls = stub({"explorer": "The router lives in bin/ai-team.\n{\"status\":\"done\",\"summary\":\"found\"}"})
+        rc, out, _ = execute("where is the router configured?")
+        self.assertEqual([(c[0], c[4]) for c in calls], [("explorer", False)]); self.assertEqual(rc, 0, out)
+        self.assertIn("The router lives in bin/ai-team.", out)
+
+    def test_read_only_failure_escalates_one_tier(self):
+        calls = stub({"explorer": lambda t: {"status": "failed"} if t == 1 else {"status": "done", "summary": "ok"}})
+        rc, out, r = execute("explain what this component does")
+        self.assertEqual([c[2] for c in calls], [1, 1, 2]); self.assertEqual(rc, 0, out)
+
+    def test_review_task_uses_the_agents_own_git_tools(self):
+        (NO_AUTH / "src/cart.js").write_text("module.exports = 2\n")
+        calls = stub({"reviewer": {"status": "done", "issues": [{"severity": "low", "file": "src/cart.js", "line": 1, "problem": "p", "fix": "f"}]}})
+        rc, out, _ = execute("review my current changes")
+        self.assertEqual([c[0] for c in calls], ["reviewer"]); self.assertEqual(rc, 0, out)
+        self.assertIn("git diff", calls[0][3]); self.assertIn("[low] src/cart.js:1 p → f", out)
+
+
+class Verification(Base):
+    def checks(self, files, cx="SMALL", task="x", root=None):
+        return m.select_checks(files, cx, task, CMDS, root)[0]
+
+    def test_matrix(self):
+        rel = git_repo({"src/Button.tsx": "x\n", "src/Button.test.tsx": "t\n"})
+        cases = [([], "SMALL", []), (["README.md", "docs/a.png"], "SMALL", []), (["styles/a.css"], "SMALL", ["lint"]),
+                 (["src/util.ts"], "MICRO", ["tc"]), (["src/a.ts", "src/b.ts"], "MEDIUM", ["tc", "lint", "test"]),
+                 (["tsconfig.json"], "SMALL", ["tc", "lint", "build"]), (["package.json"], "SMALL", ["tc", "build"]),
+                 (["src/util.ts"], "CRITICAL", ["tc", "lint", "test", "build"])]
+        for files, cx, want in cases:
+            with self.subTest(files=files, cx=cx):
+                self.assertEqual(self.checks(files, cx), want)
+        self.assertEqual(self.checks(["src/Button.tsx"], root=rel), ["tc", "test"])
+        cmds, _, js = m.select_checks(["messages/en/home.json"], "SMALL", "x", CMDS)
+        self.assertEqual((cmds, js), ([], ["messages/en/home.json"]))
+
+    def test_explicit_request_honoured_but_not_for_docs(self):
+        self.assertEqual(self.checks(["src/util.ts"], task="fix it and run tests"), ["tc", "test"])
+        self.assertEqual(self.checks(["README.md"], task="fix typo in README tests section"), [])
+
+    def test_no_change_skips_everything(self):
+        stub({"implementer": {"status": "no_change"}})
+        called = []
+        m.verify = lambda *a: called.append(1) or (True, [])
+        execute("add loading state to submit button", rmap={"commands": CMDS})
+        self.assertEqual(called, [])
+
+    def test_checks_the_task_is_about_are_strict(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            fix_all = m.Run("fix all current TypeScript errors", plan("fix all current TypeScript errors"), NO_AUTH, {"commands": CMDS})
+            ordinary = m.Run("add loading state to submit button", plan("add loading state to submit button"), NO_AUTH, {"commands": CMDS})
+            tests = m.Run("fix the failing tests", plan("fix the failing tests"), NO_AUTH, {"commands": CMDS})
+        self.assertEqual(fix_all.strict, {"tc", "lint", "test", "build"}); self.assertIsNone(fix_all.baseline("tc"))
+        self.assertEqual(ordinary.strict, set())
+        self.assertEqual(tests.strict, {"test"})
+
+
+class CheckCommands(Base):
+    def test_mutating_checks_are_never_run_by_ai_team(self):
+        root = git_repo({"package.json": {"scripts": {"lint": "eslint . --fix", "format": "yarn run prettier --write", "prettier": "prettier src",
+                                                      "typecheck": "tsc", "test": "vitest run", "build": "vite build", "dev": "vite"}}})
+        rmap = {"commands": {"lint": "npm run lint", "format": "yarn format", "typecheck": "npm run typecheck", "test": "npm test",
+                             "build": "npm run build", "dev": "npm run dev"}}
+        self.assertEqual(m.check_commands(root, rmap), {"test": "npm test", "build": "npm run build"})   # dev servers never
+
+    def test_read_only_commands_are_kept(self):
+        root = git_repo({"package.json": {"scripts": {"check": "yarn run lint:ci", "lint:ci": "eslint ."}}})
+        rmap = {"commands": {"typecheck": "yarn tsc --noEmit", "lint": "yarn check", "test": "pytest -q"}}
+        self.assertEqual(m.check_commands(root, rmap), rmap["commands"])
+        self.assertTrue(m.mutating("jest -u", {})); self.assertTrue(m.mutating("tsc -b", {})); self.assertFalse(m.mutating("tsc -p x --noEmit", {}))
+
+
+class Escalation(Base):
+    def test_bounded_retries_with_reason_codes(self):
+        def edit(tier):
+            (NO_AUTH / "src/cart.js").write_text(f"module.exports = {tier}{len(calls)}\n")
+            return {"status": "done"}
+        calls = stub({"implementer": edit})
+        m.verify = lambda *a: (False, [{"cmd": "tc", "ok": False, "tail": "src/cart.js(1,1): error TS2304: Cannot find name 'x'."}])
+        rc, out, r = execute("add loading state to submit button", rmap={"commands": CMDS})
+        self.assertEqual([c[2] for c in calls], [1, 1, 2])   # T1 ×2 → [FAILED_T1] → T2; same failure a 3rd time → stop
+        self.assertTrue(any("[FAILED_T1]" in e for e in r.escalations))
+        self.assertTrue(any("[REPEATED_FAILURE]" in e for e in r.escalations))
+        self.assertEqual(rc, 1)
+        self.assertIn("PREVIOUS ATTEMPT FAILED", calls[1][3])                    # the failure goes back to the agent
 
 
 class CostAware(Base):
@@ -298,6 +542,58 @@ class EvidenceGuard(Base):
         self.assertEqual([m.evidence_label(n) for n in (4, 5, 19, 20)], ["weak", "moderate", "moderate", "strong"])
 
 
+class Budgets(Base):
+    def test_modes_differ(self):
+        t = "implement job filter on the jobs page"
+        econ, bal, qual = plan(t, "economy"), plan(t, "balanced"), plan(t, "quality")
+        self.assertEqual((roles(econ), econ["steps"][0]["tier"]), (["implementer"], 1))   # cheapest: one tier lower, no review
+        self.assertEqual((roles(bal, "conditional"), bal["steps"][0]["tier"]), (["reviewer"], 2))
+        self.assertEqual(roles(qual, "required"), ["implementer", "reviewer"])
+
+    def test_no_t3_at_plan_time(self):
+        for budget in ("economy", "balanced", "quality"):
+            for e in EVAL:
+                self.assertFalse(any(s["tier"] == 3 for s in plan(e[1], budget)["steps"]), (budget, e[1]))
+
+
+class RiskReview(Base):
+    def needs(self, rel, body, budget="balanced", task="implement job filter on the jobs page", root=None):
+        d = root or git_repo({rel: "x = 1\n"})
+        (d / rel).write_text(body)
+        with contextlib.redirect_stdout(io.StringIO()):
+            return m.Run(task, plan(task, budget, d), d, {"commands": {}}).needs_review([rel])
+
+    def test_ordinary_changes_are_not_reviewed(self):
+        for rel, body in (("src/util.ts", "x = 2\n"), ("README.md", "".join(f"line {i}\n" for i in range(200))), ("src/a.css", ".a{}\n"),
+                          ("src/util.ts", "".join(f"y{i} = {i}\n" for i in range(80)))):
+            with self.subTest(rel=rel):
+                self.assertFalse(self.needs(rel, body))
+
+    def test_security_sensitive_or_critical_changes_are_reviewed(self):
+        self.assertTrue(self.needs("src/auth/session.ts", "x = 2\n"))
+        self.assertTrue(self.needs("src/util.ts", "const password = hash(x)\n"))
+        self.assertTrue(self.needs("src/auth/session.ts", "export const session = 1\n", task="fix authentication race condition", root=WITH_AUTH))
+
+    def test_budget_decides(self):
+        self.assertFalse(self.needs("src/auth/session.ts", "x = 2\n", "economy"))
+        self.assertTrue(self.needs("src/util.ts", "x = 2\n", "quality"))
+
+    def test_blocking_issue_gets_one_fix_round(self):
+        root = git_repo({"src/auth/session.ts": "export const ttl = 60\n"})
+        seen = []
+
+        def impl(tier):
+            seen.append(tier)
+            (root / "src/auth/session.ts").write_text("export const ttl = 3600\n" if len(seen) == 1 else "export const ttl = 600\n")
+            return {"status": "done", "summary": "ttl"}
+        calls = stub({"implementer": impl, "reviewer": {"status": "done", "issues": [{"severity": "high", "file": "src/auth/session.ts", "line": 1,
+                                                                                       "problem": "session too long", "fix": "use 600"}]}})
+        rc, out, _ = execute("change the session ttl", root=root)
+        self.assertEqual([c[0] for c in calls], ["implementer", "reviewer", "implementer"]); self.assertEqual(rc, 0, out)
+        self.assertNotEqual(calls[0][1], calls[1][1])                             # cross-provider review
+        self.assertIn("Review:      1 blocking issue(s) fixed", out)
+
+
 class ReviewerWording(Base):
     def reviewer(self, task, budget="balanced"):
         return next(s for s in plan(task, budget)["steps"] if s["role"] == "reviewer")
@@ -305,6 +601,7 @@ class ReviewerWording(Base):
     def test_cross_provider(self):
         r = self.reviewer("find and fix an authentication race condition")
         self.assertIn("cross-provider review", r["why"])
+        self.assertIn("the other provider", r["why"]); self.assertNotIn("only available provider", r["why"])
         self.assertNotIn("independent of", r["why"])
 
     def test_same_provider_is_an_independent_session(self):
@@ -399,11 +696,10 @@ class BaselineVerification(Base):
         (repo / "src/dirty.js").write_text("user's own uncommitted work\n")  # dirty tree before the task
         def impl(tier):
             (repo / "src/cart.js").write_text(edit)
-            return {"status": "done", "confidence": 0.9}
+            return {"status": "done"}
         calls = stub({"implementer": impl})
         m.verify = REAL_VERIFY
-        r = m.Run("add loading state to submit button", plan("add loading state to submit button", root=repo), repo, {"commands": {"typecheck": check}})
-        rc = r.execute()
+        rc, out, r = execute("add loading state to submit button", root=repo, rmap={"commands": {"typecheck": check}})
         return rc, calls, r, repo
 
     def test_6_preexisting_unrelated_errors_do_not_retry(self):
@@ -420,561 +716,58 @@ class BaselineVerification(Base):
                  "printf 'src/other.ts(3,1): error TS2304: Cannot find name y.\\n'; exit 1")
         rc, calls, r, repo = self.run_task(check, "BROKEN\n")
         self.assertEqual(rc, 1)
-        self.assertGreaterEqual(len(calls), 2)                          # retried / escalated as before
+        self.assertGreaterEqual(len(calls), 2)                          # retried / escalated
         self.assertTrue(any("[FAILED_T1]" in e or "REPEATED_FAILURE" in e for e in r.escalations))
         self.assertEqual((repo / "src/dirty.js").read_text(), "user's own uncommitted work\n")
 
 
-class Budgets(Base):
-    def test_modes_differ(self):
-        t = "implement job filter on the jobs page"
-        self.assertNotIn("reviewer", roles(plan(t, "economy")))
-        self.assertEqual(roles(plan(t, "balanced"), "conditional"), ["reviewer"])
-        self.assertEqual(roles(plan("add loading state to submit button", "quality"), "required"), ["implementer", "reviewer"])
-
-    def test_quality_is_not_t3(self):
-        for e in EVAL:
-            self.assertFalse(any(s["tier"] == 3 for s in plan(e[1], "quality")["steps"]), e[1])
-
-    def test_micro_gets_no_quality_extras(self):
-        self.assertEqual(roles(plan("change the border radius of the login button", "quality")), ["implementer"])
-
-
-class StagePruning(Base):
-    DEBUG_T = "find the root cause of an authentication race condition"
-
-    def gate(self, out, task=None, planned=True):
-        return m.architect_gate(out, plan(task or self.DEBUG_T), planned)
-
-    def test_localized_skips_architect(self):
-        run, codes, why = self.gate({"confidence": 0.96, "root_cause_candidate": "stale closure in onVisibilityChange", "relevant_files": ["hooks/s.ts:40"],
-                                     "affected_subsystems": ["session"], "architecture_decision_required": False, "risk": "low"})
-        self.assertFalse(run, why)
-
-    def test_high_risk_bar_is_stricter(self):
-        out = {"confidence": 0.85, "root_cause_candidate": "x", "relevant_files": ["a.ts"], "affected_subsystems": ["s"]}
-        self.assertTrue(self.gate(out)[0])
-        self.assertFalse(self.gate(out, "find the root cause of the footer layout bug")[0])
-
-    def test_ambiguity_runs_architect_with_codes(self):
-        cases = [({"confidence": 0.55, "root_cause_candidate": "x"}, "LOW_CONFIDENCE"),
-                 ({"confidence": 0.96, "root_cause_candidate": "x", "root_causes": ["a", "b", "c"]}, "MULTIPLE_ROOT_CAUSES"),
-                 ({"confidence": 0.96, "root_cause_candidate": "x", "architecture_decision_required": True}, "ARCHITECTURE_CHANGE"),
-                 ({"confidence": 0.96, "root_cause_candidate": "x", "risk": "high"}, "SECURITY_RISK"),
-                 ({"confidence": 0.96, "root_cause_candidate": "x", "unresolved_questions": ["?"]}, "CONFLICTING_EVIDENCE")]
-        for out, code in cases:
-            with self.subTest(code=code):
-                run, codes, _ = self.gate(out)
-                self.assertTrue(run); self.assertIn(code, codes)
-
-    def test_critical_and_architecture_keep_architect(self):
-        self.assertTrue(m.architect_gate({"confidence": 0.99}, plan("fix authentication race condition", root=WITH_AUTH), True)[0])
-        self.assertTrue(m.architect_gate({"confidence": 0.99}, plan("redesign authentication architecture"), True)[0])
-
-
-class PrunedExecution(Base):
-    def run_debug(self, explorer_out, task="find and fix the root cause of the footer race condition"):
-        calls = stub({"explorer": explorer_out, "architect": {"status": "done", "confidence": 0.9, "change_required": True, "next_action": "fix"},
-                      "implementer": {"status": "no_change"}})
-        m.Run("t", plan(task), NO_AUTH, {"commands": {}}).execute()
-        return [c[0] for c in calls]
-
-    def test_confident_explorer_goes_straight_to_implementer(self):
-        self.assertEqual(self.run_debug({"status": "needs_change", "confidence": 0.96, "root_cause_candidate": "localized double subscribe",
-                                         "relevant_files": ["src/cart.js:3"], "affected_subsystems": ["cart"], "next_action": "guard"}),
-                         ["explorer", "implementer"])
-
-    def test_uncertain_explorer_gets_architect(self):
-        self.assertEqual(self.run_debug({"status": "needs_change", "confidence": 0.55, "root_causes": ["a", "b", "c"]}),
-                         ["explorer", "architect", "implementer"])
-
-    def test_researcher_only_when_asked(self):
-        self.assertEqual(self.run_debug({"status": "needs_change", "confidence": 0.96, "root_cause_candidate": "localized", "relevant_files": ["src/cart.js"],
-                                         "external_research_required": True}), ["explorer", "researcher", "implementer"])
-
-    def test_downgrade_after_evidence(self):
-        stub({"explorer": {"status": "needs_change", "confidence": 0.96, "root_cause_candidate": "one wrong conditional",
-                           "relevant_files": ["src/cart.js"], "complexity": "MICRO"}, "implementer": {"status": "no_change"}})
-        r = m.Run("t", plan("find and fix the root cause of the intermittent footer race condition"), NO_AUTH, {"commands": {}})
-        r.execute()
-        self.assertEqual(r.p["complexity"], "MICRO")
-        self.assertEqual([e["tier"] for e in r.log if e["role"] == "implementer"], [1])
-
-
-class Verification(Base):
-    def checks(self, files, cx="SMALL", task="x", root=None):
-        return m.select_checks(files, cx, task, CMDS, root)[0]
-
-    def test_matrix(self):
-        rel = git_repo({"src/Button.tsx": "x\n", "src/Button.test.tsx": "t\n"})
-        cases = [([], "SMALL", []), (["README.md", "docs/a.png"], "SMALL", []), (["styles/a.css"], "SMALL", ["lint"]),
-                 (["src/util.ts"], "MICRO", ["tc"]), (["src/a.ts", "src/b.ts"], "MEDIUM", ["tc", "lint", "test"]),
-                 (["tsconfig.json"], "SMALL", ["tc", "lint", "build"]), (["package.json"], "SMALL", ["tc", "build"]),
-                 (["src/util.ts"], "CRITICAL", ["tc", "lint", "test", "build"])]
-        for files, cx, want in cases:
-            with self.subTest(files=files, cx=cx):
-                self.assertEqual(self.checks(files, cx), want)
-        self.assertEqual(self.checks(["src/Button.tsx"], root=rel), ["tc", "test"])
-        cmds, _, js = m.select_checks(["messages/en/home.json"], "SMALL", "x", CMDS)
-        self.assertEqual((cmds, js), ([], ["messages/en/home.json"]))
-
-    def test_explicit_request_honoured_but_not_for_docs(self):
-        self.assertEqual(self.checks(["src/util.ts"], task="fix it and run tests"), ["tc", "test"])
-        self.assertEqual(self.checks(["README.md"], task="fix typo in README tests section"), [])
-
-    def test_no_change_skips_everything(self):
-        stub({"implementer": {"status": "no_change"}})
-        called = []
-        m.verify = lambda *a: called.append(1) or (True, [])
-        m.Run("t", plan("add loading state to submit button"), NO_AUTH, {"commands": CMDS}).execute()
-        self.assertEqual(called, [])
-
-
-class Escalation(Base):
-    def test_bounded_retries_with_reason_codes(self):
-        def edit(tier):
-            (NO_AUTH / "src/cart.js").write_text(f"module.exports = {tier}{len(calls)}\n")
-            return {"status": "done", "confidence": 0.9}
-        calls = stub({"implementer": edit})
-        m.verify = lambda *a: (False, [{"cmd": "tc", "ok": False, "tail": "src/cart.js(1,1): error TS2304: Cannot find name 'x'."}])
-        r = m.Run("t", plan("add loading state to submit button"), NO_AUTH, {"commands": CMDS})
-        r.execute()
-        self.assertEqual([c[2] for c in calls], [1, 1, 2])   # T1 ×2 → [FAILED_T1] → T2; same failure a 3rd time → stop
-        self.assertTrue(any("[FAILED_T1]" in e for e in r.escalations))
-        self.assertTrue(any("[REPEATED_FAILURE]" in e for e in r.escalations))
-        self.assertFalse(any(c[2] == 3 for c in calls))
-
-    def test_t3_only_with_reason_code(self):
-        calls = stub({"explorer": {"status": "needs_change", "confidence": 0.4, "root_causes": ["a", "b"]},
-                      "architect": lambda t: {"status": "done", "confidence": 0.4 if t == 2 else 0.9, "change_required": False}})
-        r = m.Run("t", plan("find the root cause of the footer race condition"), NO_AUTH, {"commands": {}})
-        r.execute()
-        self.assertEqual(len([c for c in calls if c[2] == 3]), 1)
-        self.assertTrue(any("T2→T3 [LOW_CONFIDENCE]" in e for e in r.escalations))
-
-
-class ReviewGate(Base):
-    def gate(self, rel, body, outs=({"confidence": 0.9},), vres=({"ok": True},), planned=None, repaired=False):
-        d = git_repo({rel: "x = 1\n"})
-        (d / rel).write_text(body)
-        return m.review_gate(d, [rel], plan("implement job filter on the jobs page"), list(outs), list(vres),
-                             planned if planned is not None else [rel], repaired)
-
-    def test_skips(self):
-        self.assertFalse(self.gate("src/util.ts", "x = 2\n")[0])
-        self.assertFalse(self.gate("README.md", "".join(f"line {i}\n" for i in range(200)))[0])
-
-    def test_triggers(self):
-        cases = {"auth": ("src/auth/session.ts", "x = 2\n", {}), "concurrency": ("src/util.ts", "await refresh()\n", {}),
-                 "low confidence": ("src/util.ts", "x = 2\n", {"outs": ({"confidence": 0.4},)}), "unverified": ("src/util.ts", "x = 2\n", {"vres": ()}),
-                 "off-plan": ("src/util.ts", "x = 2\n", {"planned": ["src/other.ts"]}), "public api": ("src/api/users.ts", "x = 2\n", {}),
-                 "large": ("src/util.ts", "".join(f"y{i} = {i}\n" for i in range(80)), {}), "repaired": ("src/util.ts", "x = 2\n", {"repaired": True})}
-        for name, (rel, body, kw) in cases.items():
-            with self.subTest(name=name):
-                self.assertTrue(self.gate(rel, body, **kw)[0])
-
-    def test_economy_still_reviews_security(self):
-        d = git_repo({"src/auth/session.ts": "x = 1\n"})
-        (d / "src/auth/session.ts").write_text("x = 2\n")
-        self.assertTrue(m.review_gate(d, ["src/auth/session.ts"], plan("implement job filter on the jobs page", "economy"), [{}], [{"ok": True}], [])[0])
-
-
-class AggregateDiagnostics(Base):
-    TSC_ERR = "src/a.ts(3,5): error TS2304: Cannot find name foo."
-
-    def repo(self, scripts, extra=None):
-        files = {"package.json": json.dumps({"name": "fx", "private": True, "scripts": scripts}), "src/a.ts": "x\n"}
-        files.update(extra or {})
-        return git_repo(files)
-
-    def res(self, cat, status, state="required"):
-        return {"cat": cat, "cmd": cat, "state": state, "status": status, "ok": status == "PASS", "errors": 0, "warnings": 0, "out": ""}
-
-    def test_1_typecheck_fail_lint_pass_is_not_clean(self):
-        self.assertEqual(m.overall_state([self.res("typecheck", "FAIL"), self.res("lint", "PASS")]), "DIRTY")
-
-    def test_2_typecheck_pass_lint_fail_is_not_clean(self):
-        self.assertEqual(m.overall_state([self.res("typecheck", "PASS"), self.res("lint", "FAIL")]), "DIRTY")
-
-    def test_3_all_pass_is_clean(self):
-        self.assertEqual(m.overall_state([self.res("typecheck", "PASS"), self.res("lint", "PASS"),
-                                          dict(self.res("build", None, "deferred"), cmd="b")]), "CLEAN")
-
-    def test_4_one_pass_with_another_unexecuted_is_not_clean(self):
-        self.assertEqual(m.overall_state([self.res("lint", "PASS"), self.res("typecheck", None)]), "INCOMPLETE")
-        ran = []
-        r = m.Run("fix all errors", plan("fix all existing errors and warnings in this project"), NO_AUTH, {"commands": {}})
-        rows = [{"cat": "lint", "cmd": "lint", "state": "required"}, {"cat": "typecheck", "cmd": "tc", "state": "required"}]
-        out = r.run_diagnostics(rows, runner=lambda c: ran.append(c) or ((True, "") if c == "lint" else (False, self.TSC_ERR)))
-        self.assertEqual(ran, ["lint", "tc"])                      # every required category is executed
-        self.assertEqual(m.overall_state(out), "DIRTY")
-
-    def test_5_mutating_lint_is_never_the_baseline(self):
-        d = self.repo({"lint": "eslint . --fix"})
-        self.assertEqual(m.safe_diag_commands(d, {})["lint"]["cmd"], "npx eslint .")
-        d = self.repo({"lint": "eslint . --fix", "lint:check": "eslint ."})
-        self.assertEqual(m.safe_diag_commands(d, {})["lint"]["cmd"], "npm run lint:check")
-        d = self.repo({"lint": "eslint . --fix && prettier --write ."})
-        self.assertIsNone(m.safe_diag_commands(d, {})["lint"]["cmd"])   # unsafe to derive → unavailable, not run
-        d = self.repo({"typecheck": "tsc", "prettier": "prettier --write ."})
-        cmds = m.safe_diag_commands(d, {})
-        self.assertEqual((cmds["typecheck"]["cmd"], cmds["format"]["cmd"]), ("npx tsc --noEmit", "npx prettier --check ."))
-
-    def test_5b_a_check_that_writes_files_is_restored(self):
-        d = self.repo({"lint": "printf changed > src/a.ts"})
-        r = m.Run("fix all errors", plan("fix all existing errors and warnings in this project", root=d), d, {"commands": {}})
-        r.before, r.pre = m.snapshot(d), {}
-        out = r.run_diagnostics([{"cat": "lint", "cmd": "printf changed > src/a.ts", "state": "required"}])
-        self.assertEqual((d / "src/a.ts").read_text(), "x\n")
-        self.assertIn("restored", out[0]["note"])
-
-    def test_6_broad_maintenance_enables_aggregate(self):
-        for t in ("Fix all existing errors and warnings in this project", "fix all TypeScript and lint errors", "make the project pass checks",
-                  "исправь все ошибки в проекте", "repair all current static-analysis issues"):
-            with self.subTest(t=t):
-                p = plan(t)
-                self.assertTrue(p["signals"]["aggregate"])
-        rows = {d["cat"]: d for d in plan("Fix all existing errors and warnings in this project")["diagnostics"]}
-        self.assertEqual([(rows[c]["need"], rows[c]["state"]) for c in ("typecheck", "lint")], [("required", "run")] * 2)
-        self.assertEqual((rows["test"]["need"], rows["build"]["need"], rows["build"]["state"]), ("optional", "optional", "deferred"))
-
-    def test_7_targeted_task_disables_aggregate(self):
-        for t in ("fix this button", "add loading state to submit button", "fix the login form error message"):
-            with self.subTest(t=t):
-                self.assertFalse(plan(t)["signals"]["aggregate"])
-
-    def test_8_existing_typescript_errors_start_the_pipeline(self):
-        d = git_repo({"src/a.ts": "x\n"})
-        commands = {"typecheck": f"test -f fixed || {{ printf '{self.TSC_ERR}\\n'; exit 2; }}", "lint": "true"}
-        def impl(tier):
-            (d / "fixed").write_text("y\n")
-            return {"status": "done", "confidence": 0.9}
-        calls = stub({"implementer": impl})
-        r = m.Run("Fix all existing errors and warnings in this project", plan("Fix all existing errors and warnings in this project", root=d),
-                  d, {"commands": commands})
-        rc = r.execute()
-        self.assertEqual([c[0] for c in calls], ["implementer"])    # not "nothing to fix"
-        self.assertEqual(rc, 0)                                      # all required categories clean afterwards
-
-    def test_8b_unavailable_diagnostic_allows_model_repair(self):
-        d = self.repo({"typecheck": "tsc --noEmit", "lint": "eslint . --fix && prettier --write ."})   # no safe read-only lint form
-        def impl(tier):
-            (d / "fixed").write_text("y\n")
-            return {"status": "done", "confidence": 0.9}
-        stub({"implementer": impl})
-        task = "Fix all existing errors and warnings in this project"
-        r = m.Run(task, plan(task, root=d), d, {"package_manager": "npm"})
-        r.before, r.pre = m.snapshot(d), {}
-        runner = lambda c: (True, "") if (d / "fixed").exists() else (False, self.TSC_ERR)  # noqa: E731 — no package manager needed
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            rc = r.aggregate_repair({x["role"]: x for x in r.p["steps"] if x["provider"]}, "", runner=runner)
-        out = buf.getvalue()
-        self.assertEqual(rc, 0, out); self.assertIn("DONE ·", out)
-        self.assertIn("LINT not verified", out)                      # reported, never claimed clean
-        self.assertTrue((d / "fixed").exists())                      # model can inspect and repair without lint evidence
-
-    def test_misconfigured_check_is_not_a_code_error_and_not_clean(self):
-        d = self.repo({"typecheck": "true", "prettier": "prettier --check \"{src,store}/**/*.js\""})
-        r = m.Run("fix all errors", plan("fix all existing errors and warnings in this project", root=d), d, {"commands": {}})
-        r.before, r.pre = m.snapshot(d), {}
-        out = r.run_diagnostics([{"cat": "format", "cmd": "printf '[error] No files matching the pattern were found: x' >&2; exit 2", "state": "required"},
-                                 {"cat": "typecheck", "cmd": "true", "state": "required"}])
-        self.assertEqual(out[0]["status"], "BROKEN")
-        self.assertEqual(m.overall_state(out), "INCOMPLETE")   # never "clean", but no model is sent to fix formatting
-        self.assertEqual(m.group_diags(out), [])
-
-    def test_grouping_is_by_root_cause(self):
-        out = "\n".join([f"src/f{i}.ts(1,1): error TS2322: Type 'string' is not assignable to type 'number'." for i in range(5)]
-                        + ["src/g.ts(2,2): error TS2304: Cannot find name 'x'."])
-        groups = m.group_diags([dict(self.res("typecheck", "FAIL"), out=out)])
-        self.assertEqual([(g["count"], len(g["files"])) for g in groups], [(5, 5), (1, 1)])
-
-
-class BatchRegression(Base):
-    def run_regression(self, improve_first):
-        root = git_repo({"src/a.ts": "committed\n", "src/dirty.txt": "original\n"})
-        (root / "src/a.ts").write_text("user-baseline\n")
-        (root / "src/dirty.txt").write_text("user work\n")
-        edits = []
-        def impl(tier):
-            edits.append(tier)
-            (root / "src/a.ts").write_text("improved\n" if improve_first and len(edits) == 1 else "regressed\n")
-            return {"status": "done", "confidence": 0.9}
-        stub({"implementer": impl})
-        task = "fix all errors"
-        r = m.Run(task, plan(task, root=root), root, {"commands": {"typecheck": "fixture-check"}})
-        r.before = m.snapshot(root)
-        r.pre = {f: (root / f).read_bytes() for f in r.before}
-        def check(command):
-            n = {"user-baseline": 16, "improved": 10, "regressed": 37}[(root / "src/a.ts").read_text().strip()]
-            return False, "\n".join("src/a.ts(1,1): error TS2304: Missing name foo." for _ in range(n))
-        steps = {x["role"]: x for x in r.p["steps"] if x["provider"]}
-        self.assertEqual(r.aggregate_repair(steps, "", runner=check), 1)
-        self.assertEqual((root / "src/a.ts").read_text(), "improved\n" if improve_first else "user-baseline\n")
-        self.assertEqual((root / "src/dirty.txt").read_text(), "user work\n")
-        self.assertEqual(len(edits), 2 if improve_first else 1)
-        self.assertNotIn(3, edits)
-        self.assertFalse(r.escalations)
-
-    def test_16_to_37_restores_batch_and_stops(self):
-        self.run_regression(False)
-
-    def test_previous_successful_batch_is_preserved(self):
-        self.run_regression(True)
-
-    def test_mutating_check_restores_dirty_user_file(self):
-        root = git_repo({"src/a.ts": "committed\n"})
-        (root / "src/a.ts").write_text("user dirty work\n")
-        r = m.Run("fix all errors", plan("fix all errors", root=root), root, {"commands": {}})
-        r.pre = {"src/a.ts": b"user dirty work\n"}
-        out = r.run_diagnostics([{"cat": "lint", "cmd": "printf changed > src/a.ts", "state": "required"}])
-        self.assertEqual((root / "src/a.ts").read_text(), "user dirty work\n")
-        self.assertEqual(out[0]["status"], "BROKEN")
-
-    def test_warning_and_blocked_statuses(self):
-        ok, rows = REAL_VERIFY(NO_AUTH, ["printf 'warning: check this\\n'"], [], None)
-        self.assertTrue(ok)
-        self.assertEqual(m.verify_status(rows), "PASS_WITH_WARNINGS")
-        self.assertEqual(m.verify_status([{"ok": False, "status": "BLOCKED"}]), "BLOCKED")
-
-
-def run_aggregate(root, task, runner, rmap=None):
-    """aggregate_repair with an injected check runner (no package manager needed). → (rc, stdout)."""
-    r = m.Run(task, plan(task, root=root), root, rmap or {"package_manager": "npm"})
-    r.before, r.pre = m.snapshot(root), {}
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        rc = r.aggregate_repair({x["role"]: x for x in r.p["steps"] if x["provider"]}, "", runner=runner)
-    return rc, buf.getvalue()
-
-
-class ReadOnlyDerivation(Base):
-    def cmds(self, scripts, pm="npm"):
-        root = git_repo({"package.json": json.dumps({"name": "fx", "private": True, "scripts": scripts})})
-        return m.safe_diag_commands(root, {"package_manager": pm})
-
-    def test_eslint_fix_derives_read_only_lint(self):
-        c = self.cmds({"lint": "eslint \"**/*.+(ts|tsx)\" --fix --ignore-pattern 'node_modules/'"}, "yarn")["lint"]  # quoted | is not a pipe
-        self.assertEqual(c["cmd"], "yarn eslint '**/*.+(ts|tsx)' --ignore-pattern node_modules/")
-        self.assertEqual((c["configured_command"], c["derived_read_only_command"], c["confidence"]), ("yarn lint", c["cmd"], "high"))
-        self.assertIn("--fix", c["derivation_reason"])
-        self.assertEqual(self.cmds({"lint": "eslint . --fix-type problem --fix"})["lint"]["cmd"], "npx eslint .")
-
-    def test_prettier_write_derives_check(self):
-        self.assertEqual(self.cmds({"format": "prettier --write src"})["format"]["cmd"], "npx prettier --check src")
-        c = self.cmds({"prettier": "prettier --ignore-path .gitignore \"**/*.+(ts|tsx)\"", "format": "yarn run prettier --write"}, "yarn")["format"]
-        self.assertEqual(c["cmd"], "yarn prettier --ignore-path .gitignore '**/*.+(ts|tsx)' --check")   # script references resolved
-        self.assertEqual(m.read_only_form("yarn format", {"format": "yarn run prettier --write", "prettier": "prettier src"}, "yarn")["cmd"],
-                         "yarn prettier src --check")
-
-    def test_stylelint_fix_derives_read_only(self):
-        c = self.cmds({"lint:css": "stylelint \"src/**/*.css\" --fix"})["style"]
-        self.assertEqual((c["cmd"], c["confidence"]), ("npx stylelint 'src/**/*.css'", "high"))
-
-    def test_unknown_mutating_command_is_unavailable(self):
-        c = self.cmds({"lint": "mylinter --fix src"})["lint"]
-        self.assertIsNone(c["cmd"]); self.assertEqual(c["confidence"], "none"); self.assertIn("not in the read-only allowlist", c["derivation_reason"])
-        self.assertIsNone(m.read_only_form("tsc -b")["cmd"])                                # no read-only equivalent
-        self.assertEqual(m.read_only_form("tsc -p tsconfig.app.json")["cmd"], "tsc -p tsconfig.app.json --noEmit")
-
-    def test_already_read_only_command_is_unchanged(self):
-        for scripts, cat, cmd in (({"lint": "eslint ."}, "lint", "npm run lint"),
-                                  ({"check-format": "prettier --list-different .", "format": "prettier --write ."}, "format", "npm run check-format"),
-                                  ({"typecheck": "tsc --noEmit -p tsconfig.app.json"}, "typecheck", "npm run typecheck")):
-            with self.subTest(cat=cat):
-                c = self.cmds(scripts)[cat]
-                self.assertEqual((c["cmd"], c["derived_read_only_command"], c["confidence"]), (cmd, None, "exact"))
-
-    def test_dangerous_shell_operators_are_not_derived(self):
-        for body in ("eslint . --fix; rm -rf dist", "eslint . --fix && prettier --write .", "eslint . --fix | tee log",
-                     "eslint $(git ls-files) --fix", "eslint `ls` --fix", "eslint . --fix > out.txt"):
-            with self.subTest(body=body):
-                self.assertIsNone(self.cmds({"lint": body})["lint"]["cmd"])
-                self.assertIsNone(m.read_only_form(body)["cmd"])
-        self.assertEqual(m.read_only_form("tsc --noEmit && vitest run")["cmd"], "tsc --noEmit && vitest run")  # not mutating: as configured
-
-    def test_verification_never_runs_a_mutating_script(self):
-        root = git_repo({"package.json": json.dumps({"scripts": {"lint": "eslint . --fix", "format": "mytool --write"}})})
-        cmds = m.Run("t", plan("add loading state to submit button", root=root), root,
-                     {"commands": {"lint": "npm run lint", "format": "npm run format", "typecheck": "tc"}}).cmds
-        self.assertEqual(cmds, {"lint": "npx eslint .", "typecheck": "tc"})
-
-
 class GeneratedOutput(Base):
-    SRC_ERR = 'src/styles/app.css\n  1:4  ✖  Unexpected unknown property "colr"  property-no-unknown'
-    GEN_WARN = 'dist-dev/assets/index.css\n  1:1  ⚠  Unexpected vendor-prefixed property "-webkit-box"  property-no-vendor-prefix'
-    TASK = "fix all errors and warnings in this project"
-
     def repo(self):
-        root = git_repo({".gitignore": "dist-*\n", "src/styles/app.css": ".a{colr:red}\n", "build/gen.js": "module.exports = 1\n",
-                         "vite.config.ts": "export default { build: { outDir: `dist-${mode}` } }\n",
-                         "package.json": json.dumps({"scripts": {"lint:css": "stylelint \"**/*.css\""}})})
-        (root / "dist-dev/assets").mkdir(parents=True)
-        (root / "dist-dev/assets/index.css").write_text(".b{-webkit-box:1}\n")
-        (root / ".idea").mkdir()
-        return root
-
-    def runner(self, root):
-        def check(cmd):
-            src_bad = "colr" in (root / "src/styles/app.css").read_text()
-            return (not src_bad), ((self.SRC_ERR + "\n") if src_bad else "") + self.GEN_WARN
-        return check
+        return git_repo({".gitignore": "dist-*\n", "src/app.css": ".a{colr:red}\n", "build/gen.js": "module.exports = 1\n",
+                         "vite.config.ts": "export default { build: { outDir: `dist-${mode}` } }\n"},
+                        after={"dist-dev/assets/index.css": ".b{-webkit-box:1}\n"})
 
     def test_generated_dirs_need_evidence(self):
         root = self.repo()
         self.assertEqual(m.generated_dirs(root), {"dist-dev": "git-ignored, output in vite.config.ts"})   # tracked build/ is source
         mp = m.detect_map(root)
         self.assertIn("dist-dev", mp["generated_dirs"]); self.assertNotIn("dist-dev", mp["dirs"])
-        is_gen = m.generated_classifier(root)
-        self.assertTrue(is_gen("dist-dev/assets/index.css")); self.assertTrue(is_gen(str(root / "dist-dev/a.css")))
-        self.assertFalse(is_gen("src/styles/app.css")); self.assertFalse(is_gen("build/gen.js"))
 
-    def test_generated_only_ide_warnings_are_classified_separately(self):
+    def test_agent_edits_to_generated_output_are_reverted(self):
         root = self.repo()
-        (root / "src/styles/app.css").write_text(".a{color:red}\n")
-        rc, out = run_aggregate(root, self.TASK + " (WebStorm flags dist-dev/assets/index.css)", self.runner(root))  # forbid(): no model call
-        self.assertEqual(rc, 0)
-        self.assertIn("only in generated/vendor output", out)
-        self.assertIn("IDE_ONLY   dist-dev/assets/index.css: generated output named in the task", out)
-        self.assertIn("mark dist-dev/ as Excluded in the IDE (local setting; .idea is not tracked, nothing written)", out)
-        self.assertIn("DONE", out); self.assertIn("Verify:      PASS_WITH_WARNINGS", out)
-        self.assertFalse(list((root / ".idea").iterdir()))
 
-    def test_source_css_issue_still_triggers_implementation(self):
-        root, prompts = self.repo(), []
-        def run(provider, tier, prompt, write, role, tdir, label, allow, **k):
-            prompts.append(prompt)
-            (root / "src/styles/app.css").write_text(".a{color:red}\n")
-            return json.dumps({"status": "done", "confidence": 0.9}), {"in": 1, "cached": 0, "out": 1, "usd": None}, "stub"
-        m.run_provider = run
-        rc, out = run_aggregate(root, self.TASK, self.runner(root))
-        self.assertEqual((rc, len(prompts)), (0, 1))
-        self.assertIn("- src/styles/app.css", prompts[0]); self.assertNotIn("- dist-dev", prompts[0])
-        self.assertIn("Never edit generated output (dist-dev/)", prompts[0])
-
-    def test_generated_dist_css_is_not_edited(self):
-        root = self.repo()
-        def run(provider, tier, prompt, write, role, tdir, label, allow, **k):
-            (root / "dist-dev/assets/index.css").write_text(".b{display:flex}\n")   # agent "fixes" the build output too
+        def impl(tier):
+            (root / "dist-dev/assets/index.css").write_text(".b{display:flex}\n")   # the agent also "fixes" build output
             (root / "dist-dev/assets/new.css").write_text("x\n")
-            (root / "src/styles/app.css").write_text(".a{color:red}\n")
-            return json.dumps({"status": "done", "confidence": 0.9}), {"in": 1, "cached": 0, "out": 1, "usd": None}, "stub"
-        m.run_provider = run
-        rc, out = run_aggregate(root, self.TASK, self.runner(root))
-        self.assertEqual(rc, 0)
+            (root / "src/app.css").write_text(".a{color:red}\n")
+            return {"status": "done", "summary": "fixed css"}
+        calls = stub({"implementer": impl})
+        rc, out, _ = execute("fix the css color property", root=root)
+        self.assertEqual(rc, 0, out)
         self.assertEqual((root / "dist-dev/assets/index.css").read_text(), ".b{-webkit-box:1}\n")
         self.assertFalse((root / "dist-dev/assets/new.css").exists())
+        self.assertEqual((root / "src/app.css").read_text(), ".a{color:red}\n")      # the source fix stays
+        self.assertIn("Never edit generated output (dist-dev/)", calls[0][3])
         self.assertIn("implementer edited generated output", out); self.assertIn("generated-file edit(s) reverted", out)
 
 
-class RequiredOptional(Base):
-    def repo(self, scripts):
-        return git_repo({"package.json": json.dumps({"scripts": scripts}), "src/a.js": "x\n"})
+class ContextEstimate(Base):
+    def test_scopes(self):
+        self.assertEqual(plan("fix the bug in src/cart.js")["scope"], "files")
+        self.assertEqual(plan("rename foo to bar across the codebase")["scope"], "repo")
+        self.assertEqual(plan("add loading state to submit button")["scope"], "module")
+        self.assertEqual(plan("what is a race condition?")["scope"], "none")
 
-    def test_optional_unavailable_diagnostic_does_not_block(self):
-        root = self.repo({"lint": "eslint .", "format": "mytool --write ."})           # format: no safe read-only form
-        rc, out = run_aggregate(root, "fix all existing errors and warnings in this project", lambda c: (True, ""))
-        self.assertEqual(rc, 0)
-        self.assertIn("UNAVAILABLE — `format` modifies files", out); self.assertIn("warning, does not block", out)
-        self.assertIn("DONE", out); self.assertNotIn("NOT DONE", out)
-        self.assertIn("Verify:      PASS_WITH_WARNINGS", out); self.assertIn("FORMAT unavailable (optional)", out)
-
-    def test_required_unavailable_diagnostic_starts_model(self):
-        root = self.repo({"lint": "mylinter --fix src", "format": "prettier --check ."})
-        calls = stub({})
-        rc, out = run_aggregate(root, "fix all existing errors and warnings in this project", lambda c: (True, ""))
-        self.assertTrue(calls, out); self.assertEqual(rc, 0, out)
-        self.assertNotIn("BLOCKED ·", out); self.assertIn("LINT not verified", out)
-
-    def test_nothing_runnable_starts_model_without_claiming_verified(self):
-        root = self.repo({"format": "mytool --write ."})                                # only an optional gap, nothing ran
-        calls = stub({})
-        rc, out = run_aggregate(root, "fix all existing errors and warnings in this project", lambda c: (True, ""))
-        self.assertTrue(calls, out); self.assertNotIn("BLOCKED ·", out)
-        self.assertNotIn("Verify:      PASS\n", out)
-
-
-class ProviderFailover(Base):
-    """Native agent CLIs behind a claude-code-router-style fallback chain: classify the failure, then retry, cool down or
-    disable the provider, and hand the call to the next capable one."""
-
-    def setUp(self):
-        super().setUp()
-        self.sleeps = []
-        m.SLEEP = self.sleeps.append
-        self.addCleanup(setattr, m, "SLEEP", lambda s: None)
-
-    def run_with(self, script, task="add loading state to submit button"):
-        """script: {provider: [outcome, …]} consumed per call; a str outcome is a CLI failure message, a dict an agent answer."""
-        calls, queue = [], {k: list(v) for k, v in script.items()}
-
-        def run(provider, tier, prompt, write, role, *a, **k):
-            calls.append((role, provider, tier, prompt))
-            nxt = queue[provider].pop(0) if queue.get(provider) else {"status": "no_change"}
-            if isinstance(nxt, str):
-                raise m.ProviderError(nxt)
-            return json.dumps(nxt), {"in": 1, "cached": 0, "out": 1, "usd": None}, "stub"
-        m.run_provider = run
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            rc = m.Run(task, plan(task), NO_AUTH, {"commands": {}}).execute()
-        return rc, calls, buf.getvalue()
-
-    def test_failure_classes(self):
-        for text, kind in (("You've hit your usage limit. Try again in 2 hours.", "rate_limit"), ("HTTP 429 Too Many Requests", "rate_limit"),
-                           ("Claude AI usage limit reached|1759999999", "rate_limit"), ("Invalid API key · Please run /login", "auth"),
-                           ("unexpected status 401 Unauthorized", "auth"), ("error_max_budget_usd", "budget"), ("error_max_turns", "budget"),
-                           ("API Error: 529 overloaded_error", "transient"), ("stream disconnected before completion", "transient"),
-                           ("503 Service Unavailable", "transient"), ("model not found", "fatal")):
-            with self.subTest(text=text):
-                self.assertEqual(m.failure_kind(text), kind)
-
-    def test_cooldown_and_backoff_follow_the_provider(self):
-        now = m.datetime.datetime(2026, 9, 30, 10, 0)
-        self.assertEqual(m.cooldown_minutes("try again in 1 day 3 hours 32 minutes", now), 1652)
-        self.assertEqual(m.cooldown_minutes("5-hour limit reached · resets 3pm", now), 300)
-        self.assertEqual(m.cooldown_minutes(f"usage limit reached|{int(now.timestamp()) + 5400}", now), 90)
-        self.assertEqual(m.cooldown_minutes("quota exceeded", now), 60)
-        self.assertEqual((m.retry_delay("please retry after 3 seconds", 1), m.retry_delay("503", 1), m.retry_delay("503", 9)), (3, 1, 30))
-
-    def test_transient_failure_is_retried_on_the_same_provider(self):
-        rc, calls, out = self.run_with({"codex": ["503 Service Unavailable", {"status": "no_change"}]})
-        self.assertEqual([c[1] for c in calls], ["codex", "codex"]); self.assertEqual(self.sleeps, [1])
-        self.assertEqual(rc, 0, out); self.assertNotIn("codex", m.BROKEN)
-
-    def test_rate_limit_cools_down_and_falls_back(self):
-        rc, calls, out = self.run_with({"codex": ["You've hit your usage limit. Try again in 2 hours."]})
-        self.assertEqual([c[1] for c in calls], ["codex", "claude"]); self.assertEqual(rc, 0, out)
-        until = m.datetime.datetime.fromisoformat(json.loads(m.COOLDOWN_FILE.read_text())["codex"])
-        self.assertAlmostEqual((until - m.datetime.datetime.now()).total_seconds() / 60, 120, delta=2)
-        self.assertIn("Fallbacks:   implementer-t1a1 codex T1 rate_limit", out)
-        rc, calls, out = self.run_with({})                                       # the next task skips the provider in cooldown
-        self.assertEqual({c[1] for c in calls}, {"claude"})
-
-    def test_auth_error_disables_the_provider_but_a_budget_limit_only_skips_the_call(self):
-        rc, calls, out = self.run_with({"codex": ["Invalid API key · Please run /login"]})
-        self.assertEqual(([c[1] for c in calls], rc), (["codex", "claude"], 0)); self.assertIn("codex", m.BROKEN)
-        m.BROKEN.clear(); m._AVAIL.clear()
-        rc, calls, out = self.run_with({"codex": ["context window exceeded: prompt is too long"]})
-        self.assertEqual(([c[1] for c in calls], rc), (["codex", "claude"], 0))
-        self.assertNotIn("codex", m.BROKEN); self.assertIn("codex", m.available())
-
-    def test_agent_that_gives_up_hands_over_to_the_next_provider(self):
-        rc, calls, out = self.run_with({"codex": [{"status": "blocked", "open_questions": ["which API version?"]}]})
-        self.assertEqual([c[1] for c in calls], ["codex", "claude"]); self.assertEqual(rc, 0, out)
-        self.assertIn("a previous codex attempt ended blocked (which API version?)", calls[1][3])
-
-    def test_blocked_only_when_no_provider_can_continue(self):
-        rc, calls, out = self.run_with({"codex": ["usage limit reached"], "claude": ["usage limit reached"]})
-        self.assertEqual(rc, 1); self.assertIn("BLOCKED ·", out)
-        self.assertIn("no working provider for implementer (tried codex, claude)", out); self.assertIn("rate-limited: claude until", out)
-
-    def test_blocked_when_the_agents_need_information(self):
-        q = {"status": "blocked", "confidence": 0.3, "open_questions": ["Which payment provider should be used?"]}
-        rc, calls, out = self.run_with({"codex": [q, q], "claude": [q, q]})
-        self.assertEqual((rc, len(calls)), (1, 4))                               # both providers at T1, then both at T2
-        self.assertIn("BLOCKED ·", out); self.assertIn("the agents need information: Which payment provider", out)
+    def test_long_context_is_not_a_job_for_the_cheapest_tier(self):
+        task = "rename foo to bar across the codebase"
+        self.assertEqual(plan(task)["steps"][0]["tier"], 1)
+        with patch.dict(m.LIM, {"long_context_tokens": 10}):
+            p = plan(task)
+            self.assertEqual((p["steps"][0]["tier"], p.get("long_context")), (2, True))
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                m.print_plan(p, NO_AUTH, {}, task)
+            self.assertIn("long context: T2+", buf.getvalue())
 
 
 class Security(Base):
@@ -986,27 +779,12 @@ class Security(Base):
 
     def test_state_files_are_redacted(self):
         stub({"implementer": {"status": "no_change"}})
-        r = m.Run("set api_key=sk-" + "z" * 30, plan("add loading state to submit button"), NO_AUTH, {"commands": {}})
-        r.execute()
+        task = "set api_key=sk-" + "z" * 30
+        with contextlib.redirect_stdout(io.StringIO()):
+            r = m.Run(task, plan("add loading state to submit button"), NO_AUTH, {"commands": {}})
+            r.execute()
         for f in r.dir.iterdir():
             self.assertNotIn("z" * 30, f.read_text(), f.name)
-
-    def test_claude_workers_cannot_read_env_files(self):
-        captured = {}
-
-        def fake_run(cmd, **k):
-            captured["cmd"], captured["cwd"] = cmd, k.get("cwd")
-            return subprocess.CompletedProcess(cmd, 0, json.dumps({"result": "{}", "usage": {}}), "")
-        real = m.subprocess.run
-        m.subprocess.run = fake_run
-        try:
-            REAL_RUN_PROVIDER("claude", 1, "x", True, "implementer", Path(tempfile.mkdtemp()), "t", [], cwd="/repo")
-        finally:
-            m.subprocess.run = real
-            m.MODEL_CALLS[0] -= 1  # the command was captured, not executed
-        self.assertIn("Read(./.env)", captured["cmd"])
-        self.assertEqual(captured["cwd"], "/repo")
-        self.assertIn("--setting-sources", captured["cmd"])
 
     def test_state_retention(self):
         root = git_repo({"a.txt": "x\n"})

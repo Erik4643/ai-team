@@ -1,70 +1,60 @@
-# ai-team policy (read only when orchestrating; `ai-team` applies it deterministically from `routing.json`)
+# ai-team policy (`ai-team` applies it deterministically from `routing.json`; read only when orchestrating)
 
-## 1. Intent first (T0, 0 tokens)
-META / project facts (commands, stack) / INSPECTION (git status, diff) / TOOL (run lint, tests, build) → local, 0 model calls.
-QUESTION → T1 read-only (repo cues → explorer with tools; general → answer, no tools). UNKNOWN → T1 probe, edits only if it finds a change.
-REVIEW → reviewer on the current diff, no implementer. RESEARCH → researcher only. PLAN → explorer (+ architect if complex), no edits.
-IMPLEMENTATION / DEBUG / ARCHITECTURE → complexity below. ARCHITECTURE stops at the decision unless `--apply`.
+ai-team is a router, not a problem-solving framework. It classifies the task, picks ONE native agent (Codex or Claude Code)
+at the cheapest capable tier, passes the original task on, and handles failure. The agent solves the task with its own tools.
 
-## 2. Complexity → dynamic DAG (plan-time tiers never include T3)
-| Class | Stages |
-|---|---|
-| MICRO (rename, typo, color, radius, label, wording; ≤2 paths; cosmetic) | one T1 editor → checks for the changed file types |
-| SMALL | one T1 editor → targeted checks |
-| MEDIUM | explorer T1 (skipped if paths given) → editor T2 → [reviewer if the diff warrants it] |
-| COMPLEX | explorer T1 → [architect T2 if evidence] → editor T2 → verify → [reviewer if risk] |
-| CRITICAL (needs repo evidence) | explorer → architect T2 → editor T2 → verify incl. build → reviewer T2, independent vendor |
-"Fix all errors" → use available T0 diagnostics to localize repairs; if unavailable, let the selected model inspect source/configuration directly. Verify after implementation.
-Explorer evidence can reclassify MICRO..COMPLEX (down as well as up); CRITICAL is never entered or left automatically.
+## 1. Classify (T0, 0 tokens)
+Intent, complexity, context size and needs (edits, web research) come from the task text and cheap repo facts.
+META / project facts / INSPECTION (git status, diff) / TOOL (run lint, tests, build) / review of a clean tree → local, 0 model calls.
+QUESTION → read-only (repo cues → explorer with tools; general → answer, no tools). RESEARCH → researcher with web tools.
+REVIEW → reviewer on the current diff. PLAN / ARCHITECTURE → architect, read-only (`--apply` implements the decision).
+"Find why X happens" → explorer (read-only diagnosis). Everything that changes the project → implementer.
+CRITICAL needs repo evidence (auth/payment/migration code exists), not keywords alone.
 
-## 3. Gates (evidence, not keywords)
-Architect skipped when the explorer reports a localized root cause: confidence ≥ 0.80 (≥ 0.90 for auth, security, payments,
-migrations, destructive ops, concurrency), ≤ 3 files, 1 subsystem, no architecture decision, no open questions, risk not high.
-Researcher only if the task asks for current external facts or the explorer sets external_research_required.
-Reviewer is decided after checks, from the diff: security/concurrency/public-API/config change, ≥ 60 lines, several modules,
-implementer confidence < 0.7, code without a runnable check, checks that failed before passing, or files outside the plan.
-Docs-only and small verified diffs skip review. Economy reviews only CRITICAL or security-touching diffs; quality reviews every code change.
+## 2. One agent, cheapest capable tier
+Edits start at T1 (MICRO/SMALL) or T2 (MEDIUM+); the economy budget starts one tier lower. Read-only roles start at T1
+(architect on COMPLEX+ at T2). Edits whose estimated context exceeds `long_context_tokens` start at T2 at least.
+Plan-time tiers never include T3. There is no explorer → architect → implementer pipeline: one agent does the whole task.
+ai-team carries no IDE-, tool- or service-specific logic: "fix all WebStorm / Sonar / CI errors" goes to the agent like any task.
 
-## 4. Verification matrix (cheapest meaningful check)
-nothing changed → none · docs/images → none · CSS → lint · copy JSON → JSON parse · code (MICRO/SMALL) → typecheck (+ tests if a
-sibling test exists) · code (MEDIUM+ or ≥4 files) → typecheck + lint + tests · config → + lint + build · dependencies → typecheck + build ·
-CRITICAL → + build. Run available checks the user names; explicitly report unavailable checks as verification limitations.
+## 3. Provider choice (capability first, then cost)
+Expected cost = (observed baseline + our prompt + 0.1×cached + 4×output×effort + 30×seconds) ÷ p (read-only) or ÷ p² (edits).
+p = tier prior × role capability, lowered when demand exceeds the tier, blended with routing history (prior 8 samples for
+success, 5 for cost; weak history cannot override priors). Eligible = within 0.10 (edits) or 0.25 (others) of the best p;
+the cheapest eligible wins. Unavailable, broken or rate-limited providers are never picked.
 
-## 5. Providers (capability first, then cost)
-Expected cost = (observed baseline + our context + 0.1×cached + 4×output×effort + 30×seconds) ÷ p (read-only) or ÷ p² (edits).
-p = tier prior × capability (analysis, explore, edit, docs, architecture, review, debug, research), lowered when demand exceeds the
-tier, blended with history (prior 8 samples for success, 5 for cost; intent-specific history only from 5 samples up).
-Eligible = within 0.10 (edits) or 0.25 (others) of the best p; cheapest eligible wins. Unavailable, broken or rate-limited
-providers are never selected. Workers are the native Codex / Claude Code CLIs using their own tools; ai-team sets only the
-role's sandbox (read-only or workspace-write), sends one prompt per call and reads the result and usage.
+## 4. The prompt
+The original task, untouched, plus a few router lines: non-interactive, permissions (read-only; or don't commit/push and never
+edit generated output) and a one-line JSON status contract. No project dump, role essay or workflow text: each CLI loads its
+own project instructions (AGENTS.md / CLAUDE.md → .ai/CONTEXT.md) and reads files itself. Codex runs in its own sandbox
+(read-only / workspace-write); Claude Code writers run in its Bash sandbox with acceptEdits, readers with read-only tools,
+`.env*` reads and `git push` denied. Fresh session per call; secrets are redacted before anything is written.
 
-## 6. Failures and escalation (reason codes)
-Same tier at most 2 attempts (T3: 1). Identical failure fingerprint three times → stop (REPEATED_FAILURE).
-Codes: LOW_CONFIDENCE, MULTIPLE_ROOT_CAUSES, SECURITY_RISK, CONCURRENCY_AMBIGUITY, ARCHITECTURE_CHANGE, CONFLICTING_EVIDENCE,
-FAILED_T1, FAILED_T2, INCOMPLETE_VERIFICATION. T3 only via: architect confidence < 0.6 on COMPLEX+, FAILED_T2, or a judge on
-unresolved review disagreement (question + both positions + diff only).
-Provider failures fall back along the role's provider chain: rate limit → cooldown until the CLI's reported reset (default 60 min);
-transient (5xx, overloaded, network) → one retry with backoff; auth/CLI error → provider off for the run; budget/turn limit or
-timeout → next provider for that call. An agent that answers blocked/failed hands over to the next provider. BLOCKED only when no
-provider can take the call or the agents need information only the user has.
+## 5. Failure handling
+rate limit → cooldown until the CLI's reported reset (default 60 min), next provider · transient (5xx, overloaded, network)
+→ one retry with backoff (retry-after, else 1 s doubling, ≤ 30 s) · auth/CLI error → provider off for the run · budget/turn
+limit or timeout → next provider for that call · agent answers blocked/failed → next provider, then one tier up.
+Failed checks go back to the agent with their output: at most 2 attempts per tier (T3: 1), then one tier up; the same failure
+fingerprint three times → stop (REPEATED_FAILURE). An edit task with no change and no status line is NOT DONE, never DONE.
+BLOCKED only when no provider can take the call, or the agent needs information only the user has.
 
-## 7. Context
-Each call: role (≤0.1k) + one-line output schema + project sections the role needs (Rules always; facts for explorer/architect/
-MEDIUM+ editors; graphify only for explorer/architect) + repo map (explorer/architect only) + handoff (paths, never contents) + diff
-(reviewer). Budgets (ours): MICRO 1.5k · SMALL 2k · MEDIUM 8k · COMPLEX 16k; over budget → drop map, project, docs, then trim diff.
-Workers don't auto-load provider instructions (Codex project AGENTS.md off, Claude settings/skills/plugins off). Stable prefix order;
-no timestamps or ids in prompts. Fresh sessions per call (no reuse across tasks). Secrets are redacted before anything is written.
-State: last 30 task dirs / 14 days; metrics rotate at 1000 runs and store numbers only.
+## 6. Verification (T0, after edits)
+The project's own check commands for the changed files — never a mutating one (`--fix`, `--write`, `-u`, tsc without
+`--noEmit`, or a script that calls them). nothing changed → none · docs/images → none · CSS → lint · copy JSON → parse ·
+code MICRO/SMALL → typecheck (+ a sibling test) · MEDIUM+ → typecheck + lint + tests · config → + build · CRITICAL → + build.
+Baseline-aware: failures that existed before the task don't fail it; a check the task is about ("fix the failing tests",
+"fix all errors") must pass outright.
 
-## 8. Evidence (T0, `diagnostics/`)
-Named sources, supplied reports and project custom checks describe the desired verification coverage, not prerequisites for starting work.
-Unavailable or broken diagnostic sources trigger direct model inspection, with explicit verification limitations. Never infer clean IDE/CI results from another tool. Available actionable findings remain acceptance checks; findings from a supplied static report that were addressed are reported as not re-verified.
-Reserve BLOCKED for work that cannot proceed without genuinely required information, not a missing diagnostic export. Preserve zero-token planning, useful local checks and audits of readable reports.
-Only REAL_SOURCE diagnostic findings go to an implementer (generated, third-party, IDE false positives, spelling, config noise, low value never do). Direct inspection must also protect generated output and user changes.
+## 7. Review only where it pays
+balanced: CRITICAL tasks or changes touching auth/security/payment/migration code · quality: every code change · economy: never.
+One independent reviewer (the other provider when available); blocking issues get one fix round, then the checks run again.
 
-## 9. Canonical capability loading
-`capabilities.json` lists owned runtime capabilities, not an alternative routing policy. Keep deterministic decisions in
-`bin/ai-team` and `routing.json`. Load only the selected role and at most two matching supplemental workflows; drop supplemental
-guidance first under context pressure. Load optional Graphify guidance only with an installed CLI and a valid local graph;
-otherwise use targeted search. Queries do not authorize installation or graph rebuilds. Provider adapters load canonical
-instructions on invocation. Vendor caches, archives and inventory reports are never runtime sources; project facts remain local.
+## 8. Safety and state
+Generated output (build dirs with evidence: git-ignored or named as output in build config) is snapshotted before each writing
+call and restored after; only source is fixed. The user's uncommitted work is never reverted. State: last 30 task dirs /
+14 days; metrics (routing history, tokens, cost) rotate at 1000 runs and store numbers only.
+
+## 9. Canonical capabilities
+`capabilities.json` lists owned runtime files, not an alternative routing policy. Role files serve only the interactive
+entrypoints (`/team`, Claude subagents, Codex `team`); routed runs send the original task. Optional Graphify: one prompt line
+only with an installed CLI and a valid local graph; ai-team never installs or rebuilds graphs.

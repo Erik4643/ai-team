@@ -1,6 +1,6 @@
 # AI team
 
-A portable, stack-neutral development orchestrator for **Codex and Claude Code**. Python 3.9+ and Git are required; install and authenticate at least one provider CLI separately. No dependencies, sudo, vendor skill bundles or provider credentials are installed by this kit.
+A portable, stack-neutral task router for **Codex and Claude Code**. Python 3.9+ and Git are required; install and authenticate at least one provider CLI separately. No dependencies, sudo, vendor skill bundles or provider credentials are installed by this kit.
 
 ## Install
 
@@ -33,12 +33,10 @@ Both modes preserve application source and are idempotent. Backups retain three 
 ## Use
 
 ```bash
-ai-team "fix all WebStorm errors"
-ai-team "implement this feature"
-ai-team "fix this bug"
-ai-team "review current changes"
-ai-team --plan "task"          # routing, no model calls
-ai-team --context-plan "task"  # context accounting, no model calls
+ai-team "<anything>"           # the only command you need
+ai-team --plan "task"          # routing decision, no model calls
+ai-team --context-plan "task"  # the exact prompt the agent would get, no model calls
+ai-team --budget economy|balanced|quality "task"
 ai-team --cost
 ai-team --status
 ai-team --doctor
@@ -47,27 +45,27 @@ ai-team --version
 ai-team update                 # explicit fetch + fast-forward + validated install
 ```
 
-Update refuses a dirty working tree, detached HEAD or missing upstream. It does not overwrite local changes and never touches the current project. After an update that changed the kit, refresh each project with `ai-team init` (idempotent; project facts are preserved). Diagnostics, tests and installation do not call models. `--self-test --live` is an explicit opt-in to real calls.
+Update refuses a dirty working tree, detached HEAD or missing upstream. It does not overwrite local changes and never touches the current project. After an update that changed the kit, refresh each project with `ai-team init` (idempotent; project facts are preserved). Doctor, tests and installation do not call models. `--self-test --live` is an explicit opt-in to real calls.
 
 ## Runtime design
 
-T0 handles triage, mapping, budgeting, verification and cost estimation. T1/T2 roles are selected by capability and expected cost; T3 is reserved for evidence-based escalation. Routing, cooldowns, baseline-aware checks, aggregate diagnostics and risk-based review remain deterministic. Review uses a fresh isolated session and is labeled cross-provider only when providers differ.
+ai-team is a router, not a problem-solving framework:
 
-**Agents and fallback.** Work is delegated to the native Codex and Claude Code CLIs, which use their own tools; ai-team only sets the role's sandbox and reads the result, usage and cost. The provider and tier come from the cost model and routing history. If a provider fails, the call moves along a fallback chain (inspired by claude-code-router): a rate limit cools the provider down until its reported reset, a transient error is retried once with backoff, an auth or CLI error takes the provider out for the run, and an agent that gives up hands over to the other provider. Verification failures retry and then escalate a tier. BLOCKED appears only when no provider can continue or the agents need information from you; `Fallbacks:` in the summary and `route.json` in the task state show what happened.
+1. **Classify** (T0, 0 tokens): task type, complexity, estimated context size, and whether it needs edits or web research. Status, project facts, git inspection, running a project command and reviewing a clean tree are answered locally.
+2. **Choose** Codex or Claude Code and the cheapest capable tier from the cost model and routing history. Edits start at T1 (small) or T2 (medium and larger, or large context); T3 is reached only by escalation.
+3. **Delegate** the original task, plus a few router lines (permissions and a one-line status contract), to the native CLI. The agent loads its own project instructions and solves the task with its own tools inside its own sandbox. One agent does the whole task — no explorer/architect/reviewer pipeline.
+4. **Recover**: a rate limit cools the provider down until its reported reset and hands the call to the other provider; a transient error is retried once with backoff; an auth or CLI error takes the provider out for the run; an agent that gives up hands over to the other provider, then one tier up. BLOCKED appears only when no provider can continue or the agent needs information from you.
 
-**Diagnostics support normal tasks.** Missing IDE exports, tools or reports do not prevent a model from inspecting source and configuration and attempting the task. Available diagnostics localize repairs (zero tokens when everything readable is clean); verification follows implementation. A missing source is reported as not verified, never as proof that the IDE or remote CI is clean. Real check failures still matter, generated-file protection stays active, and existing user changes are preserved.
+After an edit, the project's own read-only checks run for the changed files (baseline-aware; never `--fix`/`--write`), and a failure goes back to the agent. Changes touching auth/security/payment/migration code, or CRITICAL tasks, get one independent review (every code change with `--budget quality`, none with `economy`). Edits to generated build output are reverted; the user's uncommitted work is never touched. Routing history, tokens and cost are recorded locally (`ai-team --cost`); `Fallbacks:` in the summary and `route.json` in the task state show what happened.
 
-`--evidence SOURCE=PATH` remains optional for reports you already have (SARIF, JetBrains exports, JUnit, JSON or tool output). Diagnostic adapters and project `custom_checks` remain supported. No special syntax or exported evidence is required for ordinary development tasks.
-
-Only the selected role and relevant guidance load. [Canonical capabilities](docs/CANONICAL_CAPABILITIES.md) lists the 15 capabilities. [Skill audit summary](docs/SKILL_INVENTORY.md) explains why the historical 4,661 definitions are not the runtime set. Graphify is optional and uses existing project graphs; `AI_TEAM_GRAPHIFY=off` disables it.
+ai-team deliberately has no IDE-, linter-, CI- or service-specific logic: "fix all WebStorm errors" or "fix the Sonar issues" goes to the agent, which inspects the project with its own tools. [Policy](POLICY.md) has the exact rules; [canonical capabilities](docs/CANONICAL_CAPABILITIES.md) lists the 8 runtime capabilities. [Skill audit summary](docs/SKILL_INVENTORY.md) explains why the historical 4,661 definitions are not the runtime set. Graphify is optional and uses existing project graphs; `AI_TEAM_GRAPHIFY=off` disables it.
 
 | Path | Ownership |
 |---|---|
-| `bin/ai-team`, `scripts/` | global orchestrator, bootstrap, installation, update and health |
-| `routing.json` | model mappings, cost priors, gates, budgets and provider routing |
-| `diagnostics/` | evidence registry and adapters: triage, read-only commands, parsers, finding classes |
-| `POLICY.md`, `PROTOCOL.md` | single global policy and handoff contract |
-| `roles/`, `workflows/`, `skills/graphify/` | canonical lazy reasoning guidance |
+| `bin/ai-team`, `scripts/` | global router, bootstrap, installation, update and health |
+| `routing.json` | model mappings, start tiers, budgets, cost priors and provider routing |
+| `POLICY.md` | single global policy |
+| `roles/`, `skills/graphify/` | guidance for the interactive entrypoints (`/team`, subagents); routed runs send the original task |
 | `capabilities.json` | runtime capability allowlist |
 | `template/`, `tests/` | generic templates and zero-model regression tests |
 | `state/` | ignored global metrics, cooldowns and health state |

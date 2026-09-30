@@ -1,2 +1,0 @@
-# Migration planning
-Identify the current and target contracts, affected callers, data/state boundaries and compatibility constraints. Plan bounded phases with acceptance checks and a rollback or recovery path; call out irreversible steps. Preserve project commands and facts locally. Obtain external version evidence only when needed. Planning alone does not authorize deployment, destructive data changes or new dependencies.

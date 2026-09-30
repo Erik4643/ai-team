@@ -19,9 +19,9 @@ class LifecycleTests(unittest.TestCase):
         self.temp=tempfile.TemporaryDirectory(prefix='portable home ');self.addCleanup(self.temp.cleanup)
         self.home=Path(self.temp.name)/'home';self.home.mkdir()
         self.kit=self.home/'kit with spaces';self.kit.mkdir()
-        for name in ['bin','scripts','diagnostics','roles','workflows','skills','template','tests']:
+        for name in ['bin','scripts','roles','skills','template','tests']:
             shutil.copytree(KIT/name,self.kit/name,ignore=shutil.ignore_patterns('__pycache__'))
-        for name in ['install.sh','VERSION','routing.json','capabilities.json','POLICY.md','PROTOCOL.md']:
+        for name in ['install.sh','VERSION','routing.json','capabilities.json','POLICY.md']:
             shutil.copy2(KIT/name,self.kit/name)
         self.env={**os.environ,'HOME':str(self.home),'AI_KIT':str(self.kit),'PATH':str(self.home/'.local/bin')+os.pathsep+str(Path(sys.executable).parent)+os.pathsep+os.defpath}
     def run_cmd(self,args,ok=True,cwd=None):
@@ -68,16 +68,17 @@ class LifecycleTests(unittest.TestCase):
             with patch.object(m.shutil,'which',return_value='/fake/cli'),patch.object(m,'cooldowns',return_value={'codex':'2099-01-01'}):
                 self.assertEqual(m.available(),['claude'])
     def test_unstructured_or_error_provider_result_not_done(self):
-        self.assertEqual(m.parse_output('failure without JSON','implementer')['status'],'blocked')
+        self.assertTrue(m.parse_status('failure without JSON','implementer')['_unstructured'])  # the router never counts it as confirmed
         def bad(cmd,**kwargs):return subprocess.CompletedProcess(cmd,1,json.dumps({'is_error':True,'result':'service failure'}),'')
         with patch.object(m.subprocess,'run',side_effect=bad):
-            with self.assertRaises(m.ProviderError):m.run_provider('claude',1,'x',True,'implementer',self.home,'t',[])
+            with self.assertRaises(m.ProviderError):m.run_provider('claude',1,'x',True,'implementer',self.home,'t')
     def test_shipped_sources_are_portable_and_inventory_is_runtime_only(self):
-        for folder in ['bin','scripts','diagnostics','roles','workflows','skills','template']:
+        for folder in ['bin','scripts','roles','skills','template']:
             for p in (KIT/folder).rglob('*'):
                 if p.is_file() and '__pycache__' not in p.parts:
                     text=p.read_text()
                     self.assertNotIn('/Users/',text,str(p))
         self.assertEqual(set(m.CFG['providers']),{'codex','claude'})
         self.assertLessEqual(len(m.CAPABILITIES['capabilities']),15)
+        for gone in ['diagnostics','workflows','PROTOCOL.md']:self.assertFalse((KIT/gone).exists(),gone)
         self.assertLess(len((KIT/'roles/orchestrator.md').read_text()),600)

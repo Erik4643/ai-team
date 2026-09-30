@@ -1,4 +1,4 @@
-"""Consolidation regressions: lazy loading, optional graph fallback and adapter ownership."""
+"""Consolidation regressions: routed prompts stay the original task, optional graph fallback and adapter ownership."""
 import importlib.machinery
 import importlib.util
 import json
@@ -20,23 +20,14 @@ class CanonicalCapabilities(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
 
-    def test_no_extra_guidance_for_plain_edit_or_answer(self):
+    def test_routed_prompts_carry_no_guidance(self):
         with patch.object(m.shutil, 'which', return_value=None):
-            prompt, sizes = m.build_prompt('implementer', 'TASK: change button label', self.root, {}, 'MICRO')
-            self.assertFalse(any(k.startswith(('workflow:', 'optional:')) for k in sizes))
-            self.assertNotIn('Graphify', prompt)
-            self.assertEqual(m.build_prompt('answer', 'task', self.root, {})[1], {'task': 1})
-
-    def test_selected_task_role_only_and_bounded(self):
-        with patch.object(m.shutil, 'which', return_value=None):
-            _, sizes = m.build_prompt('implementer', 'TASK: repair failing tests after dependency migration with slow performance', self.root, {}, 'MEDIUM')
-            self.assertEqual(sum(k.startswith('workflow:') for k in sizes), 2)
-            self.assertIn('workflow:debugging', sizes)
-            self.assertNotIn('workflow:security', sizes)
-            _, plain = m.build_prompt('implementer', 'TASK: change label\nEVIDENCE: security error dependency', self.root, {}, 'MICRO')
-            self.assertFalse(any(k.startswith('workflow:') for k in plain))
-            _, review = m.build_prompt('reviewer', 'TASK: review authorization changes', self.root, {}, 'SMALL')
-            self.assertIn('workflow:security', review)
+            for role, write in (('implementer', True), ('explorer', False), ('reviewer', False)):
+                prompt = m.task_prompt(role, 'repair failing tests after dependency migration with slow performance', self.root, write)
+                self.assertTrue(prompt.startswith('repair failing tests after dependency migration with slow performance\n'))
+                self.assertNotIn('code graph navigation', prompt)
+                self.assertNotIn('# Role:', prompt)
+            self.assertEqual(m.task_prompt('answer', 'task', self.root), 'task')
 
     def test_graph_gates_and_fallback(self):
         p = self.root/'graphify-out/graph.json'
@@ -45,21 +36,18 @@ class CanonicalCapabilities(unittest.TestCase):
             for body in ['{broken', '{}', '{"nodes": [], "links": []}', '{"nodes":[{}],"links":[]}']:
                 p.write_text(body)
                 self.assertFalse(m.graph_ready(self.root))
-                self.assertFalse(m.capability_guidance('explorer', 'explain code', self.root))
+                self.assertNotIn('graphify', m.task_prompt('explorer', 'explain code', self.root))
+                self.assertNotIn('code graph navigation', m.role_instructions('explorer', 'explain code', self.root))
             p.write_text(json.dumps({'nodes':[{'id':'a'}], 'links':[]}))
             self.assertTrue(m.graph_ready(self.root))
-            self.assertEqual([x[0] for x in m.capability_guidance('explorer','explain code',self.root)], ['optional:graphify'])
-            self.assertFalse(m.capability_guidance('implementer','change label',self.root))
+            self.assertIn('graphify query', m.task_prompt('explorer', 'explain code', self.root))  # one optional line, not the skill
+            self.assertLess(m.tok(m.task_prompt('explorer', 'explain code', self.root)), 120)
+            self.assertIn('code graph navigation', m.role_instructions('explorer', 'explain code', self.root))
+            self.assertNotIn('code graph navigation', m.role_instructions('implementer', 'change label', self.root))
             with patch.dict(os.environ, {'AI_TEAM_GRAPHIFY':'off'}):
                 self.assertFalse(m.graph_ready(self.root))
         with patch.object(m.shutil, 'which', return_value=None):
             self.assertFalse(m.graph_ready(self.root))
-
-    def test_guidance_dropped_before_budgeted_essential_context(self):
-        with patch.object(m.shutil,'which',return_value=None):
-            _, sizes=m.build_prompt('reviewer','TASK: review security changes',self.root,{},'SMALL',extra='x'*40000)
-            self.assertNotIn('workflow:security',sizes)
-            self.assertLessEqual(sum(v for k,v in sizes.items() if not k.startswith('_')),2060)
 
     def test_adapters_are_thin_and_custom_content_is_preserved(self):
         specs=m.adapter_specs()
@@ -84,7 +72,7 @@ class CanonicalCapabilities(unittest.TestCase):
         self.assertFalse((self.root/'.gemini').exists())
 
     def test_runtime_allowlist_is_owned_and_small(self):
-        self.assertEqual(len(m.CAPABILITIES['capabilities']),15)
+        self.assertEqual(len(m.CAPABILITIES['capabilities']),8)
         self.assertEqual(sum(c['runtime_type']=='optional skill' for c in m.CAPABILITIES['capabilities']),1)
         for c in m.CAPABILITIES['capabilities']:
             for source in c['sources']:
